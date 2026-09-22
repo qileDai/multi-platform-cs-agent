@@ -1,0 +1,27 @@
+services:
+  backend:
+    build: ./backend
+    container_name: cs-agent-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=sqlite:////data/app.db
+      - CHROMA_DIR=/data/chroma
+      - UPLOAD_DIR=/data/uploads
+    volumes:
+      - cs-data:/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: cs-agent-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  cs-data:

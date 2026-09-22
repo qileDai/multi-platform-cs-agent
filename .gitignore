@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env
+.env
+
+# Data
+data/
+*.db
+*.sqlite3
+chroma/
+
+# Node
+node_modules/
+dist/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,7 @@
+2026/09/20-14:16:20.342 5c90 Reusing MANIFEST D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/20-14:16:20.344 5c90 Recovering log #4
+2026/09/20-14:16:20.345 5c90 Level-0 table #7: started
+2026/09/20-14:16:20.347 5c90 Level-0 table #7: 82797 bytes OK
+2026/09/20-14:16:20.348 5c90 Recovering log #6
+2026/09/20-14:16:20.348 5c90 Reusing old log D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/000006.log 
+2026/09/20-14:16:20.348 5c90 Delete type=0 #4

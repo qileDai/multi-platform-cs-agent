@@ -171,3 +171,31 @@ async def test_tool_failure_degrades_to_handoff(db, conversation, monkeypatch):
     # 无在线客服时留 pending；有 active 客服时 auto_assign 会改成 human
     assert conversation.mode in ("pending", "human")
     assert "ok" in prompts[1]  # 工具错误结果已回填
+
+
+async def test_tool_rounds_exhausted_handoff(db, conversation, monkeypatch):
+    """工具轮次用尽且没有回复时，短句加转人工，不让客人消息空着。"""
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="帮我查一下"))
+    db.commit()
+
+    async def always_tool(prompt: str, **_kwargs):
+        return AgentReply(
+            reply_messages=[], intent="after_sale", confidence=0.4,
+            tool_call=ToolCall(name="query_logistics", args={"order_id": "DD1"}),
+        )
+
+    monkeypatch.setattr(engine, "_call_llm_with_retry", always_tool)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    _isolate_rag(monkeypatch)
+
+    await engine.process_ai_reply(conversation.id)
+    db.rollback()
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+    ai = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
+        .all()
+    )
+    assert any("卡了一下" in m.content for m in ai)

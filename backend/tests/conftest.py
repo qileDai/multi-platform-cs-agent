@@ -19,6 +19,13 @@ from app.models import Customer, Conversation
 @pytest.fixture(scope="session", autouse=True)
 def _setup_db():
     init_db()
+    # 测试库没有旧切片，跳过启动时的全量重嵌入
+    from pathlib import Path
+
+    from app.rag.ingest import INDEX_VERSION
+    chroma = Path(os.environ["CHROMA_DIR"])
+    chroma.mkdir(parents=True, exist_ok=True)
+    (chroma / "index_version.txt").write_text(INDEX_VERSION, encoding="utf-8")
     yield
 
 

@@ -451,7 +451,8 @@ export default function ChatWindow({
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  if (hashHits.length > 0) {
+                  // 只输入了 #、后面没有关键词时，列表是全部模板，Enter 仍应发送
+                  if (hashHits.length > 0 && hashQuery?.[1]) {
                     onDraftChange(hashHits[0].content)
                     return
                   }

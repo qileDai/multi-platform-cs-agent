@@ -24,3 +24,17 @@ def is_duplicate(event_key: str) -> bool:
         return True
     finally:
         db.close()
+
+
+def release(event_key: str) -> None:
+    """处理失败时删掉本次幂等记录，队列重试才能再次进入。成功路径不要调用。"""
+    if not event_key:
+        return
+    db = SessionLocal()
+    try:
+        db.query(ProcessedEvent).filter(ProcessedEvent.event_key == event_key).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()

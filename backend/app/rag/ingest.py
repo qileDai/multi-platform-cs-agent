@@ -1,16 +1,20 @@
-"""知识入库：多格式解析、语义切分、父子索引、增量更新。
+"""知识入库：多格式解析、按小节切分、父子索引、增量更新。
 
 策略：
 - FAQ：问答对整体作为一个 chunk，不拆散（检索精度最高）
-- 文档：先按标题/段落语义边界切分，超长再滑窗（500 字 / overlap 80）
-- 父子索引：子块参与检索，命中后取父块作为生成上下文
+- 文档：按 Markdown 标题和空行切成小节，标题留在该节正文前
+- 小节不超过 500 字：整节入库，检索文本前加文档标题
+- 超长小节：父块存全文，只把带标题的子块送进向量库和 BM25（500 字 / 重叠 80，尽量在句号处断开）
 - 增量更新：文档重新上传时旧 chunk 全部失效重建
 """
 import io
 import json
 import logging
 import re
+from dataclasses import dataclass
+from pathlib import Path
 
+from ..config import settings
 from ..database import SessionLocal
 from ..models import KnowledgeChunk, KnowledgeDoc
 from . import bm25, embeddings, vectorstore
@@ -19,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 80
+INDEX_VERSION = "2"  # 切块策略变化时递增，启动时触发重建
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+_SENTENCE_MARKS = ("。", "！", "？", "；", "\n")
+
+
+@dataclass
+class Section:
+    heading: str
+    text: str  # 标题 + 正文，标题在前
 
 
 # ============ 文档解析 ============
@@ -41,34 +55,78 @@ def parse_file(filename: str, data: bytes) -> str:
 # ============ 切分 ============
 
 def split_text(text: str) -> list[str]:
-    """语义边界切分 + 超长滑窗。"""
-    # 先按标题/空行/段落边界切
-    blocks = re.split(r"\n\s*\n|(?=^#{1,6}\s)", text, flags=re.MULTILINE)
-    blocks = [b.strip() for b in blocks if b and b.strip()]
+    """按小节切分。超长小节保持整节，滑窗在入库时再做。"""
+    return [section.text for section in split_sections(text)]
 
-    chunks: list[str] = []
-    current = ""
-    for block in blocks:
-        if len(current) + len(block) <= CHUNK_SIZE:
-            current = (current + "\n\n" + block).strip()
-        else:
-            if current:
-                chunks.extend(_sliding_window(current))
-            current = block
-    if current:
-        chunks.extend(_sliding_window(current))
-    return [c for c in chunks if len(c) >= 10]  # 过短的碎片不索引
+
+def split_sections(text: str) -> list[Section]:
+    """按 Markdown 标题和空行切成小节，标题跟随其后的正文。过短碎片不返回。"""
+    sections: list[Section] = []
+    heading = ""
+    for block in re.split(r"\n\s*\n", text.strip()):
+        block = block.strip()
+        if not block:
+            continue
+        buf: list[str] = []
+        for line in block.splitlines():
+            stripped = line.strip()
+            if _HEADING_RE.match(stripped):
+                _flush_section(sections, heading, buf)
+                heading = stripped
+                continue
+            buf.append(line)
+        _flush_section(sections, heading, buf)
+    return sections
+
+
+def _flush_section(sections: list[Section], heading: str, buf: list[str]) -> None:
+    body = "\n".join(buf).strip()
+    buf.clear()
+    if not body:
+        return
+    text = f"{heading}\n{body}" if heading else body
+    if len(text) < 10:
+        return
+    sections.append(Section(heading=heading, text=text))
 
 
 def _sliding_window(text: str) -> list[str]:
+    """滑窗切分。窗口末尾尽量落在句号上，避免把一句话切成两半。"""
     if len(text) <= CHUNK_SIZE:
         return [text]
     result = []
     start = 0
     while start < len(text):
-        result.append(text[start:start + CHUNK_SIZE])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
+        hard_end = min(start + CHUNK_SIZE, len(text))
+        end = hard_end
+        if hard_end < len(text):
+            window = text[start:hard_end]
+            cut = max(window.rfind(mark) for mark in _SENTENCE_MARKS)
+            if cut >= int(CHUNK_SIZE * 0.6):
+                end = start + cut + 1
+        piece = text[start:end].strip()
+        if piece:
+            result.append(piece)
+        if end >= len(text):
+            break
+        next_start = end - CHUNK_OVERLAP
+        if next_start <= start:
+            next_start = end
+        start = next_start
     return result
+
+
+def _index_text(doc_title: str, heading: str, text: str) -> str:
+    """检索文本带上文档标题和小节标题，后半段窗口也不会丢掉主题。"""
+    body = text
+    if heading and body.startswith(heading):
+        body = body[len(heading):].lstrip("\n")
+    parts = [f"【{doc_title}】"]
+    if heading:
+        parts.append(heading)
+    if body:
+        parts.append(body)
+    return "\n".join(parts)
 
 
 # ============ 入库 ============
@@ -117,7 +175,7 @@ async def ingest_faq(doc_id: int):
 
 
 async def ingest_document(doc_id: int):
-    """文档切分 + 父子索引。"""
+    """文档按小节切分。超长小节建父块，只索引带标题的子块。"""
     db = SessionLocal()
     try:
         doc = db.get(KnowledgeDoc, doc_id)
@@ -125,25 +183,29 @@ async def ingest_document(doc_id: int):
             return
         _delete_chunks(db, doc_id)
 
-        pieces = split_text(doc.content)
-        chunks = []
-        for i, piece in enumerate(pieces):
-            # 超过 CHUNK_SIZE 的段：自身为父块，再切子块参与检索
-            if len(piece) > CHUNK_SIZE * 1.5:
-                parent = KnowledgeChunk(doc_id=doc_id, parent_id=None, chunk_index=i, content=piece)
-                db.add(parent)
-                db.flush()
-                for j, sub in enumerate(_sliding_window(piece)):
-                    chunks.append(KnowledgeChunk(
-                        doc_id=doc_id, parent_id=parent.id, chunk_index=i * 1000 + j, content=sub
-                    ))
-            else:
-                chunks.append(KnowledgeChunk(doc_id=doc_id, parent_id=None, chunk_index=i, content=piece))
-        db.add_all(chunks)
+        index_chunks: list[KnowledgeChunk] = []
+        for i, section in enumerate(split_sections(doc.content or "")):
+            if len(section.text) <= CHUNK_SIZE:
+                index_chunks.append(KnowledgeChunk(
+                    doc_id=doc_id, parent_id=None, chunk_index=i,
+                    content=_index_text(doc.title, section.heading, section.text),
+                ))
+                continue
+            parent = KnowledgeChunk(
+                doc_id=doc_id, parent_id=None, chunk_index=i, content=section.text,
+            )
+            db.add(parent)
+            db.flush()
+            for j, window in enumerate(_sliding_window(section.text)):
+                index_chunks.append(KnowledgeChunk(
+                    doc_id=doc_id, parent_id=parent.id, chunk_index=i * 1000 + j,
+                    content=_index_text(doc.title, section.heading, window),
+                ))
+        db.add_all(index_chunks)
         db.commit()
-        for c in chunks:
-            db.refresh(c)
-        await _index_chunks(chunks, doc)
+        for chunk in index_chunks:
+            db.refresh(chunk)
+        await _index_chunks(index_chunks, doc)
     finally:
         db.close()
 
@@ -158,8 +220,10 @@ def _delete_chunks(db, doc_id: int):
 
 
 async def _index_chunks(chunks: list[KnowledgeChunk], doc: KnowledgeDoc):
-    """写入向量库（可降级）并重建 BM25。"""
-    # 向量索引
+    """写入向量库（可降级）并重建 BM25。父块不进索引。"""
+    if not chunks:
+        rebuild_bm25_from_db()
+        return
     vectors = await embeddings.embed_texts([c.content for c in chunks])
     if vectors is not None:
         vectorstore.upsert_chunks(
@@ -169,8 +233,13 @@ async def _index_chunks(chunks: list[KnowledgeChunk], doc: KnowledgeDoc):
             metadatas=[{"doc_id": doc.id, "chunk_id": c.id, "parent_id": c.parent_id or 0,
                         "title": doc.title} for c in chunks],
         )
-    # BM25 全量重建（内存索引，规模小可接受）
     rebuild_bm25_from_db()
+
+
+def _indexable(rows: list[KnowledgeChunk]) -> list[KnowledgeChunk]:
+    """有子块的父块只用于生成上下文，不参与检索。"""
+    parent_ids = {row.parent_id for row in rows if row.parent_id}
+    return [row for row in rows if row.id not in parent_ids]
 
 
 def rebuild_bm25_from_db():
@@ -185,7 +254,50 @@ def rebuild_bm25_from_db():
         )
         bm25.rebuild([
             {"chunk_id": f"chunk_{c.id}", "doc_id": c.doc_id, "content": c.content}
-            for c in rows
+            for c in _indexable(rows)
         ])
     finally:
         db.close()
+
+
+def _index_version_path() -> Path:
+    return Path(settings.chroma_dir) / "index_version.txt"
+
+
+def index_version_stale() -> bool:
+    path = _index_version_path()
+    if not path.is_file():
+        return True
+    return path.read_text(encoding="utf-8").strip() != INDEX_VERSION
+
+
+def _write_index_version() -> None:
+    path = _index_version_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(INDEX_VERSION, encoding="utf-8")
+
+
+async def reindex_all() -> None:
+    """切块版本变化后，重嵌入全部生效文档。失败则不写版本号，下次启动再试。"""
+    db = SessionLocal()
+    try:
+        docs = (
+            db.query(KnowledgeDoc)
+            .filter(KnowledgeDoc.status == "active")
+            .all()
+        )
+        jobs = [(doc.id, doc.doc_type) for doc in docs]
+    finally:
+        db.close()
+    logger.info("开始重建知识库索引，版本 %s，文档 %d 篇", INDEX_VERSION, len(jobs))
+    for doc_id, doc_type in jobs:
+        try:
+            if doc_type == "faq":
+                await ingest_faq(doc_id)
+            else:
+                await ingest_document(doc_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("重建文档失败 doc_id=%s，保留旧索引版本以便重试", doc_id)
+            return
+    _write_index_version()
+    logger.info("知识库索引已重建到版本 %s", INDEX_VERSION)

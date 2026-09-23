@@ -143,3 +143,29 @@ async def test_sweep_ignores_fresh_and_human(db, conversation):
     assert conversation.id not in closed
     db.refresh(conversation)
     assert conversation.status == "open"
+
+
+async def test_sweep_does_not_close_after_takeover(db, conversation, monkeypatch):
+    """发结束语期间会话已被转走，不再写成 closed。"""
+    from app.database import SessionLocal
+
+    conversation.last_message_at = datetime.utcnow() - timedelta(minutes=60)
+    db.commit()
+
+    async def takeover(conversation_id, content, *, sender_type, **kwargs):
+        session = SessionLocal()
+        try:
+            conv = session.get(Conversation, conversation_id)
+            conv.mode = "pending"
+            session.commit()
+        finally:
+            session.close()
+        return None
+
+    monkeypatch.setattr("app.services.send_outbound", takeover)
+    closed = await _sweep_once()
+    assert conversation.id not in closed
+    db.rollback()
+    db.refresh(conversation)
+    assert conversation.status == "open"
+    assert conversation.mode == "pending"

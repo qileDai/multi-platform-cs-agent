@@ -28,6 +28,9 @@ class TestMockInboundFlow:
     @pytest.mark.asyncio
     async def test_mock_as_douyin_saved(self, db):
         """模拟抖音用户消息：必须入库且会话平台标识为 douyin。"""
+        from app.models import Agent
+        db.query(Agent).update({Agent.status: "offline"})
+        db.commit()
         payload = _mock_payload("douyin", "在吗，这个多少钱")
         await handle_inbound(payload)
 
@@ -94,6 +97,9 @@ class TestMockInboundFlow:
     @pytest.mark.asyncio
     async def test_ai_fallback_reply_and_handoff(self, db):
         """未配置 LLM 时：AI 降级话术回复 + 自动转人工进排队。"""
+        from app.models import Agent
+        db.query(Agent).update({Agent.status: "offline"})
+        db.commit()
         payload = _mock_payload("mock", "你好")
         await handle_inbound(payload)
 
@@ -112,6 +118,9 @@ class TestAiKillSwitch:
     async def test_globally_disabled_goes_straight_to_human(self, db, monkeypatch):
         """AI 全局开关关闭：入站直接转人工，不产生 AI 回复。"""
         from app.config import settings
+        from app.models import Agent
+        db.query(Agent).update({Agent.status: "offline"})
+        db.commit()
         monkeypatch.setattr(settings, "ai_globally_enabled", False)
 
         await handle_inbound(_mock_payload("douyin", "熔断测试消息"))
@@ -122,6 +131,113 @@ class TestAiKillSwitch:
         ai_count = db.query(Message).filter(Message.conversation_id == conv.id,
                                             Message.sender_type == "ai").count()
         assert ai_count == 0
+
+
+class TestInboundRetry:
+    @pytest.mark.asyncio
+    async def test_failure_before_save_can_retry(self, db, monkeypatch):
+        """入库前失败会放开幂等键，同一条消息重试仍能入库并触发 AI。"""
+        from app.agent import engine
+        from app.models import ProcessedEvent
+        from app import services
+
+        payload = _mock_payload("douyin", "重试入库")
+        event_key = f"{payload['platform']}:{payload['msg_id']}"
+        calls = {"n": 0}
+        real = services._upsert_customer
+
+        def flaky(session, msg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("db down")
+            return real(session, msg)
+
+        ai_calls = {"n": 0}
+
+        async def fake_ai(conversation_id):
+            ai_calls["n"] += 1
+
+        monkeypatch.setattr(services, "_upsert_customer", flaky)
+        monkeypatch.setattr(engine, "process_ai_reply", fake_ai)
+
+        with pytest.raises(RuntimeError):
+            await handle_inbound(payload)
+        db.rollback()
+        assert db.query(ProcessedEvent).filter(ProcessedEvent.event_key == event_key).count() == 0
+        assert db.query(Message).filter(Message.content == "重试入库").count() == 0
+
+        await handle_inbound(payload)
+        db.rollback()
+        assert db.query(Message).filter(Message.content == "重试入库",
+                                        Message.sender_type == "user").count() == 1
+        assert ai_calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_failure_after_save_resumes_without_duplicate(self, db, monkeypatch):
+        """入库后 AI 失败：重试不插第二条、不加未读，但会补跑回复。"""
+        from app.agent import engine
+
+        payload = _mock_payload("mock", "补跑回复")
+        calls = {"n": 0}
+
+        async def flaky(conversation_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("llm down")
+
+        monkeypatch.setattr(engine, "process_ai_reply", flaky)
+        with pytest.raises(RuntimeError):
+            await handle_inbound(payload)
+        db.rollback()
+        conv = db.query(Conversation).filter(
+            Conversation.platform_conversation_id == payload["conversation_id"]).one()
+        assert conv.unread_count == 1
+        assert db.query(Message).filter(Message.conversation_id == conv.id,
+                                        Message.sender_type == "user").count() == 1
+
+        await handle_inbound(payload)
+        db.rollback()
+        db.refresh(conv)
+        assert conv.unread_count == 1
+        assert db.query(Message).filter(Message.conversation_id == conv.id,
+                                        Message.sender_type == "user").count() == 1
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_stops_when_reply_already_sent(self, db, monkeypatch):
+        """已经发出 AI 回复后再失败，重试不再发第二次。"""
+        from app.agent import engine
+        from app.database import SessionLocal
+
+        payload = _mock_payload("mock", "不要重发")
+        calls = {"n": 0}
+
+        async def flaky(conversation_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                session = SessionLocal()
+                try:
+                    session.add(Message(
+                        conversation_id=conversation_id, sender_type="ai",
+                        msg_type="text", content="已经回复过",
+                    ))
+                    session.commit()
+                finally:
+                    session.close()
+                raise RuntimeError("after send")
+
+        monkeypatch.setattr(engine, "process_ai_reply", flaky)
+        with pytest.raises(RuntimeError):
+            await handle_inbound(payload)
+        await handle_inbound(payload)
+        db.rollback()
+        conv = db.query(Conversation).filter(
+            Conversation.platform_conversation_id == payload["conversation_id"]).one()
+        assert calls["n"] == 1
+        assert db.query(Message).filter(Message.conversation_id == conv.id,
+                                        Message.sender_type == "ai").count() == 1
+        assert db.query(Message).filter(Message.conversation_id == conv.id,
+                                        Message.sender_type == "user").count() == 1
 
     def test_switch_api_and_admin_guard(self, db, monkeypatch):
         """开关 API：admin 可切换并立即生效；非 admin 被 require_admin 拒绝。"""

@@ -26,13 +26,17 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
 
 
-async def process_ai_reply(conversation_id: int):
-    """队列 worker 中对一条用户消息执行完整 AI 接待流程。"""
+async def process_ai_reply(conversation_id: int, *, local: bool = False) -> str:
+    """对一条用户消息执行完整 AI 接待流程。
+
+    local=True 时只在本系统入库并返回拼成一段的正文，不走平台发送，也不做打字延迟。
+    供知你快回同步回复接口使用。默认路径的返回值可忽略。
+    """
     db = SessionLocal()
     try:
         conversation = db.get(Conversation, conversation_id)
         if conversation is None or conversation.mode != "ai" or conversation.status != "open":
-            return
+            return ""
         customer = db.get(Customer, conversation.customer_id)
         last_user_msg = (
             db.query(Message)
@@ -41,7 +45,7 @@ async def process_ai_reply(conversation_id: int):
             .first()
         )
         if last_user_msg is None:
-            return
+            return ""
         user_text = last_user_msg.content
         platform = conversation.platform
         conversation_id_ = conversation.id
@@ -51,10 +55,10 @@ async def process_ai_reply(conversation_id: int):
 
     # LLM 未配置：降级话术 + 转人工
     if not settings.llm_configured:
-        await send_outbound(conversation_id_,
-                            "这会儿咨询有点多，我先帮您叫同事过来哈", sender_type="ai")
+        text = await _deliver_ai(
+            conversation_id_, ["这会儿咨询有点多，我先帮您叫同事过来哈"], local=local)
         await handoff(conversation_id_, reason="llm_not_configured")
-        return
+        return text
 
     # 1. 上下文窗口
     history_text, recent = context.get_history_for_prompt(conversation_id_)
@@ -63,18 +67,15 @@ async def process_ai_reply(conversation_id: int):
     retrieval = await pipeline.retrieve(user_text, history=recent)
     if not retrieval.passed:
         record_missed_question(user_text, platform, conversation_id_)
-        await send_outbound(
+        text = await _deliver_ai(
             conversation_id_,
-            "这个问题我这边没查到靠谱资料，先帮您转给同事哈",
-            sender_type="ai",
+            ["这个问题我这边没查到靠谱资料，先帮您转给同事哈"],
+            local=local,
             extra={"intent": "other", "confidence": 0.0, "citations": []},
         )
         await handoff(conversation_id_, reason="low_confidence")
-        return
-    knowledge_context = "\n\n".join(
-        f"【资料{i + 1}】（来源：{c['source']}）\n{c['content']}"
-        for i, c in enumerate(retrieval.contexts)
-    )
+        return text
+    knowledge_context = _format_knowledge_context(retrieval.contexts)
 
     # 3. 渲染提示词 + 调用 LLM（失败重试 1 次，主模型硬失败自动切备用）
     rendered = prompt_mod.render_prompt(
@@ -99,11 +100,13 @@ async def process_ai_reply(conversation_id: int):
             call.name, result, allow_chain=tool_rounds < MAX_TOOL_ROUNDS)
         reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id_)
 
-    if reply is None:
-        # 多次重试仍失败：安全兜底
-        await send_outbound(conversation_id_, "不好意思，我这边卡了一下", sender_type="ai")
-        await handoff(conversation_id_, reason="llm_parse_failed")
-        return
+    if reply is None or _tool_rounds_exhausted(reply, tool_rounds):
+        # 多次重试仍失败，或工具轮次用尽却没有可发的回复：安全兜底
+        text = await _deliver_ai(
+            conversation_id_, ["不好意思，我这边卡了一下"], local=local)
+        reason = "llm_parse_failed" if reply is None else "tool_rounds_exhausted"
+        await handoff(conversation_id_, reason=reason)
+        return text
 
     # 4. 执行动作：标签 / 留资
     _apply_side_effects(customer_id, reply)
@@ -114,19 +117,31 @@ async def process_ai_reply(conversation_id: int):
     if tool_names_used:
         extra["tool_calls"] = tool_names_used
     if reply.handoff:
+        text = ""
         if reply.reply_messages:
-            await _send_replies(conversation_id_, reply.reply_messages, extra)
+            text = await _deliver_ai(conversation_id_, reply.reply_messages, local=local, extra=extra)
             _bump_knowledge_hits(retrieval.contexts)
         await handoff(conversation_id_, reason=reply.handoff_reason or "unknown")
-        return
+        return text
 
-    # 6. 正常回复（拟人化分条发送）
+    # 6. 正常回复（拟人化分条发送；知你快回通道拼成一段本地入库）
+    text = ""
     if reply.reply_messages:
-        await _send_replies(conversation_id_, reply.reply_messages, extra)
+        text = await _deliver_ai(conversation_id_, reply.reply_messages, local=local, extra=extra)
         _bump_knowledge_hits(retrieval.contexts)
 
     # 7. 滚动小结（后台，不阻塞）
     await context.maybe_update_summary(conversation_id_)
+    return text
+
+
+def _format_knowledge_context(contexts: list[dict]) -> str:
+    """第一条标成最相关，其余只作补充，避免模型把不同资料的数字拼在一起。"""
+    blocks = []
+    for i, item in enumerate(contexts):
+        role = "最相关" if i == 0 else "仅补充，数字冲突时忽略"
+        blocks.append(f"【资料{i + 1}｜{role}】（来源：{item['source']}）\n{item['content']}")
+    return "\n\n".join(blocks)
 
 
 def _bump_knowledge_hits(contexts: list[dict]) -> None:
@@ -151,10 +166,38 @@ def _bump_knowledge_hits(contexts: list[dict]) -> None:
         db.close()
 
 
+async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
+                      extra: dict | None = None) -> str:
+    """发出 AI 正文。local 时拼成一条本地消息并返回实际入库文本。"""
+    parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
+    if not parts:
+        return ""
+    if local:
+        from ..services import record_local_ai_message
+        saved = await record_local_ai_message(conversation_id, "\n".join(parts)[:4000], extra)
+        return saved.content if saved is not None else ""
+    if len(parts) == 1:
+        await send_outbound(conversation_id, parts[0], sender_type="ai", extra=extra)
+        return ""
+    await _send_replies(conversation_id, parts, extra or {})
+    return ""
+
+
 async def _send_replies(conversation_id: int, messages: list[str], extra: dict):
-    async def _send(content: str):
-        await send_outbound(conversation_id, content, sender_type="ai", extra=extra)
+    async def _send(content: str) -> bool:
+        sent = await send_outbound(conversation_id, content, sender_type="ai", extra=extra)
+        return sent is not None
     await humanize.send_humanized(messages, _send)
+
+
+def _tool_rounds_exhausted(reply: AgentReply, tool_rounds: int) -> bool:
+    """工具打满上限后仍在要工具、且一条回复都没有。已声明转人工的交给后面的 handoff。"""
+    return (
+        tool_rounds >= MAX_TOOL_ROUNDS
+        and reply.tool_call is not None
+        and not reply.reply_messages
+        and not reply.handoff
+    )
 
 
 async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0) -> AgentReply | None:

@@ -107,3 +107,71 @@ async def test_rag_miss_hard_handoff(db, conversation, monkeypatch):
     ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").first()
     assert ai is not None
     assert "转给同事" in ai.content
+
+
+@pytest.mark.asyncio
+async def test_ai_send_stopped_when_taken_over(db, conversation, monkeypatch):
+    """生成过程中切到人工后，后续 AI 气泡不再发出。"""
+    from app.database import SessionLocal
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="多少钱"))
+    db.commit()
+
+    async def flip_mode(query, history=None, top_k=3):
+        session = SessionLocal()
+        try:
+            conv = session.get(Conversation, conversation.id)
+            conv.mode = "human"
+            session.commit()
+        finally:
+            session.close()
+        return rag_pipeline.RetrievalResult(
+            passed=True, contexts=[{"content": "99 元", "source": "价格", "doc_id": 1}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["标准款 99"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", flip_mode)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.rollback()
+    ai = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).count()
+    assert ai == 0
+    db.refresh(conversation)
+    assert conversation.mode == "human"
+
+
+@pytest.mark.asyncio
+async def test_agent_reply_reloads_after_send(db, conversation):
+    """人工回复在另一个会话里提交后，接口按消息 id 重新读取，不再 refresh 已关闭对象。"""
+    from app.api.conversations import agent_reply
+    from app.core.security import hash_password
+    from app.models import Agent
+    from app.schemas import AgentMessageSend
+
+    agent = Agent(
+        username=f"reply_{uuid.uuid4().hex[:8]}",
+        password_hash=hash_password("x"),
+        display_name="客服",
+        role="agent",
+        status="active",
+    )
+    db.add(agent)
+    conversation.mode = "human"
+    db.commit()
+    db.refresh(agent)
+    db.get(Conversation, conversation.id)
+
+    msg = await agent_reply(
+        conversation.id, AgentMessageSend(content="您好，我来处理"), agent, db,
+    )
+    assert msg.id
+    assert msg.sender_type == "agent"
+    assert "您好" in msg.content

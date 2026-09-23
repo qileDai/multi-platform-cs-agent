@@ -73,6 +73,7 @@ class Settings(BaseSettings):
 
     # RPA 通道（无官方 API 资质时的降级方案，见 docs/rpa-workers.md）
     rpa_api_key: str = ""              # Worker 鉴权密钥（留空则 RPA 接口不可用）
+    zhini_reply_api_key: str = ""      # 知你快回「自己的回复接口」密钥（留空则该接口不可用）
     douyin_channel: str = "api"        # api | rpa
     xhs_channel: str = "api"           # api | rpa
     douyin_account_type: str = "feige"  # feige（抖店商家）| enterprise（蓝V 企业号，影响 RPA 频控规则）
@@ -143,6 +144,10 @@ class Settings(BaseSettings):
     @property
     def rpa_configured(self) -> bool:
         return bool(self.rpa_api_key)
+
+    @property
+    def zhini_configured(self) -> bool:
+        return bool(self.zhini_reply_api_key)
 
     @property
     def asr_configured(self) -> bool:

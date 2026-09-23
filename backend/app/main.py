@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws
+from .api import accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
 from .api.deps import require_admin
 from .wecom import callback as wecom_callback
@@ -52,23 +52,37 @@ async def _sweep_once() -> list[int]:
     closed = []
     for cid in ids:
         try:
+            if not _still_ai_open(cid):
+                continue
             await send_outbound(cid, settings.session_close_message, sender_type="ai")
             db = SessionLocal()
             try:
                 conv = db.get(Conversation, cid)
-                if conv is not None and conv.status == "open":
+                # 发送期间可能已被接管或关掉，再确认一次才写入 closed
+                if conv is not None and conv.mode == "ai" and conv.status == "open":
                     conv.status = "closed"
                     conv.closed_at = datetime.utcnow()
                     db.commit()
                     closed.append(cid)
             finally:
                 db.close()
-            await manager.broadcast("conversation_closed", {"conversation_id": cid})
+            if cid in closed:
+                await manager.broadcast("conversation_closed", {"conversation_id": cid})
         except Exception:  # noqa: BLE001
             logger.exception("会话超时关闭失败 conversation_id=%s", cid)
     if closed:
         logger.info("会话超时自动关闭: %s", closed)
     return closed
+
+
+def _still_ai_open(conversation_id: int) -> bool:
+    """发结束语前再读一次：已经进人工队列或已关闭的会话不再动。"""
+    db = SessionLocal()
+    try:
+        conv = db.get(Conversation, conversation_id)
+        return conv is not None and conv.mode == "ai" and conv.status == "open"
+    finally:
+        db.close()
 
 
 async def session_sweeper():
@@ -215,9 +229,13 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # BM25 索引重建
+    # BM25 先用现有切片可用；切块版本变化时后台重嵌入，避免旧切片继续被搜到
     from .rag import ingest
     ingest.rebuild_bm25_from_db()
+    reindex_task = None
+    if ingest.index_version_stale():
+        logger.info("知识库索引版本不一致，后台重建")
+        reindex_task = asyncio.create_task(ingest.reindex_all())
 
     # 启动任务队列 worker / 会话超时清扫 / 小红书 token 刷新 / 发布调度 / 自动备份
     start_worker()
@@ -248,6 +266,8 @@ async def lifespan(app: FastAPI):
     comment_poll_task.cancel()
     stats_task.cancel()
     health_task.cancel()
+    if reindex_task is not None:
+        reindex_task.cancel()
     await stop_backup()
     await stop_worker()
 
@@ -270,7 +290,7 @@ for r in [auth.router, webhooks.router, conversations.router, messages.router,
           rpa.router, settings_api.router, evals.router, media_router, ws.router,
           accounts.router, contents.router, publish.router, comments.router,
           funnel.router, wecom_callback.router, analytics.router, inspiration.router,
-          queue_ops.router]:
+          queue_ops.router, zhinikuaihui.router]:
     app.include_router(r)
 
 
@@ -285,6 +305,7 @@ def health():
         "xiaohongshu": settings.xhs_configured,
         "wecom": settings.wecom_configured,
         "wecom_callback": settings.wecom_callback_configured,
+        "zhini": settings.zhini_configured,
     }
 
 
@@ -310,6 +331,7 @@ def health_detail(_: Agent = Depends(require_admin)):
             "rerank": settings.rerank_configured,
             "douyin": settings.douyin_configured,
             "xiaohongshu": settings.xhs_configured,
+            "zhini": settings.zhini_configured,
             "alert_webhook": bool(settings.alert_webhook_url),
         },
         "errors_last_hour": monitor.snapshot(),

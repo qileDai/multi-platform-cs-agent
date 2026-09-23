@@ -296,5 +296,10 @@ async def agent_reply(conversation_id: int, req: AgentMessageSend,
                               sender_id=agent.id, msg_type=req.msg_type, media_id=req.media_id)
     if msg is None:
         raise HTTPException(429, "触发平台频控，已自动转人工排队")
-    db.refresh(msg)
-    return MessageOut.model_validate(msg)
+    # send_outbound 用的是另一个已关闭的会话，不能 refresh 那个对象
+    msg_id = msg.id
+    db.rollback()
+    saved = db.get(Message, msg_id)
+    if saved is None:
+        raise HTTPException(500, "消息已发出，但读取回执失败")
+    return MessageOut.model_validate(saved)

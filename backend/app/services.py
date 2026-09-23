@@ -37,85 +37,145 @@ async def handle_inbound(payload: dict[str, Any]):
         )
         return
 
-    # 幂等：平台重推直接丢弃
+    # 幂等：平台重推直接丢弃。处理抛错会删掉这次的键，队列重试才能再进来。
     event_key = f"{msg.platform}:{msg.platform_msg_id}" if msg.platform_msg_id else ""
     if event_key and idempotency.is_duplicate(event_key):
         return
 
     db = SessionLocal()
     try:
-        customer = _upsert_customer(db, msg)
-        conversation = _get_or_create_conversation(db, customer, msg)
-
-        # 暗号钩子：用户私信命中评论规则的暗号 → 打标 + 漏斗归因（不阻断后续 AI 流程）
-        if msg.sender_side != "agent" and msg.content:
-            _apply_guide_code_hook(db, customer, msg)
-
-        # 人工旁路消息（客服在平台后台直接发送，RPA Worker 同步）：入库保持消息流完整，
-        # 不触发 AI、不计未读、不做内容过滤
-        if msg.sender_side == "agent":
-            message = _save_message(
-                db, conversation.id, sender_type="agent", msg_type=msg.msg_type,
-                content=msg.content, platform_msg_id=msg.platform_msg_id or None,
-                extra={"bypass": True, **({"media_id": msg.media_id} if msg.media_id else {})},
-            )
-            conversation.last_message_at = message.created_at
-            db.commit()
-            await _broadcast_message(conversation, message)
-            return
-
-        # 媒体消息 → 文本替身：语音走 ASR 转写，图片走视觉描述；未配置/失败用占位文本
-        media_extra: dict = {}
-        if msg.msg_type == "voice" and msg.media_id:
-            from .core import asr
-            text = await asr.transcribe_media(msg.media_id)
-            msg.content = text or "[语音消息]"
-            media_extra = {"media_id": msg.media_id, "asr": bool(text)}
-        elif msg.msg_type == "image" and msg.media_id:
-            from .core import asr
-            desc = await asr.describe_media(msg.media_id)
-            msg.content = f"[图片] {desc}" if desc else "[图片消息]"
-            media_extra = {"media_id": msg.media_id, "vision": bool(desc)}
-
-        message = _save_message(
-            db, conversation.id, sender_type="user", msg_type=msg.msg_type,
-            content=msg.content, platform_msg_id=msg.platform_msg_id or None,
-            extra=media_extra,
-        )
-
-        # 入口内容安全分级：block 打标 + 转人工（AI 不回复）；warn 仅打标
-        # 媒体消息的替身文本（转写/描述）同样参与过滤
-        risk = contentfilter.check_inbound(msg.content) if msg.content else {"level": "ok", "hit": []}
-        if risk["level"] != "ok":
-            message.extra = {**(message.extra or {}), "risk": risk["level"], "risk_hits": risk["hit"]}
-            logger.warning("入口风险消息 level=%s hits=%s content=%s",
-                           risk["level"], risk["hit"], contentfilter.mask_lead(msg.content))
-
-        conversation.last_message_at = message.created_at
-        conversation.unread_count = (conversation.unread_count or 0) + 1
-        db.commit()
-
-        await _broadcast_message(conversation, message)
-
-        if risk["level"] == "block":
-            # 严重违规：AI 不回复，直接转人工（系统提示语由 handoff 生成）
-            await handoff(conversation.id, reason="risk_content")
-            return
-
-        # AI 全局熔断：开关关闭时所有 AI 会话直接转人工，不调用 LLM
-        if not settings.ai_globally_enabled and conversation.mode == "ai":
-            logger.warning("AI 全局开关已关闭，会话 %s 直接转人工", conversation.id)
-            await handoff(conversation.id, reason="ai_globally_disabled")
-            return
-
-        # AI 接待模式才进 Agent 引擎
-        if conversation.mode == "ai" and conversation.status == "open":
-            # 通知前端展示「正在输入」动画（AI 回复的 new_message 到达后前端自动清除）
-            await manager.broadcast("ai_typing", {"conversation_id": conversation.id})
-            from .agent.engine import process_ai_reply  # 延迟导入避免循环依赖
-            await process_ai_reply(conversation.id)
+        try:
+            await _handle_inbound_locked(db, msg)
+        except Exception:
+            db.rollback()
+            idempotency.release(event_key)
+            raise
     finally:
         db.close()
+
+
+async def _handle_inbound_locked(db, msg: InboundMessage):
+    """幂等键已占住之后的入库与接待。调用方在异常时释放键。"""
+    if msg.platform_msg_id:
+        existing = (
+            db.query(Message).filter(Message.platform_msg_id == msg.platform_msg_id).first()
+        )
+        if existing is not None:
+            # 上次已入库但中途失败：不插第二条、不加未读；还没有回复才补跑
+            if msg.sender_side != "agent":
+                await _resume_if_unanswered(existing.conversation_id, existing.id)
+            return
+
+    customer = _upsert_customer(db, msg)
+    conversation = _get_or_create_conversation(db, customer, msg)
+
+    # 暗号钩子：用户私信命中评论规则的暗号 → 打标 + 漏斗归因（不阻断后续 AI 流程）
+    if msg.sender_side != "agent" and msg.content:
+        _apply_guide_code_hook(db, customer, msg)
+
+    # 人工旁路消息（客服在平台后台直接发送，RPA Worker 同步）：入库保持消息流完整，
+    # 不触发 AI、不计未读、不做内容过滤
+    if msg.sender_side == "agent":
+        message = _save_message(
+            db, conversation.id, sender_type="agent", msg_type=msg.msg_type,
+            content=msg.content, platform_msg_id=msg.platform_msg_id or None,
+            extra={"bypass": True, **({"media_id": msg.media_id} if msg.media_id else {})},
+        )
+        conversation.last_message_at = message.created_at
+        db.commit()
+        await _broadcast_message(conversation, message)
+        return
+
+    # 媒体消息 → 文本替身：语音走 ASR 转写，图片走视觉描述；未配置/失败用占位文本
+    media_extra: dict = {}
+    if msg.msg_type == "voice" and msg.media_id:
+        from .core import asr
+        text = await asr.transcribe_media(msg.media_id)
+        msg.content = text or "[语音消息]"
+        media_extra = {"media_id": msg.media_id, "asr": bool(text)}
+    elif msg.msg_type == "image" and msg.media_id:
+        from .core import asr
+        desc = await asr.describe_media(msg.media_id)
+        msg.content = f"[图片] {desc}" if desc else "[图片消息]"
+        media_extra = {"media_id": msg.media_id, "vision": bool(desc)}
+
+    message = _save_message(
+        db, conversation.id, sender_type="user", msg_type=msg.msg_type,
+        content=msg.content, platform_msg_id=msg.platform_msg_id or None,
+        extra=media_extra,
+    )
+
+    # 入口内容安全分级：block 打标 + 转人工（AI 不回复）；warn 仅打标
+    # 媒体消息的替身文本（转写/描述）同样参与过滤
+    risk = contentfilter.check_inbound(msg.content) if msg.content else {"level": "ok", "hit": []}
+    if risk["level"] != "ok":
+        message.extra = {**(message.extra or {}), "risk": risk["level"], "risk_hits": risk["hit"]}
+        logger.warning("入口风险消息 level=%s hits=%s content=%s",
+                       risk["level"], risk["hit"], contentfilter.mask_lead(msg.content))
+
+    conversation.last_message_at = message.created_at
+    conversation.unread_count = (conversation.unread_count or 0) + 1
+    db.commit()
+
+    await _broadcast_message(conversation, message)
+
+    await _route_after_user_message(
+        conversation.id,
+        risk_level=risk["level"],
+        mode=conversation.mode,
+        status=conversation.status,
+    )
+
+
+async def _route_after_user_message(conversation_id: int, *, risk_level: str, mode: str, status: str):
+    """用户消息已入库后的分流：风险/熔断转人工，AI 接待才进引擎。"""
+    if risk_level == "block":
+        # 严重违规：AI 不回复，直接转人工（系统提示语由 handoff 生成）
+        await handoff(conversation_id, reason="risk_content")
+        return
+
+    # AI 全局熔断：开关关闭时所有 AI 会话直接转人工，不调用 LLM
+    if not settings.ai_globally_enabled and mode == "ai":
+        logger.warning("AI 全局开关已关闭，会话 %s 直接转人工", conversation_id)
+        await handoff(conversation_id, reason="ai_globally_disabled")
+        return
+
+    # AI 接待模式才进 Agent 引擎
+    if mode == "ai" and status == "open":
+        # 通知前端展示「正在输入」动画（AI 回复的 new_message 到达后前端自动清除）
+        await manager.broadcast("ai_typing", {"conversation_id": conversation_id})
+        from .agent.engine import process_ai_reply  # 延迟导入避免循环依赖
+        await process_ai_reply(conversation_id)
+
+
+async def _resume_if_unanswered(conversation_id: int, user_message_id: int):
+    """重试时消息已在库：后面已有 AI / 人工 / 系统回复则结束，否则按当前规则补跑。"""
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        user_message = db.get(Message, user_message_id)
+        if conversation is None or user_message is None:
+            return
+        answered = (
+            db.query(Message.id)
+            .filter(
+                Message.conversation_id == conversation_id,
+                Message.id > user_message_id,
+                Message.sender_type.in_(("ai", "agent", "system")),
+                Message.is_internal.is_(False),
+            )
+            .first()
+        )
+        if answered is not None:
+            return
+        content = user_message.content or ""
+        risk_level = contentfilter.check_inbound(content)["level"] if content else "ok"
+        mode, status = conversation.mode, conversation.status
+    finally:
+        db.close()
+    await _route_after_user_message(
+        conversation_id, risk_level=risk_level, mode=mode, status=status,
+    )
 
 
 def _upsert_customer(db, msg: InboundMessage) -> Customer:
@@ -208,6 +268,15 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         conversation = db.get(Conversation, conversation_id)
         if conversation is None:
             return None
+        # AI 气泡发出前再看一次：人工已接管、会话已结束或全局开关已关，就不再打到平台。
+        # 人工消息和转人工系统消息不走这里。
+        if sender_type == "ai" and not _ai_may_send(conversation):
+            logger.info(
+                "跳过 AI 出站 conversation=%s mode=%s status=%s ai_enabled=%s",
+                conversation_id, conversation.mode, conversation.status,
+                settings.ai_globally_enabled,
+            )
+            return None
         customer = db.get(Customer, conversation.customer_id)
 
         # 1. 出口违禁词过滤
@@ -265,6 +334,52 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         )
         conversation.last_message_at = message.created_at
         db.commit()
+        await _broadcast_message(conversation, message)
+        return message
+    finally:
+        db.close()
+
+
+def _ai_may_send(conversation: Conversation) -> bool:
+    """AI 出站只在仍由 AI 接待、会话未结束、且全局开关开着时放行。"""
+    return (
+        conversation.mode == "ai"
+        and conversation.status == "open"
+        and settings.ai_globally_enabled
+    )
+
+
+async def record_local_ai_message(conversation_id: int, content: str,
+                                  extra: dict | None = None) -> Message | None:
+    """知你快回通道：违禁词过滤后只写入本系统并广播，不调用平台适配器，不计频控。
+
+    platform_msg_id 留空，避免和触发消息的短键或平台消息 ID 冲突。
+    """
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        if conversation is None or not _ai_may_send(conversation):
+            return None
+        filtered, hits = contentfilter.sanitize(content)
+        filtered = (filtered or "").strip()[:4000]
+        if not filtered:
+            return None
+        payload = {**(extra or {}), "channel": "zhinikuaihui"}
+        if hits:
+            payload["filtered_words"] = hits
+        message = Message(
+            conversation_id=conversation_id,
+            sender_type="ai",
+            msg_type="text",
+            content=filtered,
+            platform_msg_id=None,
+            extra=payload,
+        )
+        db.add(message)
+        db.flush()
+        conversation.last_message_at = message.created_at
+        db.commit()
+        db.refresh(message)
         await _broadcast_message(conversation, message)
         return message
     finally:

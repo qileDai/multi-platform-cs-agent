@@ -272,6 +272,10 @@ export default function Knowledge() {
               onClick={() => {
                 setNav(item.key)
                 if (item.key === 'file') setCategory('')
+                if (item.key === 'missed') {
+                  setSelectedId(null)
+                  setCreating(false)
+                }
               }}
               className={clsx(
                 'w-full text-left px-4 py-2 text-sm flex items-center',

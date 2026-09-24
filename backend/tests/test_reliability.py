@@ -34,6 +34,27 @@ class TestRateLimit:
         assert allowed is False
         assert rule == "reply_24h"
 
+    def test_user_message_resets_reply_window(self):
+        for _ in range(6):
+            allowed, _ = ratelimit.check_and_count("douyin", "conv_reset")
+            assert allowed is True
+        ratelimit.reset_reply_window("douyin", "conv_reset")
+        allowed, _ = ratelimit.check_and_count("douyin", "conv_reset")
+        assert allowed is True
+        for _ in range(5):
+            ratelimit.check_and_count("douyin", "conv_reset")
+        allowed, rule = ratelimit.check_and_count("douyin", "conv_reset")
+        assert allowed is False
+        assert rule == "reply_24h"
+
+    def test_reset_keeps_minute_cap(self):
+        for _ in range(6):
+            ratelimit.check_and_count("douyin_rpa", "conv_min")
+        ratelimit.reset_reply_window("douyin", "conv_min")
+        allowed, rule = ratelimit.check_and_count("douyin_rpa", "conv_min")
+        assert allowed is False
+        assert rule == "rpa_minute"
+
     def test_different_conversation_isolated(self):
         for _ in range(6):
             ratelimit.check_and_count("douyin", "conv_3")

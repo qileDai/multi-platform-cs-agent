@@ -1,5 +1,9 @@
-"""RAG 检索管线：查询改写 → 分路混合召回 → RRF 融合 → Rerank → 相对分数过滤。"""
+"""RAG 检索管线：查询改写 → 分路混合召回 → RRF 融合 → Rerank → 相对分数过滤。
+
+精排返回空结果或调用失败时，退回融合结果，按余弦或 BM25 分差决定是否生成。
+精排有分数但低于阈值时仍不生成。"""
 import logging
+import re
 from dataclasses import dataclass, field
 
 from ..config import settings
@@ -24,50 +28,68 @@ class RetrievalResult:
     rerank_top_score: float | None = None
     passed: bool = False
     degraded: bool = False  # 纯 BM25 降级模式
+    reason: str = "no_hits"  # passed | no_hits | rerank_below_threshold | rerank_unavailable | dense_gap | bm25_gap
+    dense_count: int = 0
+    bm25_count: int = 0
+    fused_top: list[dict] = field(default_factory=list)
+    rerank_status: str = "skipped"  # used | unavailable | skipped
 
 
-async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3) -> RetrievalResult:
+async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3,
+                   summary: str = "") -> RetrievalResult:
     """完整检索管线。返回带引用的知识片段；未过阈值时 passed=False（上层触发转人工）。"""
     result = RetrievalResult()
 
-    # 1. 查询改写（指代消解 + 多路召回）
-    queries = await rewrite.rewrite_query(query, history or [])
+    # 1. 查询改写（指代消解 + 同义多路）
+    queries = await rewrite.rewrite_query(query, history or [], summary=summary)
     result.rewritten_queries = queries
 
     # 2. 每条改写单独成路：向量批量编码，BM25 各查各的
     rankings, degraded = await _collect_rankings(queries)
     result.degraded = degraded
+    result.dense_count, result.bm25_count = _path_counts(rankings)
     if not rankings:
+        result.reason = "no_hits"
         return result
 
     # 3. RRF 融合（每路独立计名次，同一路内重复 chunk 只计一次）
     fused = _rrf_fuse(rankings)
     candidates = fused[:20]
+    result.fused_top = _fused_preview(candidates)
     if not candidates:
+        result.reason = "no_hits"
         return result
 
-    # 4. Rerank 精排。未配置时按同一种分数做分差；已配置但接口失败则未命中。
+    # 4. Rerank 精排。空结果或调用失败退回融合分差；有分数但低于阈值则不生成。
     if settings.rerank_configured:
         reranked = await rerank.rerank(queries[0], [c["content"] for c in candidates], top_n=top_k)
         if reranked:
             scored = [
                 {**candidates[r["index"]], "score": r["score"]} for r in reranked
+                if 0 <= r["index"] < len(candidates)
             ]
+            result.rerank_status = "used"
             result.rerank_top_score = scored[0]["score"] if scored else None
             selected = _filter_reranked(scored)
-        elif result.degraded:
-            # 没有向量，精排也失败：仍按 BM25 分差兜底
-            selected = _select_degraded(candidates)
-            result.rerank_top_score = None
+            if not selected:
+                result.reason = "rerank_below_threshold"
         else:
-            # 有向量但精排失败：记 0 分走未命中，避免用没校验过的弱结果回答
-            selected = []
-            result.rerank_top_score = 0.0
+            result.rerank_status = "unavailable"
+            result.rerank_top_score = None
+            has_dense = any(hit.get("dense_score") is not None for hit in candidates)
+            selected = _select_dense_gap(candidates) if has_dense else _select_degraded(candidates)
+            if not selected:
+                result.reason = "rerank_unavailable"
     else:
         has_dense = any(hit.get("dense_score") is not None for hit in candidates)
-        # 有向量结果看余弦，没有向量看 BM25。只留分差够大的第一名。
+        result.rerank_status = "skipped"
         selected = _select_dense_gap(candidates) if has_dense else _select_degraded(candidates)
         result.rerank_top_score = None
+        if not selected:
+            result.reason = "dense_gap" if has_dense else "bm25_gap"
+
+    if not selected and result.reason in ("dense_gap", "bm25_gap", "rerank_unavailable"):
+        selected = _exact_phrase_hits(query, candidates)
 
     if not selected:
         result.passed = False
@@ -77,7 +99,72 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     resolved = _resolve_hits(selected)
     result.contexts = _dedupe_contexts(resolved)[:top_k]
     result.passed = bool(result.contexts)
+    result.reason = "passed" if result.passed else "no_hits"
     return result
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _exact_phrase_hits(query: str, candidates: list[dict]) -> list[dict]:
+    """原句完整出现在切片或文档标题里时，分差规则不能把这一条丢掉。"""
+    phrase = _compact(query)
+    if len(phrase) < 4:
+        return []
+    matched: list[dict] = []
+    title_checks: list[tuple[dict, int]] = []
+    for hit in candidates:
+        if phrase in _compact(hit.get("content") or ""):
+            matched.append(hit)
+            continue
+        doc_id = hit.get("doc_id")
+        try:
+            title_checks.append((hit, int(doc_id)))
+        except (TypeError, ValueError):
+            continue
+    if not title_checks:
+        return matched
+    db = SessionLocal()
+    try:
+        titles: dict[int, str] = {}
+        for hit, doc_id in title_checks:
+            if doc_id not in titles:
+                doc = db.get(KnowledgeDoc, doc_id)
+                titles[doc_id] = _compact(doc.title if doc else "")
+            if phrase in titles[doc_id]:
+                matched.append(hit)
+    finally:
+        db.close()
+    return matched
+
+
+def _path_counts(rankings: list[list[dict]]) -> tuple[int, int]:
+    dense: set[str] = set()
+    sparse: set[str] = set()
+    for ranking in rankings:
+        for hit in ranking:
+            key = str(hit.get("chunk_id"))
+            if hit.get("score_kind") == "dense":
+                dense.add(key)
+            elif hit.get("score_kind") == "bm25":
+                sparse.add(key)
+    return len(dense), len(sparse)
+
+
+def _fused_preview(candidates: list[dict]) -> list[dict]:
+    preview = []
+    for hit in candidates[:3]:
+        preview.append({
+            "chunk_id": hit.get("chunk_id"),
+            "doc_id": hit.get("doc_id"),
+            "content": (hit.get("content") or "")[:80],
+            "score": hit.get("score"),
+            "dense_score": hit.get("dense_score"),
+            "bm25_score": hit.get("bm25_score"),
+            "rrf_score": hit.get("rrf_score"),
+        })
+    return preview
 
 
 async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool]:

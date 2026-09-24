@@ -1,15 +1,16 @@
-"""知识入库：多格式解析、按小节切分、父子索引、增量更新。
+"""知识入库：多格式解析、按语义成块、相邻块重叠、增量更新。
 
 策略：
-- FAQ：问答对整体作为一个 chunk，不拆散（检索精度最高）
-- 文档：按 Markdown 标题和空行切成小节，标题留在该节正文前
-- 小节不超过 500 字：整节入库，检索文本前加文档标题
-- 超长小节：父块存全文，只把带标题的子块送进向量库和 BM25（500 字 / 重叠 80，尽量在句号处断开）
+- FAQ：问答对整体作为一个 chunk，不拆散
+- 文档：按章节、完整清单、空行隔开的话术成块。1、2. 这类条目留在清单里
+- 相邻块重叠上一块正文的 10% 到 20%，只在完整句子或完整条目处对齐
+- 没有标题也没有空行的长段：嵌入可用时按相邻句相似度下降处切开，否则保持整段
 - 增量更新：文档重新上传时旧 chunk 全部失效重建
 """
 import io
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,12 +22,18 @@ from . import bm25, embeddings, vectorstore
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 80
-INDEX_VERSION = "2"  # 切块策略变化时递增，启动时触发重建
+INDEX_VERSION = "4"  # 切块策略变化时递增，启动时触发重建
+OVERLAP_TARGET = 0.15
+OVERLAP_MIN = 0.10
+OVERLAP_MAX = 0.20
+_SIMILARITY_DROP = 0.1
 
-_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
-_SENTENCE_MARKS = ("。", "！", "？", "；", "\n")
+_SECTION_HEADING_RE = re.compile(
+    r"^(?:#{1,6}\s+\S|[一二三四五六七八九十百]+、\s*\S|（[一二三四五六七八九十百]+）\s*\S|\([一二三四五六七八九十百]+\)\s*\S)"
+)
+_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])")
+_MIN_CHUNK_LEN = 10
 
 
 @dataclass
@@ -38,82 +45,323 @@ class Section:
 # ============ 文档解析 ============
 
 def parse_file(filename: str, data: bytes) -> str:
-    """按扩展名解析文档为纯文本。"""
-    name = filename.lower()
+    """按扩展名解析文档为纯文本。整理后的文本交给同一套语义切分。"""
+    name = (filename or "").lower()
     if name.endswith(".pdf"):
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    if name.endswith((".docx", ".doc")):
-        from docx import Document
-        doc = Document(io.BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    # md / txt 及其他按纯文本处理
+        return _parse_pdf(data)
+    if name.endswith(".docx"):
+        return _parse_docx(data)
+    if name.endswith(".doc"):
+        raise ValueError("旧版 .doc 无法解析，请另存为 docx 后再上传")
     return data.decode("utf-8", errors="ignore")
+
+
+def _parse_docx(data: bytes) -> str:
+    from docx import Document
+    doc = Document(io.BytesIO(data))
+    counters: dict[tuple[int, int], int] = {}
+    lines: list[str] = []
+    for paragraph in doc.paragraphs:
+        text = (paragraph.text or "").strip()
+        if not text and not lines:
+            continue
+        if not text:
+            lines.append("")
+            continue
+        if _is_word_heading(paragraph):
+            lines.append("")
+            lines.append(f"## {text}")
+            lines.append("")
+            continue
+        prefix = _word_list_prefix(paragraph, counters)
+        lines.append(f"{prefix}{text}" if prefix else text)
+    return "\n".join(lines).strip()
+
+
+def _is_word_heading(paragraph) -> bool:
+    name = ""
+    try:
+        name = paragraph.style.name or ""
+    except AttributeError:
+        name = ""
+    folded = name.lower()
+    return folded.startswith("heading") or name.startswith("标题")
+
+
+def _word_list_prefix(paragraph, counters: dict[tuple[int, int], int]) -> str:
+    """自动编号写回正文。读不到具体数字时用间隔号，避免条目变成普通句子。"""
+    try:
+        p_pr = paragraph._p.pPr
+        num_pr = p_pr.numPr if p_pr is not None else None
+    except AttributeError:
+        return ""
+    if num_pr is None:
+        return ""
+    try:
+        num_id = int(num_pr.numId.val)
+        level = int(num_pr.ilvl.val) if num_pr.ilvl is not None and num_pr.ilvl.val is not None else 0
+    except (TypeError, ValueError, AttributeError):
+        return "· "
+    fmt = _word_num_fmt(paragraph, num_id, level)
+    if fmt not in ("decimal", "decimalZero", "chineseCounting", "japaneseCounting"):
+        return "· "
+    key = (num_id, level)
+    counters[key] = counters.get(key, 0) + 1
+    for deeper in [item for item in counters if item[0] == num_id and item[1] > level]:
+        counters.pop(deeper, None)
+    return f"{counters[key]}、"
+
+
+def _word_num_fmt(paragraph, num_id: int, level: int) -> str | None:
+    try:
+        numbering = paragraph.part.numbering_part._element
+    except Exception:  # noqa: BLE001
+        return None
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    num = numbering.find(f".//w:num[@w:numId='{num_id}']", ns)
+    if num is None:
+        return None
+    abstract = num.find("w:abstractNumId", ns)
+    if abstract is None:
+        return None
+    abstract_id = abstract.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val")
+    abstract_node = numbering.find(f".//w:abstractNum[@w:abstractNumId='{abstract_id}']", ns)
+    if abstract_node is None:
+        return None
+    lvl = abstract_node.find(f"w:lvl[@w:ilvl='{level}']", ns)
+    if lvl is None:
+        return None
+    fmt = lvl.find("w:numFmt", ns)
+    if fmt is None:
+        return None
+    return fmt.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val")
+
+
+def _parse_pdf(data: bytes) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return _unwrap_pdf_text(_strip_repeated_page_edges(pages))
+
+
+def _strip_repeated_page_edges(pages: list[str]) -> list[str]:
+    """相邻页开头或结尾完全相同的一行视为页眉页脚。"""
+    if len(pages) < 2:
+        return pages
+
+    def edges(page: str) -> tuple[str, str]:
+        rows = [line.strip() for line in page.splitlines() if line.strip()]
+        if not rows:
+            return "", ""
+        return rows[0], rows[-1]
+
+    heads, tails = zip(*(edges(page) for page in pages))
+    header = heads[0] if heads[0] and all(item == heads[0] for item in heads) else ""
+    footer = tails[0] if tails[0] and tails[0] != header and all(item == tails[0] for item in tails) else ""
+    cleaned: list[str] = []
+    for page in pages:
+        rows = page.splitlines()
+        if rows and header and rows[0].strip() == header:
+            rows = rows[1:]
+        if rows and footer and rows[-1].strip() == footer:
+            rows = rows[:-1]
+        cleaned.append("\n".join(rows))
+    return cleaned
+
+
+def _unwrap_pdf_text(text: str) -> str:
+    """不以编号或章节开头的折行接回上一行。"""
+    merged: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line:
+            merged.append("")
+            continue
+        if (
+            merged
+            and merged[-1]
+            and not _SECTION_HEADING_RE.match(line)
+            and not _LIST_LINE_RE.match(line)
+        ):
+            merged[-1] = merged[-1].rstrip() + line
+            continue
+        merged.append(line)
+    return "\n".join(merged).strip()
 
 
 # ============ 切分 ============
 
 def split_text(text: str) -> list[str]:
-    """按小节切分。超长小节保持整节，滑窗在入库时再做。"""
+    """按语义块切分，相邻块带 10% 到 20% 重叠。"""
     return [section.text for section in split_sections(text)]
 
 
 def split_sections(text: str) -> list[Section]:
-    """按 Markdown 标题和空行切成小节，标题跟随其后的正文。过短碎片不返回。"""
+    """纯文本语义块。无嵌入时不把长段再切开。过短碎片不返回。"""
+    return _apply_overlap(_structural_sections(text))
+
+
+def _structural_sections(text: str) -> list[Section]:
+    """按章节标题和空行成块。编号清单留在同一块，不按句号拆开。"""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
     sections: list[Section] = []
     heading = ""
-    for block in re.split(r"\n\s*\n", text.strip()):
-        block = block.strip()
-        if not block:
-            continue
+    for block in re.split(r"\n\s*\n", normalized):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
         buf: list[str] = []
-        for line in block.splitlines():
-            stripped = line.strip()
-            if _HEADING_RE.match(stripped):
-                _flush_section(sections, heading, buf)
-                heading = stripped
+
+        def flush() -> None:
+            nonlocal buf
+            if not buf:
+                return
+            body = "\n".join(buf).strip()
+            buf = []
+            if not body:
+                return
+            chunk = f"{heading}\n{body}" if heading else body
+            if len(chunk) < _MIN_CHUNK_LEN:
+                return
+            sections.append(Section(heading=heading, text=chunk))
+
+        for line in lines:
+            if _SECTION_HEADING_RE.match(line):
+                flush()
+                heading = line
                 continue
             buf.append(line)
-        _flush_section(sections, heading, buf)
+        flush()
     return sections
 
 
-def _flush_section(sections: list[Section], heading: str, buf: list[str]) -> None:
-    body = "\n".join(buf).strip()
-    buf.clear()
-    if not body:
-        return
-    text = f"{heading}\n{body}" if heading else body
-    if len(text) < 10:
-        return
-    sections.append(Section(heading=heading, text=text))
+def _body_of(section: Section) -> str:
+    if section.heading and section.text.startswith(section.heading):
+        return section.text[len(section.heading):].lstrip("\n")
+    return section.text
 
 
-def _sliding_window(text: str) -> list[str]:
-    """滑窗切分。窗口末尾尽量落在句号上，避免把一句话切成两半。"""
-    if len(text) <= CHUNK_SIZE:
-        return [text]
-    result = []
-    start = 0
-    while start < len(text):
-        hard_end = min(start + CHUNK_SIZE, len(text))
-        end = hard_end
-        if hard_end < len(text):
-            window = text[start:hard_end]
-            cut = max(window.rfind(mark) for mark in _SENTENCE_MARKS)
-            if cut >= int(CHUNK_SIZE * 0.6):
-                end = start + cut + 1
-        piece = text[start:end].strip()
-        if piece:
-            result.append(piece)
-        if end >= len(text):
+def _boundary_pieces(text: str) -> list[str]:
+    """切成可对齐的句子或清单条目，拼回去等于原文。"""
+    if not text:
+        return []
+    pieces: list[str] = []
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        newline = "\n" if index < len(lines) - 1 else ""
+        stripped = line.strip()
+        if not stripped or _LIST_LINE_RE.match(stripped) or _SECTION_HEADING_RE.match(stripped):
+            pieces.append(line + newline)
+            continue
+        sentences = [part for part in _SENTENCE_SPLIT_RE.split(line) if part]
+        if len(sentences) <= 1:
+            pieces.append(line + newline)
+            continue
+        for sentence_index, sentence in enumerate(sentences):
+            if sentence_index == len(sentences) - 1:
+                pieces.append(sentence + newline)
+            else:
+                pieces.append(sentence)
+    return [piece for piece in pieces if piece]
+
+
+def _overlap_tail(text: str) -> str:
+    """上一块末尾的 10% 到 20%。只取完整句子或完整条目。"""
+    pieces = _boundary_pieces(text)
+    if not pieces:
+        return ""
+    total = len(text)
+    if len(pieces) == 1:
+        return pieces[0]
+    target = total * OVERLAP_TARGET
+    taken = 0
+    cut = len(pieces)
+    for index in range(len(pieces) - 1, -1, -1):
+        taken += len(pieces[index])
+        cut = index
+        if taken >= target:
             break
-        next_start = end - CHUNK_OVERLAP
-        if next_start <= start:
-            next_start = end
-        start = next_start
-    return result
+
+    def tail_from(index: int) -> str:
+        return "".join(pieces[index:])
+
+    tail = tail_from(cut)
+    while len(tail) > total * OVERLAP_MAX and cut < len(pieces) - 1:
+        cut += 1
+        tail = tail_from(cut)
+    if len(tail) < total * OVERLAP_MIN and cut > 0:
+        cut -= 1
+        tail = tail_from(cut)
+    return tail
+
+
+def _apply_overlap(sections: list[Section]) -> list[Section]:
+    """下一块开头抄上上一块末尾，清单块本身保持完整。"""
+    if len(sections) < 2:
+        return sections
+    overlapped = [sections[0]]
+    for prev, curr in zip(sections, sections[1:]):
+        tail = _overlap_tail(_body_of(prev)).strip()
+        body = _body_of(curr)
+        if tail and not body.startswith(tail):
+            body = f"{tail}\n{body}"
+        text = f"{curr.heading}\n{body}" if curr.heading else body
+        overlapped.append(Section(heading=curr.heading, text=text))
+    return overlapped
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+async def _split_by_similarity(text: str) -> list[str]:
+    """无结构长段：相邻句子相似度明显下降时切开。失败则保持整段。"""
+    pieces = [part for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+    if len(pieces) < 4 or not settings.embedding_configured:
+        return [text]
+    vectors = await embeddings.embed_texts(pieces)
+    if not vectors or len(vectors) != len(pieces):
+        return [text]
+    scores = [_cosine(vectors[index], vectors[index + 1]) for index in range(len(vectors) - 1)]
+    median = sorted(scores)[len(scores) // 2]
+    groups: list[list[str]] = [[pieces[0]]]
+    for index, score in enumerate(scores):
+        if score < median - _SIMILARITY_DROP:
+            groups.append([pieces[index + 1]])
+        else:
+            groups[-1].append(pieces[index + 1])
+    if len(groups) == 1:
+        return [text]
+    return ["".join(group) for group in groups]
+
+
+async def _refine_unstructured(sections: list[Section]) -> list[Section]:
+    refined: list[Section] = []
+    for section in sections:
+        if section.heading or not settings.embedding_configured:
+            refined.append(section)
+            continue
+        parts = await _split_by_similarity(section.text)
+        if len(parts) <= 1:
+            refined.append(section)
+            continue
+        refined.extend(
+            Section(heading="", text=part)
+            for part in parts
+            if len(part) >= _MIN_CHUNK_LEN
+        )
+    return refined
+
+
+async def build_sections(text: str) -> list[Section]:
+    """入库用语义块。嵌入可用时先拆无结构长段，再做相邻重叠。"""
+    sections = await _refine_unstructured(_structural_sections(text))
+    return _apply_overlap(sections)
 
 
 def _index_text(doc_title: str, heading: str, text: str) -> str:
@@ -175,7 +423,7 @@ async def ingest_faq(doc_id: int):
 
 
 async def ingest_document(doc_id: int):
-    """文档按小节切分。超长小节建父块，只索引带标题的子块。"""
+    """文档按语义块入库。每块都可检索，不再做固定长度滑窗。"""
     db = SessionLocal()
     try:
         doc = db.get(KnowledgeDoc, doc_id)
@@ -184,23 +432,11 @@ async def ingest_document(doc_id: int):
         _delete_chunks(db, doc_id)
 
         index_chunks: list[KnowledgeChunk] = []
-        for i, section in enumerate(split_sections(doc.content or "")):
-            if len(section.text) <= CHUNK_SIZE:
-                index_chunks.append(KnowledgeChunk(
-                    doc_id=doc_id, parent_id=None, chunk_index=i,
-                    content=_index_text(doc.title, section.heading, section.text),
-                ))
-                continue
-            parent = KnowledgeChunk(
-                doc_id=doc_id, parent_id=None, chunk_index=i, content=section.text,
-            )
-            db.add(parent)
-            db.flush()
-            for j, window in enumerate(_sliding_window(section.text)):
-                index_chunks.append(KnowledgeChunk(
-                    doc_id=doc_id, parent_id=parent.id, chunk_index=i * 1000 + j,
-                    content=_index_text(doc.title, section.heading, window),
-                ))
+        for i, section in enumerate(await build_sections(doc.content or "")):
+            index_chunks.append(KnowledgeChunk(
+                doc_id=doc_id, parent_id=None, chunk_index=i,
+                content=_index_text(doc.title, section.heading, section.text),
+            ))
         db.add_all(index_chunks)
         db.commit()
         for chunk in index_chunks:

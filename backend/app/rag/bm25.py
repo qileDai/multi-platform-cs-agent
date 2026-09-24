@@ -30,8 +30,11 @@ _bm25: _BM25Okapi | None = None
 _corpus_meta: list[dict] = []  # 与 BM25 语料同序: {chunk_id, doc_id, content}
 
 
+_STOPWORDS = {"的", "了", "吗", "呢", "啊", "呀"}
+
+
 def _tokenize(text: str) -> list[str]:
-    return [t for t in jieba.lcut(text.lower()) if t.strip()]
+    return [t for t in jieba.lcut(text.lower()) if t.strip() and t not in _STOPWORDS]
 
 
 def rebuild(chunks: list[dict]):

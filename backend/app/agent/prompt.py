@@ -27,8 +27,9 @@ def load_prompt() -> str:
 
 
 def render_prompt(*, platform: str, knowledge_context: str,
-                  history_text: str, user_message: str) -> str:
-    """渲染模板变量。"""
+                  history_text: str, user_message: str,
+                  customer_profile: str = "", rewritten_question: str = "") -> str:
+    """渲染模板变量。新增参数默认为空，旧评测不用改用例。"""
     from . import tools  # 延迟导入，避免注册顺序问题
     template = load_prompt()
     return (
@@ -38,6 +39,8 @@ def render_prompt(*, platform: str, knowledge_context: str,
         .replace("{{knowledge_context}}", knowledge_context or "无匹配资料")
         .replace("{{history}}", history_text or "（无历史，这是用户的第一条消息）")
         .replace("{{user_message}}", user_message)
+        .replace("{{customer_profile}}", customer_profile or "无")
+        .replace("{{rewritten_question}}", rewritten_question or "")
         .replace("{{tools_section}}", tools.tools_prompt_text())
         .replace("{{current_time}}", datetime.now().strftime("%Y-%m-%d %H:%M"))
     )

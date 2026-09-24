@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..agent.engine import process_ai_reply
 from ..config import settings
-from ..core import contentfilter
+from ..core import contentfilter, ratelimit
 from ..database import SessionLocal
 from ..models import Conversation, Customer, Message
 from ..schemas import InboundMessage
@@ -101,22 +101,27 @@ async def _handle_reply(body: dict) -> dict:
 
     await _broadcast_saved(conversation_id, trigger_id)
 
-    if mode != "ai" or status != "open":
-        return _skip("会话已由人工接待")
+    if status != "open":
+        return _skip("会话已结束")
 
     risk = contentfilter.check_inbound(text)
     if risk["level"] == "block":
         _mark_risk(trigger_id, risk)
-        await handoff(conversation_id, reason="risk_content")
+        if mode == "ai":
+            await handoff(conversation_id, reason="risk_content")
         return _skip("消息触发风险拦截，请人工处理")
     if risk["level"] == "warn":
         _mark_risk(trigger_id, risk)
 
     if not settings.ai_globally_enabled:
-        await handoff(conversation_id, reason="ai_globally_disabled")
+        if mode == "ai":
+            await handoff(conversation_id, reason="ai_globally_disabled")
         return _skip("AI 已关闭，请人工回复")
 
-    reply_text = await process_ai_reply(conversation_id, local=True)
+    if mode not in ("ai", "pending", "human"):
+        return _skip("会话已由人工接待")
+
+    reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
     reply_text = (reply_text or "").strip()[:4000]
     if not reply_text:
         return _skip("没有可发送的回复")
@@ -258,6 +263,11 @@ def _persist(body: dict, platform: str, raw_platform: str, request_key: str, tex
         conversation = db.get(Conversation, conversation_id)
         mode = conversation.mode if conversation is not None else mode
         status = conversation.status if conversation is not None else status
+        if conversation is not None:
+            ratelimit.reset_reply_window(
+                conversation.platform,
+                conversation.platform_conversation_id or str(conversation.id),
+            )
     finally:
         db.close()
     return conversation_id, mode, status, trigger

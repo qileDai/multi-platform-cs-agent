@@ -613,7 +613,7 @@ function MessageBubble({
           <div
             title={fullTime}
             className={clsx(
-              'rounded-2xl px-3.5 py-2 text-sm leading-relaxed break-words shadow-sm',
+              'rounded-2xl px-3.5 py-2 text-sm leading-relaxed break-words whitespace-pre-wrap shadow-sm',
               isUser
                 ? 'bg-white dark:bg-gray-800 dark:text-gray-50 border border-gray-200 dark:border-gray-600 rounded-tl-sm'
                 : isAi

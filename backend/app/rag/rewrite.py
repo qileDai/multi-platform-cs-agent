@@ -1,7 +1,7 @@
 """查询改写：多轮对话指代消解 + 同义多路召回。
 
-把「那这个多少钱」结合历史改写成独立完整问题，并生成 1~2 个同义改写。
-LLM 未配置，或历史里除当前这句外没有更早的消息时，直接返回原查询。
+把「那这个多少钱」结合历史改写成独立完整问题，并生成 1 个同义改写。
+LLM 未配置或调用失败时返回原查询。没有更早对话时仍做一次同义改写。
 """
 import json
 import logging
@@ -42,21 +42,28 @@ def _render_prompt(history_text: str, query: str) -> str:
     )
 
 
-async def rewrite_query(query: str, history: list[dict]) -> list[str]:
-    """返回改写后的查询列表（含原查询）。失败/未配置/没有更早历史时返回 [query]。"""
-    earlier = _earlier_history(query, history)
-    if not settings.llm_configured or not earlier:
+async def rewrite_query(query: str, history: list[dict], summary: str = "") -> list[str]:
+    """返回改写后的查询列表（含原查询，最多 3 条）。未配置或失败时返回 [query]。"""
+    if not settings.llm_configured:
         return [query]
+    earlier = _earlier_history(query, history)
     try:
-        history_text = "\n".join(
+        lines = []
+        if summary:
+            lines.append(f"【早前对话小结】{summary}")
+        lines.extend(
             f"{'用户' if h['sender_type'] == 'user' else '客服'}: {h['content']}"
-            for h in earlier[-6:]
+            for h in earlier
         )
-        client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+        history_text = "\n".join(lines) or "（无更早对话）"
+        client = AsyncOpenAI(
+            base_url=settings.llm_base_url, api_key=settings.llm_api_key, timeout=8.0,
+        )
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": _render_prompt(history_text, query)}],
             temperature=0,
+            max_tokens=200,
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)

@@ -237,6 +237,17 @@ async def lifespan(app: FastAPI):
         logger.info("知识库索引版本不一致，后台重建")
         reindex_task = asyncio.create_task(ingest.reindex_all())
 
+    async def _replay_stuck_phrase():
+        if reindex_task is not None:
+            try:
+                await reindex_task
+            except Exception:
+                logger.exception("索引重建失败，仍尝试补跑未回复消息")
+        from .services import replay_unanswered_phrase
+        await replay_unanswered_phrase("面签资料清单")
+
+    replay_task = asyncio.create_task(_replay_stuck_phrase())
+
     # 启动任务队列 worker / 会话超时清扫 / 小红书 token 刷新 / 发布调度 / 自动备份
     start_worker()
     sweeper_task = asyncio.create_task(session_sweeper())
@@ -268,6 +279,7 @@ async def lifespan(app: FastAPI):
     health_task.cancel()
     if reindex_task is not None:
         reindex_task.cancel()
+    replay_task.cancel()
     await stop_backup()
     await stop_worker()
 

@@ -115,6 +115,10 @@ async def _handle_inbound_locked(db, msg: InboundMessage):
 
     conversation.last_message_at = message.created_at
     conversation.unread_count = (conversation.unread_count or 0) + 1
+    ratelimit.reset_reply_window(
+        conversation.platform,
+        conversation.platform_conversation_id or str(conversation.id),
+    )
     db.commit()
 
     await _broadcast_message(conversation, message)
@@ -140,12 +144,15 @@ async def _route_after_user_message(conversation_id: int, *, risk_level: str, mo
         await handoff(conversation_id, reason="ai_globally_disabled")
         return
 
-    # AI 接待模式才进 Agent 引擎
-    if mode == "ai" and status == "open":
-        # 通知前端展示「正在输入」动画（AI 回复的 new_message 到达后前端自动清除）
+    # AI 接待直接进引擎。已经排队或人工接待、但这条后面还没人回时，也补答一次。
+    if status == "open" and mode == "ai":
         await manager.broadcast("ai_typing", {"conversation_id": conversation_id})
         from .agent.engine import process_ai_reply  # 延迟导入避免循环依赖
         await process_ai_reply(conversation_id)
+        return
+    if status == "open" and mode in ("pending", "human") and settings.ai_globally_enabled:
+        from .agent.engine import process_ai_reply
+        await process_ai_reply(conversation_id, allow_owned=True)
 
 
 async def _resume_if_unanswered(conversation_id: int, user_message_id: int):
@@ -176,6 +183,65 @@ async def _resume_if_unanswered(conversation_id: int, user_message_id: int):
     await _route_after_user_message(
         conversation_id, risk_level=risk_level, mode=mode, status=status,
     )
+
+
+async def note_unmatched(conversation_id: int) -> None:
+    """排队或人工会话没对上资料：写系统说明，不再重复转人工。"""
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        if conversation is None or conversation.status != "open":
+            return
+        message = _save_message(
+            db, conversation_id, sender_type="system", msg_type="system",
+            content="这条没对上资料，需要人工回复",
+        )
+        conversation.last_message_at = message.created_at
+        db.commit()
+        await _broadcast_message(conversation, message)
+    except Exception:
+        db.rollback()
+        logger.exception("写入未命中说明失败 conversation=%s", conversation_id)
+    finally:
+        db.close()
+
+
+async def replay_unanswered_phrase(phrase: str) -> int:
+    """只补跑仍 open、最后一条正好是这句话、且后面没有回复的会话。"""
+    target = (phrase or "").strip()
+    if not target:
+        return 0
+    db = SessionLocal()
+    jobs: list[tuple[int, int]] = []
+    try:
+        conversations = db.query(Conversation).filter(Conversation.status == "open").all()
+        for conversation in conversations:
+            last = (
+                db.query(Message)
+                .filter(
+                    Message.conversation_id == conversation.id,
+                    Message.is_internal.is_(False),
+                )
+                .order_by(Message.id.desc())
+                .first()
+            )
+            if last is None or last.sender_type != "user":
+                continue
+            if (last.content or "").strip() != target:
+                continue
+            jobs.append((conversation.id, last.id))
+    finally:
+        db.close()
+    done = 0
+    for conversation_id, message_id in jobs:
+        try:
+            await _resume_if_unanswered(conversation_id, message_id)
+            done += 1
+        except Exception:
+            logger.exception("补跑未回复消息失败 conversation=%s", conversation_id)
+    if done:
+        logger.info("已补跑未回复的「%s」%d 条", target, done)
+    return done
 
 
 def _upsert_customer(db, msg: InboundMessage) -> Customer:
@@ -258,7 +324,7 @@ def _save_message(db, conversation_id: int, *, sender_type: str, content: str,
 async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
                         sender_id: int | None = None, extra: dict | None = None,
                         skip_filter: bool = False, msg_type: str = "text",
-                        media_id: str = "") -> Message | None:
+                        media_id: str = "", allow_owned: bool = False) -> Message | None:
     """统一出站入口。返回 None 表示被守卫/频控拦截。
 
     msg_type/media_id：图片/语音消息（RPA 通道经 outbox 由 Worker 发到平台）。
@@ -270,7 +336,7 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
             return None
         # AI 气泡发出前再看一次：人工已接管、会话已结束或全局开关已关，就不再打到平台。
         # 人工消息和转人工系统消息不走这里。
-        if sender_type == "ai" and not _ai_may_send(conversation):
+        if sender_type == "ai" and not _ai_may_send(conversation, allow_owned=allow_owned):
             logger.info(
                 "跳过 AI 出站 conversation=%s mode=%s status=%s ai_enabled=%s",
                 conversation_id, conversation.mode, conversation.status,
@@ -299,6 +365,20 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         allowed, rule = ratelimit.check_and_count(rate_platform, conv_key)
         if not allowed:
             logger.warning("频控超限 platform=%s rule=%s，转人工", rate_platform, rule)
+            kept = _save_message(
+                db, conversation_id, sender_type=sender_type, content=filtered,
+                msg_type=msg_type, sender_id=sender_id,
+                extra={**(extra or {}), "rate_limit": rule},
+            )
+            conversation.last_message_at = kept.created_at
+            if conversation.mode != "ai":
+                note = _save_message(
+                    db, conversation_id, sender_type="system", msg_type="system",
+                    content=f"这条回复被频控拦住了（{rule}）",
+                )
+                conversation.last_message_at = note.created_at
+            db.commit()
+            await _broadcast_message(conversation, kept)
             await handoff(conversation_id, reason=f"rate_limit:{rule}")
             return None
 
@@ -340,17 +420,18 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         db.close()
 
 
-def _ai_may_send(conversation: Conversation) -> bool:
-    """AI 出站只在仍由 AI 接待、会话未结束、且全局开关开着时放行。"""
-    return (
-        conversation.mode == "ai"
-        and conversation.status == "open"
-        and settings.ai_globally_enabled
-    )
+def _ai_may_send(conversation: Conversation, *, allow_owned: bool = False) -> bool:
+    """AI 出站默认只在 AI 接待时放行。补答和招呼可在排队/人工会话里发出，模式不变。"""
+    if conversation.status != "open" or not settings.ai_globally_enabled:
+        return False
+    if conversation.mode == "ai":
+        return True
+    return allow_owned and conversation.mode in ("pending", "human")
 
 
 async def record_local_ai_message(conversation_id: int, content: str,
-                                  extra: dict | None = None) -> Message | None:
+                                  extra: dict | None = None,
+                                  allow_owned: bool = False) -> Message | None:
     """知你快回通道：违禁词过滤后只写入本系统并广播，不调用平台适配器，不计频控。
 
     platform_msg_id 留空，避免和触发消息的短键或平台消息 ID 冲突。
@@ -358,7 +439,7 @@ async def record_local_ai_message(conversation_id: int, content: str,
     db = SessionLocal()
     try:
         conversation = db.get(Conversation, conversation_id)
-        if conversation is None or not _ai_may_send(conversation):
+        if conversation is None or not _ai_may_send(conversation, allow_owned=allow_owned):
             return None
         filtered, hits = contentfilter.sanitize(content)
         filtered = (filtered or "").strip()[:4000]

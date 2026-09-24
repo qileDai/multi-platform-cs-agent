@@ -43,6 +43,15 @@ export interface Message {
     from_agent_id?: number
     outbox_status?: 'pending' | 'leased' | 'acked' | 'failed' | 'discarded'
     badcase_note?: string
+    grounding?: string
+    retrieval?: {
+      queries?: string[]
+      dense_count?: number
+      bm25_count?: number
+      rerank_top_score?: number | null
+      reason?: string
+      rerank_status?: string
+    }
   }
   is_internal: boolean
   bad_case: boolean

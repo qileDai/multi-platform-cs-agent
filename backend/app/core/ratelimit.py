@@ -98,6 +98,19 @@ def remaining(platform: str, conversation_key: str) -> dict[str, int]:
     return result
 
 
+_REPLY_WINDOW_RULES = {"reply_24h", "reply_48h"}
+
+
+def reset_reply_window(platform: str, conversation_key: str) -> None:
+    """用户新发一条消息后，这一轮的 6 条回复额度重新计算。每分钟上限保留。"""
+    platforms = {platform, f"{platform}_rpa"}
+    if platform == "douyin":
+        platforms.add("douyin_enterprise_rpa")
+    for rate_platform in platforms:
+        for name in _REPLY_WINDOW_RULES:
+            _counters.pop((rate_platform, conversation_key, name), None)
+
+
 def reset_all():
     """测试用：清空计数器。"""
     _counters.clear()

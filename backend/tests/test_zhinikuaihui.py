@@ -202,9 +202,9 @@ class TestZhiniContract:
         calls = {"n": 0}
         from app.agent.engine import process_ai_reply as real
 
-        async def wrapped(conversation_id: int, local: bool = False) -> str:
+        async def wrapped(conversation_id: int, local: bool = False, allow_owned: bool = False) -> str:
             calls["n"] += 1
-            return await real(conversation_id, local=local)
+            return await real(conversation_id, local=local, allow_owned=allow_owned)
 
         with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=wrapped):
             first = client.post("/api/integrations/zhinikuaihui/reply", json=body, headers=_auth(zhini_key))

@@ -16,7 +16,7 @@ def _ctx(conversation) -> ToolContext:
 
 def _isolate_rag(monkeypatch):
     """隔离 RAG 检索（避免测试触发真实 LLM/Embedding 网络调用）。"""
-    async def fake_retrieve(query, history=None, top_k=3):
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
         return rag_pipeline.RetrievalResult(
             passed=True,
             contexts=[{"content": "测试资料", "source": "test"}],

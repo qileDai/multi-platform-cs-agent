@@ -31,7 +31,10 @@ REPLY_BUDGET_SECONDS = 12
 _CONFIRM_REPLY = "我先让同事帮您确认"
 _TASK_RE = re.compile(r"订单|物流|快递|退货|退换|换货|退款")
 _FACT_TOOLS = frozenset({"query_order", "query_logistics"})
-_GREETING_REPLY = "在的呢，想问啥呀"
+_HELLO_REPLY = "在的，我是小赢。香港公司注册、开户都可以问我"
+_THANKS_REPLY = "客气啦，有问题随时喊我"
+_LAUGH_REPLY = "哈哈，注册还是开户，您想先看哪块"
+_GREETING_REPLIES = {"谢谢": _THANKS_REPLY, "哈哈": _LAUGH_REPLY}
 _LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
 _LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
 _LIST_LEAD = "清单我按资料发你"
@@ -44,14 +47,24 @@ _GREETINGS = frozenset({
 _GREETING_TAILS = "呀啊呢哈哦"
 
 
-def is_pure_greeting(text: str) -> bool:
-    """整句只是招呼。后面还带着具体问题时返回 False，继续检索。"""
+def _greeting_key(text: str) -> str | None:
+    """抽出纯招呼的词。后面还带着具体问题时返回 None。"""
     cleaned = re.sub(r"[\s，。！？、~～!?,.·…]+", "", text or "")
     if cleaned in _GREETINGS:
-        return True
+        return cleaned
     if cleaned and cleaned[-1] in _GREETING_TAILS and cleaned[:-1] in _GREETINGS:
-        return True
-    return False
+        return cleaned[:-1]
+    return None
+
+
+def is_pure_greeting(text: str) -> bool:
+    """整句只是招呼。后面还带着具体问题时返回 False，继续检索。"""
+    return _greeting_key(text) is not None
+
+
+def greeting_reply(text: str) -> str:
+    """你好、哈喽用开场；谢谢和哈哈用短句，不套业务介绍。"""
+    return _GREETING_REPLIES.get(_greeting_key(text) or "", _HELLO_REPLY)
 
 
 async def process_ai_reply(conversation_id: int, *, local: bool = False,
@@ -88,7 +101,7 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
 
     if is_pure_greeting(user_text):
         return await _deliver_ai(
-            conversation_id_, [_GREETING_REPLY], local=local, allow_owned=owned,
+            conversation_id_, [greeting_reply(user_text)], local=local, allow_owned=owned,
             extra={"intent": "chitchat", "confidence": 1.0, "citations": []},
         )
 

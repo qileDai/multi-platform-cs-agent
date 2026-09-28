@@ -299,7 +299,8 @@ async def test_pure_greeting_stays_with_ai(db, conversation, monkeypatch):
             .first()
         )
         assert "没查到靠谱资料" not in ai.content
-        assert "在的呢" in ai.content
+        assert "小赢" in ai.content
+        assert "开户" in ai.content
     assert called == []
     assert db.query(MissedQuestion).filter(MissedQuestion.conversation_id == conversation.id).count() == 0
     assert db.query(Message).filter(
@@ -337,7 +338,8 @@ async def test_human_greeting_sends_without_mode_change(db, conversation, monkey
     ai = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one()
-    assert "在的呢" in ai.content
+    assert "小赢" in ai.content
+    assert "开户" in ai.content
     assert db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "system",
     ).count() == 0

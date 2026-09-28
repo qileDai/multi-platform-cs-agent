@@ -245,12 +245,20 @@ async def lifespan(app: FastAPI):
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
             db.add_all([
-                QuickReply(title="打招呼", content="来啦，想问啥呀"),
+                QuickReply(title="打招呼", content="在的，我是小赢。香港公司注册、开户都可以问我"),
                 QuickReply(title="稍等", content="稍等哈，我帮您查一下"),
                 QuickReply(title="转人工", content="这个我让同事来帮您处理哈，马上来"),
                 QuickReply(title="感谢", content="客气啦，有问题随时喊我"),
                 QuickReply(title="留资引导", content="您留个手机号，稍后同事联系您，给您安排优惠"),
             ])
+        else:
+            stale = (
+                db.query(QuickReply)
+                .filter(QuickReply.title == "打招呼", QuickReply.content == "来啦，想问啥呀")
+                .all()
+            )
+            for item in stale:
+                item.content = "在的，我是小赢。香港公司注册、开户都可以问我"
         db.commit()
         # 违禁词库加载（含入口/出口方向）
         contentfilter.load_db_words(

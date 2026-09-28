@@ -187,6 +187,41 @@ def _rpa_housekeep_once():
         db.close()
 
 
+def _ensure_admin(db) -> None:
+    """保证有 admin。非生产环境密码不是 admin123 时重置；生产环境只补建缺失账号。"""
+    admin = db.query(Agent).filter(Agent.username == "admin").first()
+    # #region agent log
+    try:
+        import json, time
+        _hash = admin.password_hash if admin is not None else ""
+        _ok = bool(admin is not None and verify_password("admin123", _hash))
+        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "startup admin check", "data": {"app_env": settings.app_env, "admin_exists": admin is not None, "hash_len": len(_hash or ""), "hash_prefix": (_hash or "")[:4], "password_ok": _ok, "db": settings.database_url}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    if admin is None:
+        db.add(Agent(username="admin", password_hash=hash_password("admin123"),
+                     display_name="管理员", role="admin", status="active"))
+        logger.info("已创建默认管理员 admin / admin123，请尽快修改密码")
+        return
+    if settings.app_env == "production":
+        return
+    if verify_password("admin123", admin.password_hash):
+        return
+    admin.password_hash = hash_password("admin123")
+    admin.role = "admin"
+    logger.warning("非生产环境已将管理员 admin 的密码重置为 admin123")
+    # #region agent log
+    try:
+        import json, time
+        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "password reset written", "data": {"verify_after": verify_password("admin123", admin.password_hash)}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
 def _warn_insecure_defaults(db) -> None:
     """启动安全自检：弱配置显著告警（不阻断启动，处置见 docs/deployment-checklist.md）。"""
     if settings.secret_key == "change-me-to-a-random-string":
@@ -206,11 +241,7 @@ async def lifespan(app: FastAPI):
     init_db()
     db = SessionLocal()
     try:
-        # 默认管理员
-        if db.query(Agent).count() == 0:
-            db.add(Agent(username="admin", password_hash=hash_password("admin123"),
-                         display_name="管理员", role="admin", status="active"))
-            logger.info("已创建默认管理员 admin / admin123，请尽快修改密码")
+        _ensure_admin(db)
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
             db.add_all([

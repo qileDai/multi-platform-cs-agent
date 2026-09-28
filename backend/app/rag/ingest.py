@@ -18,7 +18,7 @@ from pathlib import Path
 from ..config import settings
 from ..database import SessionLocal
 from ..models import KnowledgeChunk, KnowledgeDoc
-from . import bm25, embeddings, vectorstore
+from . import bm25, cache as answer_cache, embeddings, vectorstore
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +447,7 @@ async def ingest_document(doc_id: int):
 
 
 def _delete_chunks(db, doc_id: int):
+    answer_cache.invalidate_docs([doc_id])
     db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id == doc_id).delete()
     db.commit()
     try:
@@ -515,6 +516,7 @@ def _write_index_version() -> None:
 
 async def reindex_all() -> None:
     """切块版本变化后，重嵌入全部生效文档。失败则不写版本号，下次启动再试。"""
+    answer_cache.clear()
     db = SessionLocal()
     try:
         docs = (

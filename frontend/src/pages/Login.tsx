@@ -25,8 +25,8 @@ export default function Login() {
     try {
       await login(username, password)
       navigate('/')
-    } catch {
-      setError('用户名或密码错误')
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : '用户名或密码错误')
     } finally {
       setLoading(false)
     }

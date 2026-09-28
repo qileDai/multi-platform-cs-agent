@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+import httpx
+
 from ..config import settings
 from ..database import SessionLocal
 from ..models import (Conversation, Customer, FunnelEvent, MatrixAccount, Ticket,
@@ -97,17 +99,16 @@ class QueryOrderTool(Tool):
         phone = (args.get("phone") or "").strip()
         if not phone or len(phone) != 11 or not phone.startswith("1"):
             return {"ok": False, "data": None, "error": "手机号格式不对，请向用户确认 11 位手机号"}
-        # TODO 生产环境：替换为真实订单接口，例如
-        #   async with httpx.AsyncClient() as client:
-        #       resp = await client.get(settings.order_api_url, params={"phone": phone}, ...)
-        # 当前为演示数据：
-        return {"ok": True, "data": {
-            "orders": [
-                {"order_id": "DD20240901001", "product": "便携榨汁杯 标准款", "amount": 99.0,
-                 "status": "已发货", "created_at": "2024-09-01 10:23"},
-            ],
-            "note": "演示数据，接入真实订单接口后返回实际结果",
-        }, "error": ""}
+        if not settings.order_api_url:
+            return {"ok": False, "data": None, "error": "订单接口未接入"}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(settings.order_api_url, params={"phone": phone})
+                resp.raise_for_status()
+                return {"ok": True, "data": resp.json(), "error": ""}
+        except Exception:  # noqa: BLE001
+            logger.exception("订单接口调用失败")
+            return {"ok": False, "data": None, "error": "订单接口暂时不可用"}
 
 
 class QueryLogisticsTool(Tool):
@@ -119,15 +120,16 @@ class QueryLogisticsTool(Tool):
         order_id = (args.get("order_id") or "").strip()
         if not order_id:
             return {"ok": False, "data": None, "error": "缺少订单号，请先通过 query_order 查到订单号"}
-        # TODO 生产环境：替换为真实物流接口（快递鸟/快递100等）
-        return {"ok": True, "data": {
-            "order_id": order_id,
-            "carrier": "中通快递",
-            "tracking_no": "ZT780012345678",
-            "latest": "【杭州市】快件已到达杭州转运中心",
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "note": "演示数据，接入真实物流接口后返回实际轨迹",
-        }, "error": ""}
+        if not settings.logistics_api_url:
+            return {"ok": False, "data": None, "error": "物流接口未接入"}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(settings.logistics_api_url, params={"order_id": order_id})
+                resp.raise_for_status()
+                return {"ok": True, "data": resp.json(), "error": ""}
+        except Exception:  # noqa: BLE001
+            logger.exception("物流接口调用失败")
+            return {"ok": False, "data": None, "error": "物流接口暂时不可用"}
 
 
 class CreateTicketTool(Tool):

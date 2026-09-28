@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     # 基础
     app_name: str = "multi-platform-cs-agent"
+    app_env: str = "development"  # production 时不重置已有管理员密码
     database_url: str = "sqlite:///./data/app.db"
     # AI 全局熔断开关：关闭时所有入站会话直接转人工（运行时也可经 /api/settings/ai-switch 切换）
     ai_globally_enabled: bool = True
@@ -36,6 +37,9 @@ class Settings(BaseSettings):
     rerank_api_key: str = ""
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     rag_rerank_threshold: float = 0.35
+    # 订单 / 物流真实接口。留空则工具返回未接入，不把演示数据说给用户。
+    order_api_url: str = ""
+    logistics_api_url: str = ""
 
     # 抖音开放平台
     douyin_client_key: str = ""

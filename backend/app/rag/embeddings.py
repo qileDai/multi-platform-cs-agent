@@ -19,12 +19,16 @@ async def embed_texts(texts: list[str]) -> list[list[float]] | None:
     client = _client()
     if client is None:
         return None
-    try:
-        resp = await client.embeddings.create(model=settings.embedding_model, input=texts)
-        return [item.embedding for item in resp.data]
-    except Exception:  # noqa: BLE001
-        logger.exception("Embedding 调用失败，降级纯 BM25")
-        return None
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            resp = await client.embeddings.create(model=settings.embedding_model, input=texts)
+            return [item.embedding for item in resp.data]
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Embedding 调用失败，第 %d 次", attempt + 1)
+    logger.error("Embedding 两次都失败，降级纯 BM25: %s", last_error)
+    return None
 
 
 async def embed_query(text: str) -> list[float] | None:

@@ -247,6 +247,7 @@ class MissedQuestionOut(BaseModel):
     platform: str
     count: int
     status: str
+    suggested_answer: str = ""
     created_at: datetime
 
     class Config:

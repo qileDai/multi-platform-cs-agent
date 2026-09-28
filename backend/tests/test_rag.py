@@ -2,7 +2,7 @@
 import pytest
 import pytest_asyncio
 
-from app.models import KnowledgeChunk, KnowledgeDoc, Message
+from app.models import KnowledgeChunk, KnowledgeDoc, Message, MissedQuestion
 from app.rag import ingest, pipeline, bm25
 
 
@@ -487,7 +487,7 @@ async def test_rewrite_prompt_survives_json_braces(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rewrite_runs_on_first_turn(monkeypatch):
-    """没有更早对话时也请求改写，失败或未改写出新句子时仍保留原句。"""
+    """没有更早对话、也没有指代时不改写。有更早对话才请求改写。"""
     from app.rag import rewrite
 
     called = []
@@ -516,7 +516,13 @@ async def test_rewrite_runs_on_first_turn(monkeypatch):
 
     monkeypatch.setattr(rewrite.settings, "llm_api_key", "test-key")
     monkeypatch.setattr(rewrite, "AsyncOpenAI", lambda **kwargs: _Client())
-    history = [{"sender_type": "user", "content": "多少钱"}]
+    skipped = await rewrite.rewrite_query("多少钱", [{"sender_type": "user", "content": "多少钱"}])
+    assert skipped == ["多少钱"]
+    assert called == []
+    history = [
+        {"sender_type": "user", "content": "看看这款"},
+        {"sender_type": "user", "content": "多少钱"},
+    ]
     result = await rewrite.rewrite_query("多少钱", history)
     assert called
     assert result[0] == "商品价格"
@@ -554,7 +560,8 @@ async def test_below_threshold_trace_on_user_message(db, conversation, monkeypat
         )
 
     async def fake_llm(*_a, **_k):
-        raise AssertionError("低于阈值不应调用生成")
+        from app.schemas import AgentReply
+        return AgentReply(reply_messages=["我先让同事确认"], intent="other", confidence=0.2, handoff=True, handoff_reason="low_confidence")
 
     monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
     monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
@@ -572,7 +579,7 @@ async def test_below_threshold_trace_on_user_message(db, conversation, monkeypat
     ai = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one()
-    assert "转给同事" in ai.content
+    assert "确认" in ai.content
 
 
 def test_customer_profile_in_prompt(db, conversation):
@@ -679,8 +686,8 @@ async def test_ungrounded_price_blocks_reply(db, conversation, monkeypatch):
     ai = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one()
-    assert "对不上" in ai.content
     assert "199" not in ai.content
+    assert "确认" in ai.content
     db.refresh(conversation)
     assert conversation.mode in ("pending", "human")
 
@@ -709,9 +716,13 @@ async def test_tool_reply_keeps_numbers_outside_knowledge(db, conversation, monk
         prompts.append(prompt)
         return first if len(prompts) == 1 else final
 
+    async def fake_logistics(self, args, ctx):
+        return {"ok": True, "data": {"latest": "预计 3天 到"}, "error": ""}
+
     monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
     monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
     monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.tools.QueryLogisticsTool, "run", fake_logistics)
     await engine.process_ai_reply(conversation.id)
     db.expire_all()
     ai = db.query(Message).filter(
@@ -787,5 +798,126 @@ async def test_rerank_below_threshold_keeps_exact_phrase_as_miss(monkeypatch):
     monkeypatch.setattr(pipeline.settings, "rerank_api_key", "test-key")
 
     result = await pipeline.retrieve("面签资料清单", history=[])
-    assert result.passed is False
-    assert result.reason == "rerank_below_threshold"
+    assert result.passed is True
+    assert "面签资料清单" in result.contexts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_invoice_polarity_blocked(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="能开增值税专用发票吗"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "不支持开发票", "source": "发票", "doc_id": 1}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["可以，支持开发票"], intent="other", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").one()
+    assert "支持开发票" not in ai.content
+    assert "可以" not in ai.content
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+
+
+@pytest.mark.asyncio
+async def test_kb_miss_fallback_handoff_without_new_number(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="你们周末营业吗"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query], contexts=[])
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["这块我先让同事确认"], intent="other", confidence=0.3,
+            handoff=False,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").one()
+    assert ai.content
+    assert not any(ch.isdigit() for ch in ai.content)
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+    assert db.query(MissedQuestion).filter(MissedQuestion.conversation_id == conversation.id).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_price_hit_does_not_handoff(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="多少钱"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "标准款 99 元", "source": "价格", "doc_id": 1}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["这款 99 元"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.answer_cache, "lookup", _async_none)
+    monkeypatch.setattr(engine.answer_cache, "store", _async_none)
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").one()
+    assert "99" in ai.content
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+
+
+async def _async_none(*_a, **_k):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_hit_and_invalidation(monkeypatch):
+    from app.rag import cache as answer_cache
+
+    answer_cache.clear()
+
+    async def fake_embed(text):
+        return [1.0, 0.0] if "价格" in text or "多少钱" in text else [0.0, 1.0]
+
+    monkeypatch.setattr(answer_cache.embeddings, "embed_query", fake_embed)
+    await answer_cache.store("标准款多少钱", ["这款 99 元"], [7])
+    assert await answer_cache.lookup("这款价格") == ["这款 99 元"]
+    assert await answer_cache.lookup("怎么退货") is None
+    answer_cache.invalidate_docs([7])
+    assert await answer_cache.lookup("这款价格") is None
+
+
+def test_agent_correction_stays_pending(db, conversation):
+    from app.services import note_agent_correction
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="能周末发货吗"))
+    db.commit()
+    note_agent_correction(conversation.id, "周末可以发货")
+    missed = db.query(MissedQuestion).filter(MissedQuestion.question == "能周末发货吗").one()
+    assert missed.status == "pending"
+    assert missed.suggested_answer == "周末可以发货"

@@ -42,23 +42,27 @@ async def rerank(query: str, documents: list[str], top_n: int = 3) -> list[dict]
     """对候选文档精排。返回 [{index, score}] 按分数降序；未配置、失败或空结果返回 None。"""
     if not settings.rerank_configured or not documents:
         return None
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{settings.rerank_base_url.rstrip('/')}/rerank",
-                headers={"Authorization": f"Bearer {settings.rerank_api_key}"},
-                json={
-                    "model": settings.rerank_model,
-                    "query": query,
-                    "documents": documents,
-                    "top_n": min(top_n, len(documents)),
-                },
-            )
-            parsed = parse_rerank_payload(resp.json())
-        if not parsed:
-            logger.info("Rerank 返回空结果，退回混合检索")
-            return None
-        return parsed
-    except Exception:  # noqa: BLE001
-        logger.exception("Rerank 调用失败，跳过精排")
-        return None
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{settings.rerank_base_url.rstrip('/')}/rerank",
+                    headers={"Authorization": f"Bearer {settings.rerank_api_key}"},
+                    json={
+                        "model": settings.rerank_model,
+                        "query": query,
+                        "documents": documents,
+                        "top_n": min(top_n, len(documents)),
+                    },
+                )
+                parsed = parse_rerank_payload(resp.json())
+            if not parsed:
+                logger.info("Rerank 返回空结果，第 %d 次", attempt + 1)
+                continue
+            return parsed
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Rerank 调用失败，第 %d 次", attempt + 1)
+    logger.error("Rerank 两次都不可用，退回混合检索: %s", last_error)
+    return None

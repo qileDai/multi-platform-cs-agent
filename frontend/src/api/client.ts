@@ -107,6 +107,7 @@ export interface MissedQuestion {
   platform: string
   count: number
   status: string
+  suggested_answer?: string
   created_at: string
 }
 
@@ -492,7 +493,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }
   const resp = await fetch(path, { ...options, headers: { ...headers, ...(options.headers as any) } })
+  // #region agent log
+  if (path === '/api/auth/login') {
+    fetch('http://127.0.0.1:7468/ingest/3569a161-5930-4d96-8a6f-489725b55d4c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'aaecc8'},body:JSON.stringify({sessionId:'aaecc8',hypothesisId:'C',location:'client.ts:request',message:'login response',data:{status:resp.status,ok:resp.ok,path},timestamp:Date.now()})}).catch(()=>{});
+  }
+  // #endregion
   if (resp.status === 401) {
+    if (path === '/api/auth/login') {
+      const text = await resp.text()
+      let detail = '账号或密码错误'
+      try {
+        detail = JSON.parse(text).detail || detail
+      } catch { /* 保留默认文案 */ }
+      throw new Error(detail)
+    }
     setToken(null)
     window.location.href = '/login'
     throw new Error('未登录')

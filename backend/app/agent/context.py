@@ -41,7 +41,14 @@ def get_history_for_prompt(conversation_id: int) -> tuple[str, list[dict], str]:
         for m in recent:
             role = {"user": "用户", "ai": "客服阿茶", "agent": "人工客服", "system": "系统"}.get(m.sender_type, m.sender_type)
             lines.append(f"{role}: {m.content}")
-        recent_dicts = [{"sender_type": m.sender_type, "content": m.content} for m in recent]
+        recent_dicts = [
+            {
+                "sender_type": m.sender_type,
+                "content": m.content,
+                "grounded": bool((m.extra or {}).get("grounded")),
+            }
+            for m in recent
+        ]
         return "\n".join(lines), recent_dicts, summary
     finally:
         db.close()

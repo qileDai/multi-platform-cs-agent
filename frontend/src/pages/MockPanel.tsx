@@ -69,7 +69,7 @@ function roundsFrom(messages: Message[]): Round[] {
       reply: replies.join('\n'),
     })
   }
-  return rounds
+  return rounds.reverse()
 }
 
 async function loadRounds(platform: string, userId: string): Promise<Round[]> {
@@ -120,7 +120,7 @@ export default function MockPanel() {
       while (Date.now() < deadline) {
         const items = await loadRounds(platform, userId)
         setRounds(items)
-        const hit = [...items].reverse().find((item) => item.userText === text)
+        const hit = items.find((item) => item.userText === text)
         if (hit?.reply) break
         await sleep(800)
       }
@@ -198,7 +198,7 @@ export default function MockPanel() {
 
         <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
           <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">对话记录</div>
-          <div className="space-y-3 max-h-96 overflow-y-auto">
+          <div className="space-y-3">
             {rounds.map((round) => (
               <div key={round.id} className="border dark:border-gray-800 rounded-lg px-3 py-2 space-y-1">
                 <div className="text-sm text-gray-800 dark:text-gray-100">{round.userText}</div>

@@ -14,7 +14,17 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 @router.post("/login", response_model=TokenResponse)
 def login(req: LoginRequest, db: Session = Depends(get_db)):
     agent = db.query(Agent).filter(Agent.username == req.username).first()
-    if agent is None or not verify_password(req.password, agent.password_hash):
+    password_ok = bool(agent is not None and verify_password(req.password, agent.password_hash))
+    # #region agent log
+    try:
+        import json, time
+        _hash = agent.password_hash if agent is not None else ""
+        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "B", "location": "auth.py:login", "message": "login attempt", "data": {"username_len": len(req.username or ""), "username_is_admin": (req.username or "") == "admin", "password_len": len(req.password or ""), "agent_found": agent is not None, "hash_len": len(_hash or ""), "hash_prefix": (_hash or "")[:4], "password_ok": password_ok}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    if agent is None or not password_ok:
         raise HTTPException(401, "账号或密码错误")
     token = create_access_token(agent.id, agent.username)
     return TokenResponse(access_token=token, agent=AgentOut.model_validate(agent))

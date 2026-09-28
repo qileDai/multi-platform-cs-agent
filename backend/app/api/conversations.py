@@ -294,6 +294,9 @@ async def agent_reply(conversation_id: int, req: AgentMessageSend,
         return MessageOut.model_validate(msg)
     msg = await send_outbound(conversation_id, req.content, sender_type="agent",
                               sender_id=agent.id, msg_type=req.msg_type, media_id=req.media_id)
+    if msg is not None and req.msg_type == "text":
+        from ..services import note_agent_correction
+        note_agent_correction(conversation_id, req.content)
     if msg is None:
         raise HTTPException(429, "触发平台频控，已自动转人工排队")
     # send_outbound 用的是另一个已关闭的会话，不能 refresh 那个对象

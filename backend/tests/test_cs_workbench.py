@@ -92,7 +92,8 @@ async def test_rag_miss_hard_handoff(db, conversation, monkeypatch):
 
     async def fake_llm(*_a, **_k):
         llm_called.append(1)
-        raise AssertionError("未过阈值不应调用 LLM")
+        from app.schemas import AgentReply
+        return AgentReply(reply_messages=["我先让同事确认"], intent="other", confidence=0.2, handoff=True, handoff_reason="low_confidence")
 
     monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
     monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
@@ -101,12 +102,12 @@ async def test_rag_miss_hard_handoff(db, conversation, monkeypatch):
     await engine.process_ai_reply(conversation.id)
     db.refresh(conversation)
     assert conversation.mode in ("pending", "human")
-    assert not llm_called
+    assert llm_called
     missed = db.query(MissedQuestion).filter(MissedQuestion.conversation_id == conversation.id).first()
     assert missed is not None
     ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").first()
     assert ai is not None
-    assert "转给同事" in ai.content
+    assert "确认" in ai.content
 
 
 @pytest.mark.asyncio
@@ -368,7 +369,7 @@ async def test_empty_model_reply_hands_off(db, conversation, monkeypatch):
     ai = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one()
-    assert "没说清楚" in ai.content
+    assert "确认" in ai.content
 
 
 @pytest.mark.asyncio
@@ -486,8 +487,8 @@ async def test_miss_answers_from_earlier_dialogue(db, conversation, monkeypatch)
     from app.schemas import AgentReply
 
     db.add(Message(
-        conversation_id=conversation.id, sender_type="user", msg_type="text",
-        content="明天我去香港开户",
+        conversation_id=conversation.id, sender_type="agent", msg_type="text",
+        content="明天可以去香港开户",
     ))
     db.add(Message(
         conversation_id=conversation.id, sender_type="user", msg_type="text",

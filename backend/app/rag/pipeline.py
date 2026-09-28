@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 RRF_K = 60  # RRF 平滑常数
 DENSE_MIN_SCORE = 0.3  # 余弦相似度低于此值的向量命中不参与融合
+DENSE_ABSOLUTE_MIN = 0.45  # 没配精排时，第一名低于此值直接未命中
 RELATIVE_SCORE_RATIO = 0.65  # 相对最高分过低的命中不送进生成
 DEGRADED_SCORE_GAP = 1.5  # 纯 BM25：第一名须达到其他资料的倍数，否则视为含糊
 DENSE_SCORE_GAP = 0.08  # 余弦：第一名须比另一篇至少高出该差值
@@ -36,7 +37,7 @@ class RetrievalResult:
 
 
 async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3,
-                   summary: str = "") -> RetrievalResult:
+                   summary: str = "", *, broaden: bool = True) -> RetrievalResult:
     """完整检索管线。返回带引用的知识片段；未过阈值时 passed=False（上层触发转人工）。"""
     result = RetrievalResult()
 
@@ -50,7 +51,7 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     result.dense_count, result.bm25_count = _path_counts(rankings)
     if not rankings:
         result.reason = "no_hits"
-        return result
+        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
     # 3. RRF 融合（每路独立计名次，同一路内重复 chunk 只计一次）
     fused = _rrf_fuse(rankings)
@@ -58,11 +59,11 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     result.fused_top = _fused_preview(candidates)
     if not candidates:
         result.reason = "no_hits"
-        return result
+        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
-    # 4. Rerank 精排。空结果或调用失败退回融合分差；有分数但低于阈值则不生成。
+    # 4. Rerank 精排。原句权重大于改写句。空结果或调用失败退回融合分差。
     if settings.rerank_configured:
-        reranked = await rerank.rerank(queries[0], [c["content"] for c in candidates], top_n=top_k)
+        reranked = await _rerank_weighted(queries, [c["content"] for c in candidates], top_n=top_k)
         if reranked:
             scored = [
                 {**candidates[r["index"]], "score": r["score"]} for r in reranked
@@ -88,18 +89,35 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
         if not selected:
             result.reason = "dense_gap" if has_dense else "bm25_gap"
 
-    if not selected and result.reason in ("dense_gap", "bm25_gap", "rerank_unavailable"):
+    if not selected and result.reason in (
+        "dense_gap", "bm25_gap", "rerank_unavailable", "rerank_below_threshold",
+    ):
         selected = _exact_phrase_hits(query, candidates)
 
     if not selected:
         result.passed = False
-        return result
+        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
     # 5. 父子索引：短父块才整段替换；否则用带标题的命中片段
     resolved = _resolve_hits(selected)
     result.contexts = _dedupe_contexts(resolved)[:top_k]
     result.passed = bool(result.contexts)
     result.reason = "passed" if result.passed else "no_hits"
+    return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
+
+
+async def _maybe_broaden(result: RetrievalResult, query: str, history: list[dict], summary: str,
+                         top_k: int, broaden: bool) -> RetrievalResult:
+    """第一轮没过阈值时，用更宽的问法再检一次。"""
+    if result.passed or not broaden:
+        return result
+    wider = await rewrite.broaden_query(query, result.rewritten_queries, result.reason, history, summary)
+    if not wider:
+        return result
+    second = await retrieve(wider, history=[], top_k=top_k, broaden=False)
+    if second.passed:
+        second.rewritten_queries = list(result.rewritten_queries) + list(second.rewritten_queries)
+        return second
     return result
 
 
@@ -193,6 +211,34 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool]
     return rankings, degraded
 
 
+async def _rerank_weighted(queries: list[str], documents: list[str], top_n: int) -> list[dict] | None:
+    """原句权重 1，改写句权重 0.5。只拿到其中一路时用那一路的分。"""
+    original = queries[-1] if queries else ""
+    lead = queries[0] if queries else ""
+    pairs = [(original, 1.0)]
+    if lead and lead != original:
+        pairs.append((lead, 0.5))
+    combined: dict[int, float] = {}
+    weights: dict[int, float] = {}
+    any_ok = False
+    for text, weight in pairs:
+        ranked = await rerank.rerank(text, documents, top_n=max(top_n, len(documents)))
+        if not ranked:
+            continue
+        any_ok = True
+        for item in ranked:
+            index = item["index"]
+            combined[index] = combined.get(index, 0.0) + item["score"] * weight
+            weights[index] = weights.get(index, 0.0) + weight
+    if not any_ok:
+        return None
+    merged = [
+        {"index": index, "score": combined[index] / weights[index]}
+        for index in combined
+    ]
+    return sorted(merged, key=lambda item: item["score"], reverse=True)
+
+
 def _filter_reranked(hits: list[dict]) -> list[dict]:
     """保留不低于绝对阈值、且不低于最高分一定比例的命中。"""
     if not hits:
@@ -218,6 +264,9 @@ def _select_dense_gap(hits: list[dict]) -> list[dict]:
     top_score = top.get("dense_score")
     if not isinstance(top_score, (int, float)):
         logger.info("融合第一名没有向量分，判为未命中")
+        return []
+    if float(top_score) < DENSE_ABSOLUTE_MIN:
+        logger.info("向量检索第一名绝对分过低，判为未命中")
         return []
     rival_score: float | None = None
     for hit in hits[1:]:

@@ -129,6 +129,7 @@ class MissedQuestion(Base):
     platform = Column(String(16), default="")
     conversation_id = Column(Integer, nullable=True)
     count = Column(Integer, default=1)
+    suggested_answer = Column(Text, default="")  # 人工纠正，待确认后才入库
     status = Column(String(16), default="pending")  # pending | resolved
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

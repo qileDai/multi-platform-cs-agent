@@ -501,7 +501,7 @@ async def handoff(conversation_id: int, reason: str, db=None):
 
 # ============ 未命中问题沉淀 ============
 
-def record_missed_question(question: str, platform: str, conversation_id: int):
+def record_missed_question(question: str, platform: str, conversation_id: int, suggested_answer: str = ""):
     db = SessionLocal()
     try:
         existing = (
@@ -512,9 +512,49 @@ def record_missed_question(question: str, platform: str, conversation_id: int):
         if existing:
             existing.count += 1
             existing.updated_at = datetime.utcnow()
+            if suggested_answer:
+                existing.suggested_answer = suggested_answer[:2000]
         else:
             db.add(MissedQuestion(
-                question=question[:500], platform=platform, conversation_id=conversation_id
+                question=question[:500], platform=platform, conversation_id=conversation_id,
+                suggested_answer=(suggested_answer or "")[:2000],
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def note_agent_correction(conversation_id: int, answer: str) -> None:
+    """人工接管后的回复先记成待审答案，确认后才写入知识库。"""
+    text = (answer or "").strip()
+    if not text:
+        return
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        if conversation is None:
+            return
+        previous = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
+            .order_by(Message.id.desc())
+            .first()
+        )
+        if previous is None or not (previous.content or "").strip():
+            return
+        question = previous.content.strip()[:500]
+        existing = (
+            db.query(MissedQuestion)
+            .filter(MissedQuestion.question == question, MissedQuestion.status == "pending")
+            .first()
+        )
+        if existing:
+            existing.suggested_answer = text[:2000]
+            existing.updated_at = datetime.utcnow()
+        else:
+            db.add(MissedQuestion(
+                question=question, platform=conversation.platform, conversation_id=conversation_id,
+                suggested_answer=text[:2000],
             ))
         db.commit()
     finally:

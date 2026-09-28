@@ -912,6 +912,177 @@ async def test_semantic_cache_hit_and_invalidation(monkeypatch):
     assert await answer_cache.lookup("这款价格") is None
 
 
+def test_split_facets_single_question_stays_one_retrieval():
+    assert pipeline.split_facets("多少钱") == []
+    assert pipeline.split_facets("你好，这个多少钱") == []
+
+
+def test_split_facets_two_asks():
+    assert pipeline.split_facets("多少钱和包邮吗") == ["多少钱", "包邮吗"]
+    assert pipeline.split_facets("发货和退换") == ["发货", "退换"]
+
+
+def test_seven_days_matches_digit_days():
+    assert evidence_fold_supported("七天无理由", "7天无理由退换")
+    assert not evidence_fold_supported("这款 199元", "标准款 99 元")
+
+
+def evidence_fold_supported(reply: str, source: str) -> bool:
+    from app.agent import evidence
+    return not evidence.claims_unsupported([reply], source)
+
+
+def test_conflict_drops_both_prices():
+    from app.agent import evidence
+    contexts = [{"content": "标准款 99 元"}, {"content": "活动价 199 元"}]
+    kept, dropped = evidence.partition_messages(["这款 99 元"], "标准款 99 元\n活动价 199 元", contexts)
+    assert kept == []
+    assert dropped == ["这款 99 元"]
+
+
+def test_handoff_line_can_name_the_gap():
+    from app.agent import evidence
+    kept, dropped = evidence.partition_messages(
+        ["包邮这句我让同事确认哈"], "", [{"content": "标准款 99 元"}],
+    )
+    assert kept == ["包邮这句我让同事确认哈"]
+    assert dropped == []
+
+
+@pytest.mark.asyncio
+async def test_partial_answer_keeps_price_and_hands_off_shipping(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="多少钱和包邮吗",
+    ))
+    db.commit()
+    calls = []
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        calls.append(query)
+        if query == "包邮吗":
+            return pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query], contexts=[])
+        return pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "标准款 99 元", "source": "价格", "doc_id": 1}],
+        )
+
+    async def fake_llm(prompt: str, **_k):
+        if "已核对事实" in prompt:
+            return AgentReply(reply_messages=["包邮这句我让同事确认哈"], intent="other", confidence=0.4, handoff=True, handoff_reason="low_confidence")
+        return AgentReply(reply_messages=["这款 99 元", "全国包邮"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.answer_cache, "lookup", _async_none)
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = "\n".join(
+        row.content for row in db.query(Message).filter(
+            Message.conversation_id == conversation.id, Message.sender_type == "ai",
+        )
+    )
+    assert "99" in sent
+    assert "全国包邮" not in sent
+    assert "同事" in sent
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+    assert calls[0] == "多少钱和包邮吗"
+    assert "包邮吗" in calls
+
+
+@pytest.mark.asyncio
+async def test_chitchat_miss_fallback_does_not_handoff(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="哈哈哈你们回复好快",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query], contexts=[])
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["哈哈那是，我一直盯着呢"], intent="chitchat", confidence=0.9, handoff=False)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").one()
+    assert "哈哈" in ai.content
+    assert not any(ch.isdigit() for ch in ai.content)
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    assert db.query(MissedQuestion).filter(MissedQuestion.conversation_id == conversation.id).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_rechecks_current_knowledge(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.rag import cache as answer_cache
+    from app.schemas import AgentReply
+
+    answer_cache.clear()
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="多少钱"))
+    db.commit()
+
+    async def fake_lookup(_query):
+        return ["这款 199 元"]
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "标准款 99 元", "source": "价格", "doc_id": 1}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["这款 99 元"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.answer_cache, "lookup", fake_lookup)
+    monkeypatch.setattr(engine.answer_cache, "store", _async_none)
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(Message.conversation_id == conversation.id, Message.sender_type == "ai").one()
+    assert "199" not in ai.content
+    assert "99" in ai.content
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+
+
+@pytest.mark.asyncio
+async def test_covering_retrieve_merges_two_faqs(db):
+    price = KnowledgeDoc(title="产品价格", doc_type="faq", content="问：多少钱\n答：标准款 99 元。", status="active")
+    ship = KnowledgeDoc(title="运费", doc_type="faq", content="问：包邮吗\n答：全国包邮。", status="active")
+    db.add_all([price, ship])
+    db.commit()
+    db.refresh(price)
+    db.refresh(ship)
+    await ingest.ingest_faq(price.id)
+    await ingest.ingest_faq(ship.id)
+    from app.agent import engine
+    result = await engine._retrieve_covering("多少钱和包邮吗", [], "")
+    blob = "\n".join(item["content"] for item in result.contexts)
+    assert "99" in blob
+    assert "包邮" in blob
+    assert result.gaps == []
+    price.status = "archived"
+    ship.status = "archived"
+    db.commit()
+    ingest.rebuild_bm25_from_db()
+
+
 def test_agent_correction_stays_pending(db, conversation):
     from app.services import note_agent_correction
 

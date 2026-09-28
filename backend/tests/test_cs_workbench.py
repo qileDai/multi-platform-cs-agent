@@ -482,6 +482,191 @@ async def test_numbered_list_reply_uses_source_items(db, conversation, monkeypat
     ).count() == 1
 
 
+_MIANQIAN_ITEMS = [
+    "1、香港开户请勿与开户经理提及被制裁国家，您的所有生意和转账地区仅限kyc内填写的地区国家。",
+    "2、去银行开户仅需要面签人员进场，其他人员不要进入银行。",
+    "3、去银行不要左顾右盼，不要戴耳机。对工作人员礼貌一些。",
+    "4、对自己的生意模式、合作伙伴、公司基本信息需要了如指掌，不能一问三不知。",
+    "5、在银行内部不要拍照、拍视频等。",
+    "6、开户请勿提及付钱开户，一律回复自己预约的银行开户。",
+    "7、如果经理推理财保险，不需要的话请委婉拒绝说要先了解一下",
+    "8、董事手机提前开通好漫游，用来接受银行短信",
+]
+
+
+@pytest.mark.asyncio
+async def test_single_question_list_is_one_verbatim_message(db, conversation, monkeypatch):
+    """问法没有「清单」，第二段召回里的 8 条也要原文进同一条消息。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="面签遵循哪些提示"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[
+                {"content": "面签时注意不要提及敏感国家", "source": "面签说明"},
+                {"content": "\n".join(_MIANQIAN_ITEMS), "source": "面签提示"},
+            ],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["不要提及敏感国家", "进场的只有面签人员，别的不要进哈"],
+            intent="other", confidence=0.9,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 1
+    sent = rows[0].content
+    for item in (
+        "被制裁国家", "kyc", "不要进入银行", "不要戴耳机", "不能一问三不知",
+        "不要拍照", "付钱开户", "理财保险", "开通好漫游",
+    ):
+        assert item in sent
+    assert "不要提及敏感国家" not in sent
+
+
+@pytest.mark.asyncio
+async def test_other_list_without_list_wording_stays_verbatim(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="退货要注意什么"))
+    db.commit()
+    source = "\n".join([
+        "1、保持包装完整",
+        "2、七天内寄回",
+        "3、附上订单号",
+    ])
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": source, "source": "退货"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["包装别拆就行"], intent="after_sale", confidence=0.8)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 1
+    sent = rows[0].content
+    assert "保持包装完整" in sent
+    assert "七天内寄回" in sent
+    assert "附上订单号" in sent
+    assert "包装别拆就行" not in sent
+
+
+@pytest.mark.asyncio
+async def test_named_one_list_item_does_not_dump_the_rest(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="开户调查问卷"))
+    db.commit()
+    source = "\n".join([
+        "1、董事个人身份证和港澳通行证",
+        "2、香港公司全套注册资料原件",
+        "3、开户调查问卷",
+    ])
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": source, "source": "开户"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["问卷填一下就行"], intent="consult_feature", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "开户调查问卷" in sent
+    assert "董事个人身份证" not in sent
+    assert "香港公司全套注册资料" not in sent
+
+
+@pytest.mark.asyncio
+async def test_price_without_numbered_list_stays_price(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="这款多少钱"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "这款 99 元", "source": "价格"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["这款 99 元"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "99" in sent
+    assert "清单我按资料发你" not in sent
+
+
+@pytest.mark.asyncio
+async def test_two_questions_stay_separate_messages(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="多少钱，还包邮吗",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": "多少钱是 99 元，包邮是全国包邮", "source": "价格"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["这款 99 元", "全国包邮"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 2
+    sent = "\n".join(row.content for row in rows)
+    assert "99" in sent
+    assert "包邮" in sent
+
+
 @pytest.mark.asyncio
 async def test_miss_answers_from_earlier_dialogue(db, conversation, monkeypatch):
     from app.schemas import AgentReply

@@ -100,7 +100,7 @@ class TestMockInboundFlow:
         from app.models import Agent
         db.query(Agent).update({Agent.status: "offline"})
         db.commit()
-        payload = _mock_payload("mock", "你好")
+        payload = _mock_payload("mock", "这个多少钱")
         await handle_inbound(payload)
 
         conv = db.query(Conversation).filter(

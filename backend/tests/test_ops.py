@@ -49,13 +49,15 @@ async def test_llm_no_fallback_when_not_configured(monkeypatch):
     assert calls == ["primary-model"]
 
 
-async def test_llm_parse_failure_no_fallback(monkeypatch):
-    """解析失败（非硬失败）不触发备用模型切换。"""
+async def test_llm_parse_failure_uses_fallback(monkeypatch):
+    """解析失败时也切换备用模型，不再直接放弃。"""
     calls: list[str] = []
 
     async def fake_once(prompt, *, base_url, api_key, model, conversation_id=0):
         calls.append(model)
-        return None, False  # 解析失败，非硬失败
+        if model == "primary-model":
+            return None, False
+        return AgentReply(reply_messages=["备用模型接上了"], confidence=0.6), False
 
     monkeypatch.setattr(engine, "_call_llm_once", fake_once)
     monkeypatch.setattr(engine.settings, "llm_model", "primary-model")
@@ -64,8 +66,9 @@ async def test_llm_parse_failure_no_fallback(monkeypatch):
 
     reply = await engine._call_llm_with_retry("test prompt")
 
-    assert reply is None
-    assert calls == ["primary-model"]
+    assert reply is not None
+    assert reply.reply_messages == ["备用模型接上了"]
+    assert calls == ["primary-model", "backup-model"]
 
 
 # ============ 监控告警 ============

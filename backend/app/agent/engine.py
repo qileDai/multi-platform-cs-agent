@@ -30,7 +30,6 @@ MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
 REPLY_BUDGET_SECONDS = 12
 _CONFIRM_REPLY = "我先让同事帮您确认"
 _TASK_RE = re.compile(r"订单|物流|快递|退货|退换|换货|退款")
-_LIST_ASK_RE = re.compile(r"有哪些|清单|都包括什么|有哪几")
 _FACT_TOOLS = frozenset({"query_order", "query_logistics"})
 _GREETING_REPLY = "在的呢，想问啥呀"
 _LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
@@ -105,17 +104,20 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     started = time.monotonic()
     history_text, recent, summary = context.get_history_for_prompt(conversation_id_)
     cached = await answer_cache.lookup(user_text)
-    if cached:
+    if _over_budget(started):
+        return await _confirm_and_handoff(conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned)
+
+    retrieval = await _retrieve_covering(user_text, recent, summary)
+    _save_retrieval_trace(user_message_id, retrieval)
+    agent_lines = _agent_fact_lines(recent)
+    if cached and _cache_still_grounded(cached, retrieval, agent_lines):
         return await _deliver_ai(
             conversation_id_, cached, local=local, allow_owned=owned,
             extra={"intent": "other", "confidence": 1.0, "citations": [], "cache_hit": True, "grounded": True},
         )
+    if cached:
+        answer_cache.invalidate_messages(cached)
 
-    if _over_budget(started):
-        return await _confirm_and_handoff(conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned)
-
-    retrieval = await pipeline.retrieve(user_text, history=recent, summary=summary)
-    _save_retrieval_trace(user_message_id, retrieval)
     tool_results: list[dict] = []
     tool_names_used: list[str] = []
     if retrieval.passed:
@@ -130,48 +132,94 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         )
         if isinstance(reply, str):
             return reply
+        if reply is None:
+            reply = AgentReply()
 
-    if reply is None or _tool_rounds_exhausted(reply, len(tool_names_used)):
+    if retrieval.passed and (reply is None or _tool_rounds_exhausted(reply, len(tool_names_used))):
         text = await _deliver_ai(
             conversation_id_, ["不好意思，我这边卡了一下"], local=local, allow_owned=owned)
         reason = "llm_parse_failed" if reply is None else "tool_rounds_exhausted"
         await handoff(conversation_id_, reason=reason)
         return text
 
-    if _over_budget(started):
+    if reply is None:
+        reply = AgentReply()
+
+    if _over_budget(started) and not reply.reply_messages:
         return await _confirm_and_handoff(conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned)
 
-    listed = _reply_with_source_list(user_text, reply.reply_messages, retrieval.contexts)
+    listed = _reply_with_source_list(user_text, retrieval.contexts, retrieval.facets)
     messages = listed if listed is not None else list(reply.reply_messages)
-    agent_lines = _agent_fact_lines(recent)
     blob = evidence.evidence_text(retrieval.contexts, tool_results, agent_lines)
-    if messages and evidence.claims_unsupported(messages, blob):
-        return await _confirm_and_handoff(
-            conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned, record=not retrieval.passed,
+    kept, dropped = evidence.partition_messages(messages, blob, retrieval.contexts)
+    gaps = list(retrieval.gaps)
+    forced_human = reply.handoff_reason in ("complaint", "explicit_human", "sensitive", "out_of_scope")
+    tool_ok = _tool_answered(tool_names_used, tool_results)
+    need_fallback = (not forced_human) and (bool(gaps) or not kept) and not tool_ok
+    used_fallback = False
+    if need_fallback and not _over_budget(started):
+        fallback = await _llm_fallback(
+            conversation_id_, user_text, kept, gaps, recent, started,
         )
-    if not messages and not reply.handoff:
-        return await _confirm_and_handoff(conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned)
+        used_fallback = True
+        if fallback is not None:
+            fb_kept, fb_dropped = evidence.partition_messages(fallback.reply_messages, blob, retrieval.contexts)
+            dropped.extend(fb_dropped)
+            for line in fb_kept:
+                if line not in kept:
+                    kept.append(line)
+            if fallback.handoff:
+                reply.handoff = True
+                reply.handoff_reason = fallback.handoff_reason or reply.handoff_reason or "low_confidence"
+            if not reply.intent or reply.intent == "other":
+                reply.intent = fallback.intent
+    elif need_fallback:
+        if not any(evidence.is_handoff_guide(line) for line in kept):
+            kept.append(_CONFIRM_REPLY)
+        reply.handoff = True
+        reply.handoff_reason = reply.handoff_reason or "low_confidence"
 
+    shop_gap = bool(gaps) or ((not retrieval.passed) and _expects_shop_fact(user_text) and not tool_ok)
+    if not kept:
+        kept = [_CONFIRM_REPLY]
+        reply.handoff = True
+        reply.handoff_reason = reply.handoff_reason or "low_confidence"
+    if shop_gap or (reply.handoff and forced_human):
+        reply.handoff = True
+        reply.handoff_reason = reply.handoff_reason or "low_confidence"
+    if used_fallback and not shop_gap and not forced_human and kept and not reply.handoff:
+        reply.handoff = False
+
+    messages = kept[:3]
+    if len(retrieval.facets) < 2 and len(messages) > 1:
+        messages = ["\n".join(messages)]
     _apply_side_effects(customer_id, reply)
     citations = [c["source"] for c in retrieval.contexts]
+    must_handoff = bool(reply.handoff) or shop_gap
     extra = {
-        "intent": reply.intent, "confidence": reply.confidence, "citations": citations, "grounded": True,
+        "intent": reply.intent,
+        "confidence": reply.confidence,
+        "citations": citations,
+        "grounded": not must_handoff,
+        "facets": list(retrieval.facets),
+        "gaps": gaps,
+        "dropped": dropped,
+        "fallback": used_fallback,
     }
     if tool_names_used:
         extra["tool_calls"] = tool_names_used
-    must_handoff = reply.handoff or (not retrieval.passed and not _tool_answered(tool_names_used, tool_results))
     if messages:
         text = await _deliver_ai(conversation_id_, messages, local=local, allow_owned=owned, extra=extra)
-        if retrieval.passed:
+        if retrieval.passed and not must_handoff:
             _bump_knowledge_hits(retrieval.contexts)
-            if not must_handoff and not _FACT_TOOLS.intersection(tool_names_used):
+            if not _FACT_TOOLS.intersection(tool_names_used):
                 doc_ids = [item["doc_id"] for item in retrieval.contexts if isinstance(item.get("doc_id"), int)]
                 await answer_cache.store(user_text, messages, doc_ids)
     else:
         text = ""
     if must_handoff:
-        if not retrieval.passed:
-            record_missed_question(user_text, platform, conversation_id_)
+        if shop_gap or not retrieval.passed:
+            record_missed_question(gaps[0] if gaps else user_text, platform, conversation_id_)
         await handoff(conversation_id_, reason=reply.handoff_reason or "low_confidence")
         return text
     if local:
@@ -181,8 +229,90 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     return text
 
 
+_SHOP_FACT = re.compile(
+    r"多少钱|什么价|价格|几元|几块|包邮|运费|邮费|发货|退货|退换|换货|退款|发票|质保|保修|"
+    r"库存|有货|营业|几点|地址|尺码|颜色|优惠|折扣|几天|多久|周末"
+)
+
+
 def _over_budget(started: float) -> bool:
     return time.monotonic() - started > REPLY_BUDGET_SECONDS
+
+
+def _expects_shop_fact(user_text: str) -> bool:
+    return bool(_SHOP_FACT.search(user_text or ""))
+
+
+def _context_key(item: dict) -> tuple:
+    return (item.get("chunk_id"), item.get("doc_id"), item.get("content"))
+
+
+async def _retrieve_covering(user_text: str, recent: list[dict], summary: str) -> pipeline.RetrievalResult:
+    """单问只检索一次。多问先整句，没盖住的子问题再各检一次，合并最多 3 条。"""
+    primary = await pipeline.retrieve(user_text, history=recent, summary=summary)
+    facets = pipeline.split_facets(user_text)
+    primary.facets = facets
+    if len(facets) < 2:
+        return primary
+    merged = list(primary.contexts)
+    seen = {_context_key(item) for item in merged}
+    gaps: list[str] = []
+    for facet in facets:
+        if pipeline.facet_covered(facet, merged):
+            continue
+        extra = await pipeline.retrieve(facet, history=recent, summary=summary)
+        for item in extra.contexts:
+            key = _context_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        if not pipeline.facet_covered(facet, merged):
+            gaps.append(facet)
+    primary.contexts = merged[:3]
+    primary.gaps = gaps
+    if primary.contexts and not primary.passed:
+        primary.passed = True
+        primary.reason = "passed"
+    return primary
+
+
+def _cache_still_grounded(messages: list[str], retrieval: pipeline.RetrievalResult,
+                          agent_lines: list[str]) -> bool:
+    if not retrieval.passed or retrieval.gaps:
+        return False
+    blob = evidence.evidence_text(retrieval.contexts, [], agent_lines)
+    kept, dropped = evidence.partition_messages(messages, blob, retrieval.contexts)
+    return bool(kept) and not dropped
+
+
+async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], gaps: list[str],
+                        recent: list[dict], started: float) -> AgentReply | None:
+    """知识或主回复接不住时再叫一次模型。只许复述已核对事实，或把缺口说成转人工。"""
+    if _over_budget(started):
+        return None
+    facts = "\n".join(kept) or "（没有已核对事实）"
+    missing = "、".join(gaps) or "知识库没有直接答案"
+    lines = []
+    for row in _earlier_dialogue(user_text, recent):
+        role = "用户" if row.get("sender_type") == "user" else "客服"
+        lines.append(f"{role}: {row.get('content') or ''}")
+    prompt = (
+        "你是客服阿茶，用 1 到 2 句微信口语回复。"
+        "不要说「根据资料」「知识库显示」「您好，很高兴为您服务」。\n"
+        "只能复述下面已经核对过的事实。"
+        "不要用自己的记忆补充价格、折扣、期限、库存、是否包邮、能否退换、快递公司或单号。\n"
+        "缺的是店铺事实时，用口语说要请同事确认，handoff 填 true，handoff_reason 填 low_confidence。\n"
+        "只是闲聊，或要追问哪一款、手机号时，直接接话，handoff 填 false。\n"
+        "投诉、辱骂、用户明确要真人时，先安抚再转人工，handoff 填 true。\n"
+        f"已核对事实：\n{facts}\n还缺：{missing}\n"
+        "已核对对话：\n" + ("\n".join(lines) or "（无）") + f"\n用户说：{user_text}\n"
+        "只输出 JSON："
+        '{"reply_messages":["一句"],"intent":"other","confidence":0.4,'
+        '"handoff":false,"handoff_reason":"","tags":[],'
+        '"lead":{"phone":"","wechat":"","note":""},"quick_action":"none","tool_call":null}'
+    )
+    return await _call_llm_with_retry(prompt, conversation_id=conversation_id)
 
 
 def _tool_answered(names: list[str], results: list[dict]) -> bool:
@@ -223,7 +353,7 @@ async def _answer_from_knowledge(conversation_id: int, customer_id: int, platfor
     rewritten = retrieval.rewritten_queries[0] if retrieval.rewritten_queries else user_text
     rendered = prompt_mod.render_prompt(
         platform=platform,
-        knowledge_context=_format_knowledge_context(retrieval.contexts),
+        knowledge_context=_format_knowledge_context(retrieval.contexts, retrieval.gaps),
         history_text=history_text,
         user_message=user_text,
         customer_profile=context.customer_profile_text(conversation_id),
@@ -239,12 +369,17 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
                                     recent: list[dict], started: float, tool_results: list[dict],
                                     tool_names: list[str], *, local: bool, allow_owned: bool, owned: bool):
     """没检索到时：办事先调工具，否则只用人工原话，再不行就兜底并转人工。"""
+    if _over_budget(started):
+        return await _confirm_and_handoff(
+            conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
     if _TASK_RE.search(user_text or ""):
         if _over_budget(started):
             return await _confirm_and_handoff(
                 conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
         rendered = (
-            "用户在查订单、物流或退换。可以调用工具。没有真实结果就不要编造单号、快递和价格。"
+            "你是客服阿茶。用户在查订单、物流或退换。可以调用工具。"
+            "没有真实结果就不要编造单号、快递和价格。"
+            "查到之后用 1 到 2 句微信口语说结果，不要说「根据查询结果」。"
             "只输出 JSON 契约。\n\n"
             + tools.tools_prompt_text()
             + f"\n\n用户说：{user_text}"
@@ -266,25 +401,7 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
         await note_unmatched(conversation_id)
         record_missed_question(user_text, platform, conversation_id)
         return ""
-    if _over_budget(started):
-        return await _confirm_and_handoff(
-            conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
-    fallback = (
-        "知识库没有这个问题的资料。用 1 到 2 句口语说明你要请同事确认。"
-        "不要报价格、折扣、期限、库存、是否包邮、能否退款、快递公司或单号。"
-        "只输出 JSON："
-        "{\"reply_messages\":[\"一句\"],\"intent\":\"other\",\"confidence\":0.3,"
-        "\"handoff\":true,\"handoff_reason\":\"low_confidence\",\"tags\":[],"
-        "\"lead\":{\"phone\":\"\",\"wechat\":\"\",\"note\":\"\"},\"quick_action\":\"none\",\"tool_call\":null}\n\n"
-        f"用户说：{user_text}"
-    )
-    reply = await _call_llm_with_retry(fallback, conversation_id=conversation_id)
-    if reply is None or evidence.claims_unsupported(reply.reply_messages, ""):
-        return await _confirm_and_handoff(
-            conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
-    reply.handoff = True
-    reply.handoff_reason = "low_confidence"
-    return reply
+    return None
 
 
 async def _consume_tools(conversation_id: int, customer_id: int, platform: str, rendered: str,
@@ -365,21 +482,60 @@ def _format_source_list(items: list[str]) -> str:
     return f"{_LIST_LEAD}\n\n" + "\n".join(lines)
 
 
-def _reply_with_source_list(user_text: str, messages: list[str], contexts: list[dict]) -> list[str] | None:
-    """用户在问清单时，才用资料原文替换漏项的回答。"""
-    if not _LIST_ASK_RE.search(user_text or "") or not contexts:
+def _reply_with_source_list(user_text: str, contexts: list[dict], facets: list[str]) -> list[str] | None:
+    """召回正文里的编号条目用原文作答，不看问法。点名一条时只发那一条。"""
+    if len(facets) >= 2:
+        groups: list[list[str]] = []
+        for facet in facets:
+            own = [item for item in contexts if pipeline.facet_covered(facet, [item])]
+            chosen = _choose_numbered_items(user_text, _collect_numbered_items(own))
+            if not chosen:
+                return None
+            groups.append(chosen)
+        return [_format_source_list(items) for items in groups]
+    chosen = _choose_numbered_items(user_text, _collect_numbered_items(contexts))
+    if not chosen:
         return None
-    items = _numbered_items(contexts[0].get("content") or "")
+    return [_format_source_list(chosen)]
+
+
+def _collect_numbered_items(contexts: list[dict]) -> list[str]:
+    """只收这一轮召回正文里的编号条目，不去数据库补同一篇文档。"""
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in contexts or []:
+        for line in _numbered_items(item.get("content") or ""):
+            body = _LIST_MARKER_RE.sub("", line).strip()
+            key = re.sub(r"\s+", "", body)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(line)
+    return items
+
+
+def _choose_numbered_items(user_text: str, items: list[str]) -> list[str] | None:
     if len(items) < 2:
         return None
-    blob = "\n".join(messages or [])
+    named = _items_user_named(user_text, items)
+    if len(named) == 1:
+        return named
+    return items
+
+
+def _items_user_named(user_text: str, items: list[str]) -> list[str]:
+    """用户原话点到了某条正文，才算点名。"""
+    compact_user = re.sub(r"\s+", "", user_text or "")
+    if len(compact_user) < 4:
+        return []
+    named = []
     for item in items:
-        anchor = _LIST_MARKER_RE.sub("", item).strip()
-        if len(anchor) > 12:
-            anchor = anchor[:12]
-        if anchor and anchor not in blob:
-            return [_format_source_list(items)]
-    return None
+        body = re.sub(r"\s+", "", _LIST_MARKER_RE.sub("", item).strip())
+        if len(body) < 4:
+            continue
+        if body in compact_user or compact_user in body:
+            named.append(item)
+    return named
 
 
 def _has_ungrounded_amount(messages: list[str], contexts: list[dict]) -> bool:
@@ -403,6 +559,8 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
             "rerank_top_score": retrieval.rerank_top_score,
             "reason": retrieval.reason,
             "rerank_status": retrieval.rerank_status,
+            "facets": list(retrieval.facets),
+            "gaps": list(retrieval.gaps),
         }
         msg.extra = extra
         db.commit()
@@ -410,12 +568,13 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
         db.close()
 
 
-def _format_knowledge_context(contexts: list[dict]) -> str:
-    """第一条标成最相关，其余只作补充，避免模型把不同资料的数字拼在一起。"""
+def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = None) -> str:
+    """每条资料分开给。数字冲突时不要选边，缺口不要编。"""
     blocks = []
     for i, item in enumerate(contexts):
-        role = "最相关" if i == 0 else "仅补充，数字冲突时忽略"
-        blocks.append(f"【资料{i + 1}｜{role}】（来源：{item['source']}）\n{item['content']}")
+        blocks.append(f"【资料{i + 1}】（来源：{item['source']}）\n{item['content']}")
+    if gaps:
+        blocks.append("这些问题没有资料，不要编，请同事确认：" + "、".join(gaps))
     return "\n\n".join(blocks)
 
 
@@ -480,19 +639,23 @@ def _tool_rounds_exhausted(reply: AgentReply, tool_rounds: int) -> bool:
 
 
 async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0) -> AgentReply | None:
-    """主模型调用（解析失败重试 1 次）；硬失败（网络/服务异常）时自动切换备用模型再试一轮。"""
+    """主模型调用（解析失败重试 1 次）。硬失败或解析失败时，改走备用模型再试一轮。"""
     reply, hard_failed = await _call_llm_once(
         rendered_prompt, conversation_id=conversation_id,
         base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model,
     )
-    if hard_failed and settings.llm_fallback_configured:
+    if reply is not None or not settings.llm_fallback_configured:
+        return reply
+    if hard_failed:
         logger.warning("主 LLM 不可用，切换备用模型 %s", settings.llm_fallback_model)
         monitor.record("llm_failure", f"主模型 {settings.llm_model} 失败，切换备用模型")
-        reply, _ = await _call_llm_once(
-            rendered_prompt, conversation_id=conversation_id,
-            base_url=settings.llm_fallback_base_url or settings.llm_base_url,
-            api_key=settings.llm_fallback_api_key, model=settings.llm_fallback_model,
-        )
+    else:
+        logger.warning("主 LLM 没有给出可用 JSON，切换备用模型 %s", settings.llm_fallback_model)
+    reply, _ = await _call_llm_once(
+        rendered_prompt, conversation_id=conversation_id,
+        base_url=settings.llm_fallback_base_url or settings.llm_base_url,
+        api_key=settings.llm_fallback_api_key, model=settings.llm_fallback_model,
+    )
     return reply
 
 

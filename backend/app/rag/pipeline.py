@@ -34,6 +34,14 @@ class RetrievalResult:
     bm25_count: int = 0
     fused_top: list[dict] = field(default_factory=list)
     rerank_status: str = "skipped"  # used | unavailable | skipped
+    facets: list[str] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+
+
+_ASK_HINT = re.compile(
+    r"多少钱|什么价|价格|几块|几元|包邮|运费|邮费|发货|几天|退货|退换|换货|质保|发票|库存|有货|保修|优惠|折扣"
+)
+_CONNECTOR = re.compile(r"还有|另外|以及|顺便")
 
 
 async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3,
@@ -119,6 +127,46 @@ async def _maybe_broaden(result: RetrievalResult, query: str, history: list[dict
         second.rewritten_queries = list(result.rewritten_queries) + list(second.rewritten_queries)
         return second
     return result
+
+
+def split_facets(query: str) -> list[str]:
+    """一句里有两件独立的事才拆开。单问返回空列表，调用方只检索一次。"""
+    text = (query or "").strip()
+    if not text:
+        return []
+    qmarks = len(re.findall(r"[？?]", text))
+    if qmarks >= 2:
+        raw = re.split(r"[？?]", text)
+    elif _CONNECTOR.search(text):
+        raw = _CONNECTOR.split(text)
+    elif re.search(r"和|跟", text):
+        raw = re.split(r"和|跟", text)
+    elif ("，" in text or "," in text) and len(_ASK_HINT.findall(text)) >= 2:
+        raw = re.split(r"[，,]", text)
+    else:
+        return []
+    parts = []
+    for part in raw:
+        cleaned = part.strip(" ，,、。！!？? ")
+        if len(cleaned) >= 2:
+            parts.append(cleaned)
+    if len(parts) < 2:
+        return []
+    hinted = sum(1 for part in parts if _ASK_HINT.search(part))
+    if hinted >= 2 or qmarks >= 2 or _CONNECTOR.search(text):
+        return parts[:3]
+    return []
+
+
+def facet_covered(facet: str, contexts: list[dict]) -> bool:
+    """这条资料写到了该子问题的关键词，或子问题原文就在正文里。"""
+    blob = "\n".join((item.get("content") or "") for item in contexts)
+    compact_blob = _compact(blob)
+    phrase = _compact(facet)
+    if len(phrase) >= 2 and phrase in compact_blob:
+        return True
+    hints = _ASK_HINT.findall(facet or "")
+    return bool(hints) and all(hint in blob for hint in hints)
 
 
 def _compact(text: str) -> str:

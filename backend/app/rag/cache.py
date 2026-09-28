@@ -37,6 +37,13 @@ def invalidate_docs(doc_ids: list[int]) -> None:
         _entries[:] = kept
 
 
+def invalidate_messages(messages: list[str]) -> None:
+    """当前知识对不上这条缓存时丢掉它，避免下一轮再命中。"""
+    target = list(messages)
+    with _lock:
+        _entries[:] = [item for item in _entries if item["messages"] != target]
+
+
 def clear() -> None:
     with _lock:
         _entries.clear()

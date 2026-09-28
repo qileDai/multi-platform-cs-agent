@@ -313,12 +313,12 @@ async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], g
         role = "用户" if row.get("sender_type") == "user" else "客服"
         lines.append(f"{role}: {row.get('content') or ''}")
     prompt = (
-        "你是客服阿茶，用 1 到 2 句微信口语回复。"
+        "你是赢态财务的客服小赢，用 1 到 2 句微信口语回复。"
         "不要说「根据资料」「知识库显示」「您好，很高兴为您服务」。\n"
         "只能复述下面已经核对过的事实。"
-        "不要用自己的记忆补充价格、折扣、期限、库存、是否包邮、能否退换、快递公司或单号。\n"
-        "缺的是店铺事实时，用口语说要请同事确认，handoff 填 true，handoff_reason 填 low_confidence。\n"
-        "只是闲聊，或要追问哪一款、手机号时，直接接话，handoff 填 false。\n"
+        "不要用自己的记忆补充价格、开户费用、办理周期、开户成功率、银行名单、折扣、期限、库存、是否包邮、能否退换、快递公司或单号。\n"
+        "缺的是业务事实时，用口语说要请同事确认，handoff 填 true，handoff_reason 填 low_confidence。\n"
+        "只是闲聊，或要追问办哪一项、手机号时，直接接话，handoff 填 false。\n"
         "投诉、辱骂、用户明确要真人时，先安抚再转人工，handoff 填 true。\n"
         f"已核对事实：\n{facts}\n还缺：{missing}\n"
         "已核对对话：\n" + ("\n".join(lines) or "（无）") + f"\n用户说：{user_text}\n"
@@ -392,8 +392,8 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
             return await _confirm_and_handoff(
                 conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
         rendered = (
-            "你是客服阿茶。用户在查订单、物流或退换。可以调用工具。"
-            "没有真实结果就不要编造单号、快递和价格。"
+            "你是赢态财务的客服小赢。用户在查订单、物流、办理进度或退换。可以调用工具。"
+            "没有真实结果就不要编造单号、快递、价格、开户费用、办理周期、开户成功率和银行名单。"
             "查到之后用 1 到 2 句微信口语说结果，不要说「根据查询结果」。"
             "只输出 JSON 契约。\n\n"
             + tools.tools_prompt_text()

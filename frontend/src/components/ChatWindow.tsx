@@ -64,6 +64,11 @@ function formatTick(iso: string): string {
 
 const TICK_GAP_MS = 5 * 60 * 1000
 
+function withMessage(prev: Message[], msg: Message): Message[] {
+  if (prev.some((m) => m.id === msg.id)) return prev
+  return [...prev, msg]
+}
+
 interface Props {
   conversation: Conversation
   onRefresh: () => void
@@ -97,6 +102,7 @@ export default function ChatWindow({
   const bottomRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const typingTimer = useRef<ReturnType<typeof setTimeout>>()
+  const sendingRef = useRef(false)
 
   useEffect(() => {
     setSummaryOpen(false)
@@ -116,10 +122,7 @@ export default function ChatWindow({
     return subscribeWs((event, data) => {
       if (data.conversation_id !== conversation.id) return
       if (event === 'new_message') {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === data.message.id)) return prev
-          return [...prev, data.message]
-        })
+        setMessages((prev) => withMessage(prev, data.message))
         if (data.message.sender_type === 'ai') {
           setAiTyping(false)
           clearTimeout(typingTimer.current)
@@ -135,15 +138,17 @@ export default function ChatWindow({
 
   const send = async (override?: string) => {
     const text = (override ?? draft).trim()
-    if (!text || sending) return
+    if (!text || sendingRef.current) return
+    sendingRef.current = true
     setSending(true)
     try {
       const msg = await api.reply(conversation.id, text, noteMode)
-      if (msg) setMessages((prev) => [...prev, msg])
+      if (msg) setMessages((prev) => withMessage(prev, msg))
       onDraftChange('')
     } catch (e: any) {
       toast.error(e?.message || '发送失败，请稍后重试')
     } finally {
+      sendingRef.current = false
       setSending(false)
     }
   }
@@ -152,7 +157,7 @@ export default function ChatWindow({
     try {
       const { media_id } = await api.uploadMedia(file, 'image')
       const msg = await api.reply(conversation.id, '[图片]', false, 'image', media_id)
-      if (msg) setMessages((prev) => [...prev, msg])
+      if (msg) setMessages((prev) => withMessage(prev, msg))
     } catch (e: any) {
       toast.error(e?.message || '图片发送失败')
     }
@@ -450,6 +455,7 @@ export default function ChatWindow({
               onChange={(e) => onDraftChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return
                   e.preventDefault()
                   // 只输入了 #、后面没有关键词时，列表是全部模板，Enter 仍应发送
                   if (hashHits.length > 0 && hashQuery?.[1]) {

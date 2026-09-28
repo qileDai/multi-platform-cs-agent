@@ -45,13 +45,22 @@ def _to_out(db: Session, conv: Conversation, agents: dict[int, Agent] | None = N
         .order_by(Message.id.desc())
         .first()
     )
+    # 等待计时认 AI 和人工回复；转入标记仍只看人工，避免 AI 补答把「转入」弄丢。
+    last_reply = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv.id,
+                Message.sender_type.in_(("ai", "agent")),
+                Message.is_internal == False)  # noqa: E712
+        .order_by(Message.id.desc())
+        .first()
+    )
     now = datetime.utcnow()
     wait_seconds = 0
     awaiting_first = False
     overdue = False
     if conv.status == "open" and conv.mode in ("pending", "human") and last_user:
-        no_human_after = last_human is None or last_human.id < last_user.id
-        if no_human_after:
+        no_reply_after = last_reply is None or last_reply.id < last_user.id
+        if no_reply_after:
             awaiting_first = True
             wait_seconds = max(0, int((now - last_user.created_at).total_seconds()))
             overdue = wait_seconds >= FIRST_RESPONSE_OVERDUE_SECONDS

@@ -1,5 +1,6 @@
 """客服工作台：分配上限、回头客、RAG 未命中硬转人工。"""
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -736,3 +737,72 @@ async def test_rate_limit_keeps_body_when_already_human(db, conversation, monkey
     assert "频控" in note.content
     assert conversation.mode == "human"
     ratelimit.reset_all()
+
+
+def _msg(conversation, sender_type, content, *, minutes_ago=0, internal=False, extra=None):
+    return Message(
+        conversation_id=conversation.id,
+        sender_type=sender_type,
+        msg_type="text",
+        content=content,
+        is_internal=internal,
+        extra=extra or {},
+        created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+    )
+
+
+def test_wait_badge_clears_after_ai_or_agent_reply(db, conversation):
+    """最后一条用户消息后面有非内部 AI 或人工回复时，不再显示等待分钟数。"""
+    from app.api.conversations import _to_out
+
+    conversation.mode = "human"
+    db.add(_msg(conversation, "user", "在吗", minutes_ago=5))
+    db.commit()
+    waiting = _to_out(db, conversation)
+    assert waiting.awaiting_first_response is True
+    assert waiting.wait_seconds >= 60
+
+    db.add(_msg(conversation, "ai", "在的"))
+    db.commit()
+    assert _to_out(db, conversation).awaiting_first_response is False
+
+    db.add(_msg(conversation, "user", "再问一下", minutes_ago=1))
+    db.commit()
+    again = _to_out(db, conversation)
+    assert again.awaiting_first_response is True
+
+    db.add(_msg(conversation, "agent", "我来回复"))
+    db.commit()
+    assert _to_out(db, conversation).awaiting_first_response is False
+
+
+def test_internal_note_does_not_clear_wait_badge(db, conversation):
+    from app.api.conversations import _to_out
+
+    conversation.mode = "pending"
+    db.add(_msg(conversation, "user", "需要人工", minutes_ago=2))
+    db.add(_msg(conversation, "agent", "同事先看一下", internal=True))
+    db.commit()
+    out = _to_out(db, conversation)
+    assert out.awaiting_first_response is True
+    assert out.wait_seconds > 0
+
+
+def test_ai_reply_keeps_transferred_in_flag(db, conversation):
+    """AI 补答清掉等待计时，但不算人工接手，转入标记还在。"""
+    from app.api.conversations import _to_out
+
+    agent = _agent(db, name="接手")
+    conversation.mode = "human"
+    conversation.assignee_id = agent.id
+    db.add(_msg(conversation, "user", "转过来了", minutes_ago=3))
+    db.add(_msg(
+        conversation, "system", "会话已转接",
+        extra={"event": "transfer", "to_agent_id": agent.id},
+    ))
+    db.add(_msg(conversation, "ai", "我先答一下"))
+    db.commit()
+
+    out = _to_out(db, conversation, viewer_id=agent.id)
+    assert out.awaiting_first_response is False
+    assert out.transferred_in is True

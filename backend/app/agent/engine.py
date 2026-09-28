@@ -281,9 +281,24 @@ def _cache_still_grounded(messages: list[str], retrieval: pipeline.RetrievalResu
                           agent_lines: list[str]) -> bool:
     if not retrieval.passed or retrieval.gaps:
         return False
+    if _cached_misses_numbered_items(messages, retrieval.contexts):
+        return False
     blob = evidence.evidence_text(retrieval.contexts, [], agent_lines)
     kept, dropped = evidence.partition_messages(messages, blob, retrieval.contexts)
     return bool(kept) and not dropped
+
+
+def _cached_misses_numbered_items(messages: list[str], contexts: list[dict]) -> bool:
+    """缓存句漏了召回里的编号正文时，不能再直接发出。"""
+    items = _collect_numbered_items(contexts)
+    if len(items) < 2:
+        return False
+    blob = re.sub(r"\s+", "", "\n".join(messages or []))
+    for item in items:
+        body = re.sub(r"\s+", "", _LIST_MARKER_RE.sub("", item).strip())
+        if body and body not in blob:
+            return True
+    return False
 
 
 async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], gaps: list[str],
@@ -464,7 +479,16 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
 
 
 def _numbered_items(text: str) -> list[str]:
-    return [line.strip() for line in (text or "").splitlines() if _LIST_ITEM_RE.match(line.strip())]
+    items = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("答："):
+            stripped = stripped.removeprefix("答：").strip()
+        elif stripped.startswith("答:"):
+            stripped = stripped.removeprefix("答:").strip()
+        if _LIST_ITEM_RE.match(stripped):
+            items.append(stripped)
+    return items
 
 
 def _format_list_item(item: str) -> str:

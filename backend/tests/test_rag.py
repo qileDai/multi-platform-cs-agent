@@ -1083,6 +1083,68 @@ async def test_covering_retrieve_merges_two_faqs(db):
     ingest.rebuild_bm25_from_db()
 
 
+@pytest.mark.asyncio
+async def test_exact_faq_beats_stale_cache_and_other_doc(db, conversation, monkeypatch):
+    """原问对上 FAQ 时用这 5 条原文。旧的一句缓存和其他文档条目都不发出。"""
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    faq = KnowledgeDoc(
+        title="香港开户资料", doc_type="faq", status="active",
+        content=(
+            "问：香港开户资料\n"
+            "答：1、香港公司全套注册资料（CR/BR/NNC1 / 公司章程）；\n"
+            "2、董事 / 股东个人资料：身份证 + 港澳通行证 / 护照（有效期 6 个月以上）\n"
+            "3、公司业务证明：国内公司营业执照（如有）+ 近 3 个月购销合同 / 提单 / 发票 / 银行流水（2-3 套，体现真实经营）；\n"
+            "4、董事 / 股东个人银行流水（近 6 个月，无断月，体现个人资金往来）；\n"
+            "5、开户调查问卷（我司提供模板，需您如实填写签字）。"
+        ),
+    )
+    other = KnowledgeDoc(
+        title="注册", doc_type="file", status="active",
+        content="1、另一份材料里的护照复印件\n2、额外的住址证明",
+    )
+    db.add_all([faq, other])
+    db.commit()
+    db.refresh(faq)
+    db.refresh(other)
+    await ingest.ingest_faq(faq.id)
+    await ingest.ingest_document(other.id)
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="香港开户资料",
+    ))
+    db.commit()
+
+    async def fake_lookup(_query):
+        return ["香港开户需要准备董事身份证、港澳通行证或护照原件等资料。"]
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["香港开户需要准备董事身份证、港澳通行证或护照原件等资料。"],
+            intent="consult_feature", confidence=0.9,
+        )
+
+    monkeypatch.setattr(engine.answer_cache, "lookup", fake_lookup)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 1
+    sent = rows[0].content
+    for item in ("公司章程", "港澳通行证", "营业执照", "个人银行流水", "开户调查问卷"):
+        assert item in sent
+    assert "香港开户需要准备董事身份证" not in sent
+    assert "另一份材料里的护照复印件" not in sent
+    faq.status = "archived"
+    other.status = "archived"
+    db.commit()
+    ingest.rebuild_bm25_from_db()
+
+
 def test_agent_correction_stays_pending(db, conversation):
     from app.services import note_agent_correction
 

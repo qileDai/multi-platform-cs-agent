@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from ..config import settings
 from ..database import SessionLocal
 from ..models import KnowledgeChunk, KnowledgeDoc
-from . import bm25, embeddings, rerank, rewrite, vectorstore
+from . import bm25, embeddings, ingest, rerank, rewrite, vectorstore
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     result.dense_count, result.bm25_count = _path_counts(rankings)
     if not rankings:
         result.reason = "no_hits"
-        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
+        return await _finish_retrieve(result, query, history or [], summary, top_k, broaden)
 
     # 3. RRF 融合（每路独立计名次，同一路内重复 chunk 只计一次）
     fused = _rrf_fuse(rankings)
@@ -67,7 +67,7 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     result.fused_top = _fused_preview(candidates)
     if not candidates:
         result.reason = "no_hits"
-        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
+        return await _finish_retrieve(result, query, history or [], summary, top_k, broaden)
 
     # 4. Rerank 精排。原句权重大于改写句。空结果或调用失败退回融合分差。
     if settings.rerank_configured:
@@ -104,14 +104,66 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
 
     if not selected:
         result.passed = False
-        return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
+        return await _finish_retrieve(result, query, history or [], summary, top_k, broaden)
 
     # 5. 父子索引：短父块才整段替换；否则用带标题的命中片段
     resolved = _resolve_hits(selected)
     result.contexts = _dedupe_contexts(resolved)[:top_k]
     result.passed = bool(result.contexts)
     result.reason = "passed" if result.passed else "no_hits"
+    return await _finish_retrieve(result, query, history or [], summary, top_k, broaden)
+
+
+async def _finish_retrieve(result: RetrievalResult, query: str, history: list[dict], summary: str,
+                           top_k: int, broaden: bool) -> RetrievalResult:
+    """原问对上启用 FAQ 时，本轮只用这条 FAQ，不再扩检。"""
+    pinned = _exact_faq_context(query)
+    if pinned is not None:
+        result.contexts = [pinned]
+        result.passed = True
+        result.reason = "passed"
+        result.gaps = []
+        return result
     return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
+
+
+def _exact_faq_context(query: str) -> dict | None:
+    """用户原句等于 FAQ 的问题、标题或相似问时，返回这条 FAQ 切片。"""
+    phrase = _compact(query)
+    if len(phrase) < 2:
+        return None
+    db = SessionLocal()
+    try:
+        docs = db.query(KnowledgeDoc).filter(
+            KnowledgeDoc.doc_type == "faq",
+            KnowledgeDoc.status == "active",
+        ).all()
+        for doc in docs:
+            labels = [_compact(doc.title or "")]
+            first, _, _rest = (doc.content or "").partition("\n")
+            labels.append(_compact(first.removeprefix("问：").removeprefix("问:")))
+            labels.extend(_compact(item) for item in ingest.load_similar_questions(doc.similar_questions))
+            if phrase not in labels:
+                continue
+            chunk = (
+                db.query(KnowledgeChunk)
+                .filter(KnowledgeChunk.doc_id == doc.id)
+                .order_by(KnowledgeChunk.chunk_index)
+                .first()
+            )
+            content = chunk.content if chunk is not None else ingest.faq_index_text(doc)
+            return {
+                "content": _with_title(doc.title, content),
+                "source": doc.title,
+                "doc_id": doc.id,
+                "doc_type": "faq",
+                "parent_id": None,
+                "chunk_id": f"chunk_{chunk.id}" if chunk is not None else None,
+                "score": None,
+            }
+        return None
+    finally:
+        db.close()
 
 
 async def _maybe_broaden(result: RetrievalResult, query: str, history: list[dict], summary: str,

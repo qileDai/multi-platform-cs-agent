@@ -102,7 +102,7 @@ def partition_messages(messages: list[str], evidence: str,
         if is_handoff_guide(message):
             kept.append(message)
             continue
-        if units and _uses_units(message, units):
+        if units and _picks_one_conflicting_number(message, contexts or [], units):
             dropped.append(message)
             continue
         if claims_unsupported([message], evidence):
@@ -115,6 +115,20 @@ def partition_messages(messages: list[str], evidence: str,
 def _uses_units(message: str, units: set[str]) -> bool:
     folded = fold_digits(message)
     return any(match.group(2) in units for match in _AMOUNT.finditer(folded))
+
+
+def _picks_one_conflicting_number(message: str, contexts: list[dict], units: set[str]) -> bool:
+    """同一单位有两个数字时，只报其中一个算选边。原文把两个数字都写上则保留。"""
+    folded_msg = fold_digits(message)
+    if not _uses_units(message, units):
+        return False
+    folded_src = fold_digits("\n".join(item.get("content") or "" for item in contexts))
+    for unit in units:
+        source_numbers = set(re.findall(rf"(\d+(?:\.\d+)?)\s*{re.escape(unit)}", folded_src))
+        message_numbers = set(re.findall(rf"(\d+(?:\.\d+)?)\s*{re.escape(unit)}", folded_msg))
+        if message_numbers and not source_numbers <= message_numbers:
+            return True
+    return False
 
 
 def _policy_missing(reply: str, evidence: str) -> bool:

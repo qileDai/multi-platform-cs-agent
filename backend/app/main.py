@@ -54,6 +54,7 @@ async def _sweep_once() -> list[int]:
         try:
             if not _still_ai_open(cid):
                 continue
+            # 知你快回会话的结束语由 send_outbound 只写入本系统，不打开放平台。
             await send_outbound(cid, settings.session_close_message, sender_type="ai")
             db = SessionLocal()
             try:

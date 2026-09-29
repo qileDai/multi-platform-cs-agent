@@ -770,6 +770,88 @@ async def test_miss_answers_from_earlier_dialogue(db, conversation, monkeypatch)
     ).count() == 0
 
 
+def test_earlier_dialogue_keeps_user_lines_and_drops_ungrounded_ai():
+    rows = engine._earlier_dialogue("那我叫啥名字", [
+        {"sender_type": "user", "content": "我叫小明啊"},
+        {"sender_type": "ai", "content": "编的价格 99 元", "grounded": False},
+        {"sender_type": "ai", "content": "你好，小明", "grounded": True},
+        {"sender_type": "user", "content": "那我叫啥名字"},
+    ])
+    assert [row["content"] for row in rows] == ["我叫小明啊", "你好，小明"]
+
+
+async def _miss_then_answer(monkeypatch, answer: str):
+    from app.schemas import AgentReply
+
+    prompts = []
+
+    async def fake_retrieve(query, history=None, top_k=3, summary="", broaden=True):
+        return rag_pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query])
+
+    async def fake_llm(rendered, *_a, **_k):
+        prompts.append(rendered)
+        return AgentReply(reply_messages=[answer], intent="other", confidence=0.9, handoff=False)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    return prompts
+
+
+@pytest.mark.asyncio
+async def test_followup_uses_name_the_user_already_said(db, conversation, monkeypatch):
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="我叫小明啊"))
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="那我叫啥名字"))
+    db.commit()
+    prompts = await _miss_then_answer(monkeypatch, "你叫小明")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "小明" in sent
+    assert "你叫啥名字" not in sent
+    assert any("我叫小明啊" in prompt and "不要再问一遍" in prompt for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_followup_uses_place_the_user_already_said(db, conversation, monkeypatch):
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="我今天要去香港"))
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="我刚才说去哪"))
+    db.commit()
+    prompts = await _miss_then_answer(monkeypatch, "你刚才说去香港")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "香港" in sent
+    assert "去哪" not in sent
+    assert any("我今天要去香港" in prompt for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_user_stated_price_is_not_repeated_as_fact(db, conversation, monkeypatch):
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="我觉得这个 3800 元"))
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="多少钱"))
+    db.commit()
+    prompts = await _miss_then_answer(monkeypatch, "是 3800 元")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = "\n".join(
+        row.content for row in db.query(Message).filter(
+            Message.conversation_id == conversation.id, Message.sender_type == "ai",
+        ).all()
+    )
+    assert "3800" not in sent
+    assert any("3800" in prompt for prompt in prompts)
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_keeps_body_when_already_human(db, conversation, monkeypatch):
     from app.core import ratelimit

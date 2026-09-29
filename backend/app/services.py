@@ -227,7 +227,10 @@ async def note_unmatched(conversation_id: int) -> None:
 
 
 async def replay_unanswered_phrase(phrase: str) -> int:
-    """只补跑仍 open、最后一条正好是这句话、且后面没有回复的会话。"""
+    """只补跑仍 open、最后一条正好是这句话、且后面没有回复的会话。
+
+    知你快回会话跳过：插件当时已经结束等待，事后生成也送不到网页。
+    """
     target = (phrase or "").strip()
     if not target:
         return 0
@@ -236,6 +239,8 @@ async def replay_unanswered_phrase(phrase: str) -> int:
     try:
         conversations = db.query(Conversation).filter(Conversation.status == "open").all()
         for conversation in conversations:
+            if is_zhini_conversation(conversation):
+                continue
             last = (
                 db.query(Message)
                 .filter(
@@ -341,6 +346,13 @@ def _save_message(db, conversation_id: int, *, sender_type: str, content: str,
 
 # ============ 出站（守卫 + 频控 + 发送 + 入库 + 广播） ============
 
+def is_zhini_conversation(conversation: Conversation | None) -> bool:
+    """知你快回入库时把会话号收成 zn: 短键，不能拿去调开放平台或写 RPA。"""
+    if conversation is None:
+        return False
+    return str(conversation.platform_conversation_id or "").startswith("zn:")
+
+
 async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
                         sender_id: int | None = None, extra: dict | None = None,
                         skip_filter: bool = False, msg_type: str = "text",
@@ -383,6 +395,13 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
                 await _broadcast_message(conversation, note)
                 await handoff(conversation_id, reason="low_confidence")
                 return None
+
+        # 知你快回没有回写网页的通道。事后出站只留在工作台，不占平台频控，也不打开放平台。
+        if is_zhini_conversation(conversation):
+            return await _persist_zhini_local(
+                db, conversation, content=filtered, sender_type=sender_type,
+                sender_id=sender_id, msg_type=msg_type, media_id=media_id, extra=extra,
+            )
 
         # 2. 平台频控（RPA 通道适用更严的专属规则，键为 <platform>_rpa；
         #    抖音企业号账号形态走 douyin_enterprise_rpa，官方规则与抖店不同）
@@ -454,6 +473,23 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         return message
     finally:
         db.close()
+
+
+async def _persist_zhini_local(db, conversation: Conversation, *, content: str,
+                               sender_type: str, sender_id: int | None, msg_type: str,
+                               media_id: str, extra: dict | None) -> Message:
+    """知你快回事后出站：入库并广播，标明这条没有发到网页。"""
+    payload = {**(extra or {}), "channel": "zhinikuaihui", "not_delivered_to_page": True}
+    if media_id:
+        payload["media_id"] = media_id
+    message = _save_message(
+        db, conversation.id, sender_type=sender_type, content=content,
+        msg_type=msg_type, sender_id=sender_id, extra=payload,
+    )
+    conversation.last_message_at = message.created_at
+    db.commit()
+    await _broadcast_message(conversation, message)
+    return message
 
 
 def _ai_may_send(conversation: Conversation, *, allow_owned: bool = False) -> bool:

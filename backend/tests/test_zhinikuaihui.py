@@ -1,5 +1,6 @@
 """知你快回回复接口：按插件 1.7.0 的请求/响应契约测试。"""
 import uuid
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.database import SessionLocal
 from app.main import app
-from app.models import Customer, Message
+from app.models import Conversation, Customer, Message
 
 client = TestClient(app)
 
@@ -261,3 +262,123 @@ class TestZhiniContract:
             send.assert_not_called()
         assert resp.status_code == 200
         assert resp.json()["action"] == "skip"
+
+
+def _zhini_conversation(db, *, mode: str = "human"):
+    uid = uuid.uuid4().hex[:8]
+    customer = Customer(
+        platform="douyin",
+        platform_user_id=f"zn:user{uid}",
+        nickname="张先生",
+        tags=[],
+    )
+    db.add(customer)
+    db.flush()
+    conversation = Conversation(
+        customer_id=customer.id,
+        platform="douyin",
+        platform_conversation_id=f"zn:conv{uid}",
+        mode=mode,
+        status="open",
+    )
+    db.add(conversation)
+    db.commit()
+    return conversation
+
+
+def _forbid_platform_send(monkeypatch):
+    def fail_send(_platform):
+        raise AssertionError("知你快回会话不应调用平台发送")
+
+    monkeypatch.setattr(settings, "douyin_channel", "rpa")
+    monkeypatch.setattr("app.services.get_send_adapter", fail_send)
+    monkeypatch.setattr("app.services.get_rpa_fallback_adapter", lambda _platform: None)
+
+
+@pytest.mark.asyncio
+async def test_agent_reply_on_zhini_stays_in_workbench(db, monkeypatch):
+    """工作台人工回复只入库，不调开放平台，也不写 RPA outbox。"""
+    from app.api.conversations import agent_reply
+    from app.core.security import hash_password
+    from app.models import Agent, RpaOutbox
+    from app.schemas import AgentMessageSend
+
+    _forbid_platform_send(monkeypatch)
+    conversation = _zhini_conversation(db)
+    before = db.query(RpaOutbox).count()
+    agent = Agent(
+        username=f"zhini_{uuid.uuid4().hex[:8]}",
+        password_hash=hash_password("x"),
+        display_name="客服",
+        role="agent",
+        status="active",
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    msg = await agent_reply(
+        conversation.id, AgentMessageSend(content="我在工作台回你"), agent, db,
+    )
+    assert msg.sender_type == "agent"
+    assert msg.content == "我在工作台回你"
+    assert msg.extra["channel"] == "zhinikuaihui"
+    assert msg.extra["not_delivered_to_page"] is True
+    db.expire_all()
+    stored = db.get(Message, msg.id)
+    assert stored.platform_msg_id is None
+    assert db.query(RpaOutbox).count() == before
+
+
+@pytest.mark.asyncio
+async def test_zhini_sweep_close_message_stays_local(db, monkeypatch):
+    """超时结束语只写在本系统，然后关闭会话。"""
+    from app.main import _sweep_once
+    from app.models import RpaOutbox
+
+    _forbid_platform_send(monkeypatch)
+    conversation = _zhini_conversation(db, mode="ai")
+    conversation.last_message_at = datetime.utcnow() - timedelta(minutes=60)
+    db.commit()
+    before = db.query(RpaOutbox).count()
+
+    closed = await _sweep_once()
+
+    assert conversation.id in closed
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.status == "closed"
+    close_msg = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
+        .one()
+    )
+    assert close_msg.extra["channel"] == "zhinikuaihui"
+    assert close_msg.extra["not_delivered_to_page"] is True
+    assert close_msg.platform_msg_id is None
+    assert db.query(RpaOutbox).count() == before
+
+
+@pytest.mark.asyncio
+async def test_replay_skips_zhini_conversation(db, monkeypatch):
+    """启动补跑不给知你快回会话再生成一条送不出去的回复。"""
+    from app.services import replay_unanswered_phrase
+
+    conversation = _zhini_conversation(db, mode="ai")
+    phrase = f"面签资料清单{uuid.uuid4().hex[:8]}"
+    db.add(Message(
+        conversation_id=conversation.id,
+        sender_type="user",
+        msg_type="text",
+        content=phrase,
+    ))
+    db.commit()
+    called = []
+
+    async def spy(conversation_id, user_message_id):
+        called.append(conversation_id)
+
+    monkeypatch.setattr("app.services._resume_if_unanswered", spy)
+    count = await replay_unanswered_phrase(phrase)
+    assert count == 0
+    assert conversation.id not in called

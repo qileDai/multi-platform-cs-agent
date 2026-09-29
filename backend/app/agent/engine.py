@@ -487,12 +487,15 @@ async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], g
         "不要说「根据资料」「知识库显示」「您好，很高兴为您服务」。\n"
         "没有核对过的事实时，可以接话、追问办的是注册还是开户、或问手机号。\n"
         "用户报名字、问放假、说今天去哪里，直接接一句，handoff 填 false，不要说对不上资料。\n"
+        "先看用户前面已经说过的事，包括名字、称呼、去哪、要办什么、放假、计划。"
+        "现在问到其中一件，就用那些原话回答或用一两句概括，不要再问一遍。\n"
         "不要用自己的记忆补充价格、费用、办理天数、银行名单、资料清单、办理步骤、开户或注册能否办成、优惠、政策、折扣、库存、是否包邮、能否退换、快递公司或单号。\n"
+        "用户自己说过的数字也不能当成这些事实。\n"
         "用户在要这些内容时，只说请同事确认，不要写步骤或编号清单，handoff 填 true，handoff_reason 填 low_confidence。\n"
         "只是闲聊，或要追问办哪一项、手机号时，直接接话，handoff 填 false。\n"
         "投诉、辱骂、用户明确要真人时，先安抚再转人工，handoff 填 true。\n"
         f"已核对事实：\n{facts}\n还缺：{missing}\n"
-        "已核对对话：\n" + ("\n".join(lines) or "（无）") + f"\n用户说：{user_text}\n"
+        "已有对话：\n" + ("\n".join(lines) or "（无）") + f"\n用户说：{user_text}\n"
         "只输出 JSON："
         '{"reply_messages":["一句"],"intent":"other","confidence":0.4,'
         '"handoff":false,"handoff_reason":"","tags":[],'
@@ -745,7 +748,7 @@ async def _consume_tools(conversation_id: int, customer_id: int, platform: str, 
 
 
 def _earlier_dialogue(user_text: str, recent: list[dict]) -> list[dict]:
-    """去掉当前这句。事实只留人工原话和已经核对过的 AI 回复。"""
+    """去掉当前这句。留下用户原话、人工原话和已经核对过的 AI 回复。"""
     rows = list(recent or [])
     if rows and rows[-1].get("sender_type") == "user" and rows[-1].get("content") == user_text:
         rows = rows[:-1]
@@ -754,9 +757,22 @@ def _earlier_dialogue(user_text: str, recent: list[dict]) -> list[dict]:
         content = (row.get("content") or "").strip()
         if not content:
             continue
-        if row.get("sender_type") == "agent" or (row.get("sender_type") == "ai" and row.get("grounded")):
+        sender = row.get("sender_type")
+        if sender == "user" or sender == "agent" or (sender == "ai" and row.get("grounded")):
             kept.append(row)
     return kept
+
+
+def _confirmed_dialogue_text(rows: list[dict]) -> str:
+    """费用和资料只认人工原话和已核对的 AI 回复，不认用户自己说的数字。"""
+    lines = []
+    for row in rows:
+        sender = row.get("sender_type")
+        if sender == "agent" or (sender == "ai" and row.get("grounded")):
+            content = (row.get("content") or "").strip()
+            if content:
+                lines.append(content)
+    return "\n".join(lines)
 
 
 async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: list[dict], *,
@@ -771,7 +787,10 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
         lines.append(f"{role}: {row['content']}")
     rendered = (
         "下面是已经发生的对话。用户现在又问了一句。"
-        "只有对话里已经说过的事实才能回答，不要查知识库，不要编造。"
+        "先看用户前面已经说过的事，包括名字、称呼、去哪、要办什么、放假、计划。"
+        "现在问到其中一件，就用那些原话回答，或用一两句概括，不要再问一遍。"
+        "只有对话里已经说过的事才能回答，不要查知识库，不要编造。"
+        "价格、费用、办理天数、银行、资料、政策不能用用户自己说的数字来回答。"
         "能回答时输出 JSON：{\"reply_messages\":[\"一句短回复\"],\"intent\":\"other\",\"confidence\":0.9,\"handoff\":false}。"
         "对话里没有这个事实时输出 JSON：{\"reply_messages\":[],\"intent\":\"other\",\"confidence\":0,\"handoff\":false}。\n\n"
         f"已有对话：\n" + "\n".join(lines) + f"\n\n用户现在问：{user_text}"
@@ -784,8 +803,7 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
     )
     if reply is None or reply.handoff or not reply.reply_messages:
         return None
-    facts = "\n".join(row["content"] for row in earlier)
-    if evidence.claims_unsupported(reply.reply_messages[:1], facts):
+    if evidence.claims_unsupported(reply.reply_messages[:1], _confirmed_dialogue_text(earlier)):
         return None
     text, _sent = await _deliver_ai(
         conversation_id, reply.reply_messages[:1], local=local, allow_owned=allow_owned,

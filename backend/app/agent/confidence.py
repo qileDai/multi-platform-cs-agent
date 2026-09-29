@@ -27,7 +27,6 @@ _HIGH_RISK_RE = re.compile(
     r"退款|赔偿|税务|身份规划|怎么弄|要准备|办理步骤|怎么办|发票|优惠|政策"
 )
 _SCOPE_ASK_RE = re.compile(r"做不做|你们做|有没有|做吗|能不能注册|能不能办|接不接|做哪些|做什么")
-_LOW_RISK_RE = re.compile(r"哈哈|谢谢|你好|您好|在吗|机器人|人工智障")
 _SERVICES = (
     ("香港", "公司注册", "香港公司注册"),
     ("香港", "注册", "香港公司注册"),
@@ -198,15 +197,13 @@ def used_precision(verdicts: list[int]) -> float:
 
 
 def risk_tier(user_text: str) -> str:
-    """高风险对应不许编造的业务事实。怎么弄算高风险，不算做不做。"""
+    """高风险只表示在要不能编的事实。对不上这些词的话是接话，不再默认高风险。"""
     text = user_text or ""
     if _HIGH_RISK_RE.search(text):
         return "high"
     if _SCOPE_ASK_RE.search(text):
         return "medium"
-    if _LOW_RISK_RE.search(text):
-        return "low"
-    return "high"
+    return "low"
 
 
 def scope_reply(user_text: str) -> str | None:

@@ -275,6 +275,63 @@ async def test_human_mode_miss_leaves_note_and_reason(db, conversation, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_human_mode_name_uses_fallback_not_internal_note(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    _owned_conversation(db, conversation, "我叫小明")
+
+    async def fake_retrieve(query, history=None, top_k=3, summary="", broaden=True):
+        return rag_pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query])
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["好，小明，记下了"], intent="chitchat", confidence=0.9, handoff=False)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id, allow_owned=True)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "human"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "小明" in sent
+    assert db.query(Message).filter(
+        Message.conversation_id == conversation.id,
+        Message.content == "这条没对上资料，需要人工回复",
+    ).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_mode_name_stays_with_model_sentence(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="我叫小明"))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary="", broaden=True):
+        return rag_pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query])
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["好，小明，记下了"], intent="chitchat", confidence=0.9, handoff=False)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "小明" in sent
+
+
+@pytest.mark.asyncio
 async def test_pure_greeting_stays_with_ai(db, conversation, monkeypatch):
     called = []
 
@@ -1023,3 +1080,133 @@ async def test_greeting_skips_answer_confidence(db, conversation, monkeypatch):
     ).one()
     assert called == []
     assert "answer_confidence" not in (ai.extra or {})
+
+
+async def _irrelevant_then_miss(monkeypatch, user_text: str):
+    """第一次检索通过，判定都不相关，放宽后再检也没有。"""
+    from app.agent import engine
+
+    calls = {"n": 0}
+
+    async def fake_retrieve(query, history=None, top_k=3, summary="", broaden=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return rag_pipeline.RetrievalResult(
+                passed=True, contexts=[{"content": "无关段落", "source": "其他"}],
+            )
+        return rag_pipeline.RetrievalResult(passed=False, contexts=[])
+
+    async def none_relevant(_user, contexts, *, timeout=4.0):
+        return [0] * len(contexts or [])
+
+    async def fake_broaden(*_a, **_k):
+        return "放宽后的问法"
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", none_relevant)
+    monkeypatch.setattr(engine.rewrite, "broaden_query", fake_broaden)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_chitchat_uses_fallback_sentence(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="哈哈哈你们回复好快",
+    ))
+    db.commit()
+    await _irrelevant_then_miss(monkeypatch, "哈哈哈你们回复好快")
+    called = []
+
+    async def fake_llm(*_a, **_k):
+        called.append(1)
+        return AgentReply(
+            reply_messages=["哈哈那是，我一直盯着呢"],
+            intent="chitchat", confidence=0.9, handoff=False,
+        )
+
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert called
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "哈哈那是" in sent
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_materials_question_does_not_invent_list(db, conversation, monkeypatch):
+    from app.agent import engine
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="香港公司注册要准备什么",
+    ))
+    db.commit()
+    await _irrelevant_then_miss(monkeypatch, "香港公司注册要准备什么")
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["1、护照和公司章程", "注册费3800元", "我先让同事确认"],
+            intent="consult_feature", confidence=0.4, handoff=True, handoff_reason="low_confidence",
+        )
+
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = "\n".join(
+        row.content for row in db.query(Message).filter(
+            Message.conversation_id == conversation.id, Message.sender_type == "ai",
+        )
+    )
+    assert "确认" in sent
+    assert "3800" not in sent
+    assert "1、" not in sent
+    assert "护照" not in sent
+
+
+@pytest.mark.asyncio
+async def test_unscored_does_not_call_fallback_model(db, conversation, monkeypatch):
+    from app.agent import engine
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="注册要准备什么资料",
+    ))
+    db.commit()
+    called = []
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, contexts=[{"content": "无关段落", "source": "其他"}],
+        )
+
+    async def no_verdict(*_a, **_k):
+        return None
+
+    async def fake_llm(*_a, **_k):
+        called.append(1)
+        from app.schemas import AgentReply
+        return AgentReply(reply_messages=["1、护照"], intent="other", confidence=0.2)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", no_verdict)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    assert called == []
+    sent = "\n".join(
+        row.content for row in db.query(Message).filter(
+            Message.conversation_id == conversation.id, Message.sender_type == "ai",
+        )
+    )
+    assert "确认" in sent
+    assert "护照" not in sent

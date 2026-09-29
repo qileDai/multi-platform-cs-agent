@@ -151,11 +151,15 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
             )
             return text
         if confidence_meta["action"] == "stop":
-            return await _risk_stop(
-                conversation_id_, user_text, platform, confidence_meta,
-                local=local, allow_owned=owned, owned=owned,
-            )
-        retrieval.contexts = confidence_meta["contexts"]
+            if confidence_meta.get("cause") != "out_of_kb":
+                return await _risk_stop(
+                    conversation_id_, user_text, platform, confidence_meta,
+                    local=local, allow_owned=owned, owned=owned,
+                )
+            retrieval.passed = False
+            retrieval.contexts = []
+        else:
+            retrieval.contexts = confidence_meta["contexts"]
     cache_ok = bool(cached) and _cache_still_grounded(cached, retrieval, agent_lines)
     if cache_ok and confidence_meta is not None:
         cache_ok = confidence.faithfulness(cached, retrieval.contexts) >= confidence.PASS_SCORE
@@ -247,6 +251,8 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         reply.handoff = True
         reply.handoff_reason = reply.handoff_reason or "low_confidence"
 
+    kept, list_dropped = _without_ungrounded_lists(kept, blob)
+    dropped.extend(list_dropped)
     shop_gap = bool(gaps) or ((not retrieval.passed) and _expects_shop_fact(user_text) and not tool_ok)
     if not kept:
         kept = [_CONFIRM_REPLY]
@@ -255,7 +261,9 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     if shop_gap or (reply.handoff and forced_human):
         reply.handoff = True
         reply.handoff_reason = reply.handoff_reason or "low_confidence"
-    if used_fallback and not shop_gap and not forced_human and kept and not reply.handoff:
+    if used_fallback and not shop_gap and not forced_human and kept and (
+        not reply.handoff or confidence.risk_tier(user_text) == "low"
+    ):
         reply.handoff = False
     reply_blob = "\n".join(kept)
     if confidence_meta is None and ((reply.confidence < 0.6 and _expects_shop_fact(reply_blob)) or bool(dropped)):
@@ -377,6 +385,33 @@ def _expects_shop_fact(user_text: str) -> bool:
     return bool(_SHOP_FACT.search(user_text or ""))
 
 
+def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str], list[str]]:
+    """编号行必须整句出现在证据里。没有证据的清单不能发出。"""
+    compact_blob = re.sub(r"\s+", "", blob or "")
+    kept: list[str] = []
+    dropped: list[str] = []
+    for message in messages:
+        lines: list[str] = []
+        for raw in (message or "").splitlines():
+            line = raw.strip()
+            if not line:
+                lines.append("")
+                continue
+            if _LIST_ITEM_RE.match(line):
+                body = re.sub(r"\s+", "", _LIST_MARKER_RE.sub("", line))
+                if not body or body not in compact_blob:
+                    dropped.append(line)
+                    continue
+            lines.append(line)
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        if any(lines):
+            kept.append("\n".join(lines))
+    return kept, dropped
+
+
 def _context_key(item: dict) -> tuple:
     return (item.get("chunk_id"), item.get("doc_id"), item.get("content"))
 
@@ -450,9 +485,10 @@ async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], g
     prompt = (
         "你是赢态财务的客服小赢，用 1 到 2 句微信口语回复。"
         "不要说「根据资料」「知识库显示」「您好，很高兴为您服务」。\n"
-        "只能复述下面已经核对过的事实。"
-        "不要用自己的记忆补充价格、开户费用、办理周期、开户成功率、银行名单、折扣、期限、库存、是否包邮、能否退换、快递公司或单号。\n"
-        "缺的是业务事实时，用口语说要请同事确认，handoff 填 true，handoff_reason 填 low_confidence。\n"
+        "没有核对过的事实时，可以接话、追问办的是注册还是开户、或问手机号。\n"
+        "用户报名字、问放假、说今天去哪里，直接接一句，handoff 填 false，不要说对不上资料。\n"
+        "不要用自己的记忆补充价格、费用、办理天数、银行名单、资料清单、办理步骤、开户或注册能否办成、优惠、政策、折扣、库存、是否包邮、能否退换、快递公司或单号。\n"
+        "用户在要这些内容时，只说请同事确认，不要写步骤或编号清单，handoff 填 true，handoff_reason 填 low_confidence。\n"
         "只是闲聊，或要追问办哪一项、手机号时，直接接话，handoff 填 false。\n"
         "投诉、辱骂、用户明确要真人时，先安抚再转人工，handoff 填 true。\n"
         f"已核对事实：\n{facts}\n还缺：{missing}\n"
@@ -680,7 +716,7 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
         conversation_id, user_text, recent, local=local, allow_owned=allow_owned, started=started)
     if remembered is not None:
         return remembered
-    if owned:
+    if owned and confidence.risk_tier(user_text) == "high":
         await note_unmatched(conversation_id)
         record_missed_question(user_text, platform, conversation_id)
         return ""

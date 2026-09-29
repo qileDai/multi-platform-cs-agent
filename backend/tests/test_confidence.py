@@ -47,6 +47,10 @@ def test_risk_tiers_follow_existing_rules():
     assert confidence.risk_tier("开户要准备什么资料") == "high"
     assert confidence.risk_tier("做不做香港开户") == "medium"
     assert confidence.risk_tier("哈哈") == "low"
+    assert confidence.risk_tier("我叫小明") == "low"
+    assert confidence.risk_tier("你们国庆放假吗") == "low"
+    assert confidence.risk_tier("我今天要去香港") == "low"
+    assert confidence.risk_tier("火星移民政策") == "high"
 
 
 def test_scope_reply_does_not_invent_fees():

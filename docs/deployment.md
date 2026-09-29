@@ -2,31 +2,42 @@
 
 ## 方式一：Docker Compose（推荐，知你快回）
 
-域名先解析到这台机器。编排只起后端、前端和 Caddy，不启动 RPA Worker。对外只开 80 和 443。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。
+证书和反向代理由宝塔做。这套编排只起后端和前端，不启动 Caddy，也不启动 RPA Worker。前端只监听本机 `127.0.0.1:8080`，不要把 8080 对公网开放。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。
+
+已有网站不要改。给客服系统单独用一个子域名，例如 `cs.cndistribution.com`，A 记录指向这台服务器。
 
 ```bash
 cp backend/.env.example backend/.env
 ```
 
-编辑 `backend/.env`，至少填这四项：
+编辑 `backend/.env`，至少填这三项：
 
-- `SITE_DOMAIN`：域名，例如 `cs.example.com`（不要带 `https://`）
 - `LLM_API_KEY`
 - `ZHINI_REPLY_API_KEY`：随机串，`python -c "import secrets;print(secrets.token_hex(16))"`
 - `SECRET_KEY`：换成另一把随机串
 
-然后启动：
+`SITE_DOMAIN` 只作备查，填子域名，不要带 `https://`。然后启动：
 
 ```bash
 docker compose up -d --build
 ```
 
-工作台：`https://你的域名`。首次登录 `admin` / `admin123`，登录后立刻改掉。
+宝塔里添加站点 `cs.cndistribution.com`，PHP 选纯静态。申请 SSL 并开启强制 HTTPS。反向代理目标填 `http://127.0.0.1:8080`，发送域名填 `$host`，关闭缓存，并在代理配置里加上：
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_read_timeout 90s;
+```
+
+工作台：`https://cs.cndistribution.com`。首次登录 `admin` / `admin123`，登录后立刻改掉。
 
 知你快回插件：
 
 1. 回复来源选「使用自己的回复接口」。
-2. 接口地址填 `https://你的域名/api/integrations/zhinikuaihui/reply`。
+2. 接口地址填 `https://cs.cndistribution.com/api/integrations/zhinikuaihui/reply`。
 3. 身份验证填同一把 `ZHINI_REPLY_API_KEY`。
 4. 等待时间选 60 秒。
 5. 点测试并保存。浏览器弹出该域名的访问授权时点允许。

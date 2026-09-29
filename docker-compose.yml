@@ -20,27 +20,11 @@ services:
   frontend:
     build: ./frontend
     container_name: cs-agent-frontend
+    ports:
+      - "127.0.0.1:8080:80"
     depends_on:
       - backend
     restart: unless-stopped
 
-  caddy:
-    image: caddy:2
-    container_name: cs-agent-caddy
-    env_file:
-      - ./backend/.env
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    depends_on:
-      - frontend
-    restart: unless-stopped
-
 volumes:
   cs-data:
-  caddy-data:
-  caddy-config:

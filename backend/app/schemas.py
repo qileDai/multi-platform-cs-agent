@@ -248,6 +248,7 @@ class MissedQuestionOut(BaseModel):
     count: int
     status: str
     suggested_answer: str = ""
+    conversation_id: int | None = None
     created_at: datetime
 
     class Config:
@@ -411,6 +412,10 @@ class StatsOverview(BaseModel):
     today_comments: int = 0                 # 今日采集评论数（内容矩阵）
     today_leads: int = 0                    # 今日留资数（漏斗 lead 层）
     today_wecom_adds: int = 0               # 今日加企微数（漏斗 wecom 层）
+    handoff_reasons_7d: dict[str, int] = {}
+    retrieval_miss_rate_7d: float = 0.0
+    bad_case_count_7d: int = 0
+    send_failed_count_7d: int = 0
 
 
 # ============ 内容矩阵平台 ============

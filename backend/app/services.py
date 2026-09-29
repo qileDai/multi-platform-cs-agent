@@ -3,6 +3,7 @@
 这是连接 适配器 / 队列 / Agent 引擎 / WebSocket 的业务核心。
 """
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +13,7 @@ from .adapters import get_adapter, get_rpa_fallback_adapter, get_send_adapter, s
 from .api.ws import manager
 from .config import settings
 from .core import contentfilter, idempotency, monitor, ratelimit
-from .core.queue import register_handler
+from .core.queue import enqueue, register_handler
 from .database import SessionLocal
 from .models import Conversation, Customer, HandoffEvent, Message, MissedQuestion
 from .schemas import InboundMessage
@@ -37,10 +38,10 @@ async def handle_inbound(payload: dict[str, Any]):
         )
         return
 
-    # 幂等：平台重推直接丢弃。处理抛错会删掉这次的键，队列重试才能再进来。
+    # 幂等键在用户消息入库成功后才写入。键在、消息不在，说明进程在这两步之间被杀掉，放行重试。
     event_key = f"{msg.platform}:{msg.platform_msg_id}" if msg.platform_msg_id else ""
-    if event_key and idempotency.is_duplicate(event_key):
-        return
+    if event_key and idempotency.exists(event_key) and not _platform_message_exists(msg.platform_msg_id):
+        idempotency.release(event_key)
 
     db = SessionLocal()
     try:
@@ -54,6 +55,22 @@ async def handle_inbound(payload: dict[str, Any]):
         db.close()
 
 
+def _platform_message_exists(platform_msg_id: str) -> bool:
+    if not platform_msg_id:
+        return False
+    db = SessionLocal()
+    try:
+        row = db.query(Message.id).filter(Message.platform_msg_id == platform_msg_id).first()
+        return row is not None
+    finally:
+        db.close()
+
+
+def _mark_inbound(msg: InboundMessage) -> None:
+    if msg.platform_msg_id:
+        idempotency.mark(f"{msg.platform}:{msg.platform_msg_id}")
+
+
 async def _handle_inbound_locked(db, msg: InboundMessage):
     """幂等键已占住之后的入库与接待。调用方在异常时释放键。"""
     if msg.platform_msg_id:
@@ -64,6 +81,7 @@ async def _handle_inbound_locked(db, msg: InboundMessage):
             # 上次已入库但中途失败：不插第二条、不加未读；还没有回复才补跑
             if msg.sender_side != "agent":
                 await _resume_if_unanswered(existing.conversation_id, existing.id)
+            _mark_inbound(msg)
             return
 
     customer = _upsert_customer(db, msg)
@@ -83,6 +101,7 @@ async def _handle_inbound_locked(db, msg: InboundMessage):
         )
         conversation.last_message_at = message.created_at
         db.commit()
+        _mark_inbound(msg)
         await _broadcast_message(conversation, message)
         return
 
@@ -120,6 +139,7 @@ async def _handle_inbound_locked(db, msg: InboundMessage):
         conversation.platform_conversation_id or str(conversation.id),
     )
     db.commit()
+    _mark_inbound(msg)
 
     await _broadcast_message(conversation, message)
 
@@ -345,13 +365,24 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
             return None
         customer = db.get(Customer, conversation.customer_id)
 
-        # 1. 出口违禁词过滤
+        # 1. 出口违禁词过滤。删空后不发给平台。
         filtered = content
         if not skip_filter:
             filtered, hits = contentfilter.sanitize(content)
+            filtered = (filtered or "").strip()
             if hits:
                 logger.warning("违禁词命中 %s，已改写: %s", hits, contentfilter.mask_lead(content))
                 extra = {**(extra or {}), "filtered_words": hits}
+            if not filtered:
+                note = _save_message(
+                    db, conversation_id, sender_type="system", msg_type="system",
+                    is_internal=True, content="这条回复被违禁词删空了，没有发给顾客",
+                )
+                conversation.last_message_at = note.created_at
+                db.commit()
+                await _broadcast_message(conversation, note)
+                await handoff(conversation_id, reason="low_confidence")
+                return None
 
         # 2. 平台频控（RPA 通道适用更严的专属规则，键为 <platform>_rpa；
         #    抖音企业号账号形态走 douyin_enterprise_rpa，官方规则与抖店不同）
@@ -365,20 +396,14 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         allowed, rule = ratelimit.check_and_count(rate_platform, conv_key)
         if not allowed:
             logger.warning("频控超限 platform=%s rule=%s，转人工", rate_platform, rule)
-            kept = _save_message(
-                db, conversation_id, sender_type=sender_type, content=filtered,
-                msg_type=msg_type, sender_id=sender_id,
-                extra={**(extra or {}), "rate_limit": rule},
+            note = _save_message(
+                db, conversation_id, sender_type="system", msg_type="system",
+                is_internal=True,
+                content=f"这条回复被频控拦住了（{rule}），未发给顾客：{(filtered or '')[:200]}",
             )
-            conversation.last_message_at = kept.created_at
-            if conversation.mode != "ai":
-                note = _save_message(
-                    db, conversation_id, sender_type="system", msg_type="system",
-                    content=f"这条回复被频控拦住了（{rule}）",
-                )
-                conversation.last_message_at = note.created_at
+            conversation.last_message_at = note.created_at
             db.commit()
-            await _broadcast_message(conversation, kept)
+            await _broadcast_message(conversation, note)
             await handoff(conversation_id, reason=f"rate_limit:{rule}")
             return None
 
@@ -392,17 +417,28 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
             )
         except Exception as exc:  # noqa: BLE001
             fallback = get_rpa_fallback_adapter(conversation.platform)
-            if fallback is None:
-                raise
-            logger.exception("[API 发送失败→RPA 降级] platform=%s conv=%s err=%s",
-                             conversation.platform, conversation.platform_conversation_id, exc)
-            monitor.record("api_send_fallback",
-                           f"platform={conversation.platform} err={str(exc)[:150]}")
-            platform_msg_id = await fallback.send(
-                conversation.platform_conversation_id, customer.platform_user_id, filtered,
-                msg_type=msg_type, media_id=media_id,
-            )
-            extra = {**(extra or {}), "send_fallback": "rpa", "api_error": str(exc)[:200]}
+            if fallback is not None:
+                logger.exception("[API 发送失败→RPA 降级] platform=%s conv=%s err=%s",
+                                 conversation.platform, conversation.platform_conversation_id, exc)
+                monitor.record("api_send_fallback",
+                               f"platform={conversation.platform} err={str(exc)[:150]}")
+                try:
+                    platform_msg_id = await fallback.send(
+                        conversation.platform_conversation_id, customer.platform_user_id, filtered,
+                        msg_type=msg_type, media_id=media_id,
+                    )
+                except Exception as fallback_exc:  # noqa: BLE001
+                    return await _persist_send_failure(
+                        db, conversation, content=filtered, sender_type=sender_type,
+                        sender_id=sender_id, msg_type=msg_type, extra=extra,
+                        error=str(fallback_exc),
+                    )
+                extra = {**(extra or {}), "send_fallback": "rpa", "api_error": str(exc)[:200]}
+            else:
+                return await _persist_send_failure(
+                    db, conversation, content=filtered, sender_type=sender_type,
+                    sender_id=sender_id, msg_type=msg_type, extra=extra, error=str(exc),
+                )
 
         # 4. 入库 + 广播
         if media_id:
@@ -469,6 +505,22 @@ async def record_local_ai_message(conversation_id: int, content: str,
 
 # ============ 转人工 / 模式切换 ============
 
+def handoff_public_line(reason: str) -> str:
+    """工作台系统行用口语。原始 reason 只留在 HandoffEvent。"""
+    if (reason or "").startswith("rate_limit:"):
+        detail = "发送有点频繁，先请同事来回复"
+    else:
+        detail = {
+            "low_confidence": "我先请同事过来确认一下",
+            "llm_parse_failed": "我这边卡住了，先请同事过来",
+            "tool_rounds_exhausted": "我查到一半卡住了，先请同事过来",
+            "llm_not_configured": "自动回复这会儿不可用，先请同事过来",
+            "ai_globally_disabled": "自动回复已暂停，先请同事过来",
+            "risk_content": "这条需要同事来处理",
+        }.get(reason or "", "先请同事过来")
+    return f"已为您转接人工客服，请稍等哈~（{detail}）"
+
+
 async def handoff(conversation_id: int, reason: str, db=None):
     """会话切到 pending（排队待人工），记录事件，自动分配客服，广播提醒。"""
     own_db = db is None
@@ -482,7 +534,7 @@ async def handoff(conversation_id: int, reason: str, db=None):
 
         sys_msg = _save_message(
             db, conversation_id, sender_type="system", msg_type="system",
-            content=f"已为您转接人工客服，请稍等哈~（原因：{reason}）",
+            content=handoff_public_line(reason),
         )
         conversation.last_message_at = sys_msg.created_at
         db.commit()
@@ -501,13 +553,23 @@ async def handoff(conversation_id: int, reason: str, db=None):
 
 # ============ 未命中问题沉淀 ============
 
+def _normalize_missed_question(question: str) -> str:
+    text = re.sub(r"\s+", "", question or "").strip()
+    return text.rstrip("？?。！!")[:500]
+
+
 def record_missed_question(question: str, platform: str, conversation_id: int, suggested_answer: str = ""):
     db = SessionLocal()
     try:
-        existing = (
+        normalized = _normalize_missed_question(question)
+        pending = (
             db.query(MissedQuestion)
-            .filter(MissedQuestion.question == question, MissedQuestion.status == "pending")
-            .first()
+            .filter(MissedQuestion.status == "pending")
+            .all()
+        )
+        existing = next(
+            (row for row in pending if _normalize_missed_question(row.question) == normalized),
+            None,
         )
         if existing:
             existing.count += 1
@@ -516,7 +578,7 @@ def record_missed_question(question: str, platform: str, conversation_id: int, s
                 existing.suggested_answer = suggested_answer[:2000]
         else:
             db.add(MissedQuestion(
-                question=question[:500], platform=platform, conversation_id=conversation_id,
+                question=normalized or question[:500], platform=platform, conversation_id=conversation_id,
                 suggested_answer=(suggested_answer or "")[:2000],
             ))
         db.commit()
@@ -648,6 +710,97 @@ async def handle_compliance_check(payload: dict[str, Any]):
 
 
 # 注册队列处理器
+async def _persist_send_failure(db, conversation: Conversation, *, content: str, sender_type: str,
+                                sender_id: int | None, msg_type: str, extra: dict | None,
+                                error: str) -> Message:
+    """平台没发出去：记下正文和 send_failed，稍后再发这一条，不重跑整段接待。"""
+    payload = {**(extra or {}), "send_failed": True, "send_error": (error or "")[:200]}
+    message = _save_message(
+        db, conversation.id, sender_type=sender_type, content=content,
+        msg_type=msg_type, sender_id=sender_id, extra=payload,
+    )
+    conversation.last_message_at = message.created_at
+    db.commit()
+    db.refresh(message)
+    await _broadcast_message(conversation, message)
+    monitor.record("outbound_send_failed", f"conversation={conversation.id} {(error or '')[:150]}")
+    enqueue("outbound_retry", {"message_id": message.id, "attempt": 1}, delay_seconds=30)
+    return message
+
+
+async def save_unsent_outbound(conversation_id: int, content: str, *, extra: dict | None = None) -> Message | None:
+    """拟人多条里还没发出的后几条，记成未送达，交给 outbound_retry。"""
+    text = (content or "").strip()
+    if not text:
+        return None
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        if conversation is None:
+            return None
+        return await _persist_send_failure(
+            db, conversation, content=text, sender_type="ai", sender_id=None,
+            msg_type="text", extra=extra, error="前一条发送失败，本条未发出",
+        )
+    finally:
+        db.close()
+
+
+async def retry_outbound_send(payload: dict[str, Any]):
+    """只重发标记了 send_failed 的那一条。"""
+    message_id = int(payload.get("message_id") or 0)
+    attempt = int(payload.get("attempt") or 1)
+    db = SessionLocal()
+    try:
+        message = db.get(Message, message_id)
+        if message is None or not (message.extra or {}).get("send_failed"):
+            return
+        conversation = db.get(Conversation, message.conversation_id)
+        customer = db.get(Customer, conversation.customer_id) if conversation is not None else None
+        if conversation is None or customer is None or conversation.status != "open":
+            return
+        adapter = get_send_adapter(conversation.platform)
+        try:
+            platform_msg_id = await adapter.send(
+                conversation.platform_conversation_id, customer.platform_user_id, message.content,
+                msg_type=message.msg_type or "text",
+                media_id=str((message.extra or {}).get("media_id") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            fallback = get_rpa_fallback_adapter(conversation.platform)
+            platform_msg_id = ""
+            if fallback is not None:
+                try:
+                    platform_msg_id = await fallback.send(
+                        conversation.platform_conversation_id, customer.platform_user_id, message.content,
+                        msg_type=message.msg_type or "text",
+                        media_id=str((message.extra or {}).get("media_id") or ""),
+                    )
+                except Exception as fallback_exc:  # noqa: BLE001
+                    exc = fallback_exc
+                    platform_msg_id = ""
+            if not platform_msg_id:
+                if attempt >= 3:
+                    monitor.record("outbound_send_failed", f"retry_exhausted message={message_id} {str(exc)[:120]}")
+                    return
+                enqueue(
+                    "outbound_retry",
+                    {"message_id": message_id, "attempt": attempt + 1},
+                    delay_seconds=30 * attempt,
+                )
+                return
+        extra = dict(message.extra or {})
+        extra.pop("send_failed", None)
+        extra["send_retried"] = True
+        message.extra = extra
+        message.platform_msg_id = platform_msg_id
+        db.commit()
+        await _broadcast_message(conversation, message)
+    finally:
+        db.close()
+
+
 register_handler("inbound_message", handle_inbound)
+register_handler("outbound_retry", retry_outbound_send)
 register_handler("content_generate", handle_content_generate)
 register_handler("compliance_check", handle_compliance_check)

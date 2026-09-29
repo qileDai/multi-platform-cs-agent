@@ -30,6 +30,7 @@ type Round = {
   userText: string
   reason: string
   score: string
+  confidence: string
   reply: string
 }
 
@@ -61,11 +62,17 @@ function roundsFrom(messages: Message[]): Round[] {
       if (next.sender_type === 'ai' || next.sender_type === 'system') replies.push(next.content)
     }
     const described = describeRetrieval(message)
+    const confidence = messages.slice(i + 1).find((item) => item.sender_type === 'ai' && !item.is_internal)
+      ?.extra?.answer_confidence
+    const confidenceText = confidence
+      ? `忠实度 ${confidence.faithfulness ?? '—'} · 上下文精度 ${confidence.context_precision ?? '—'} · 综合 ${confidence.score ?? '—'}`
+      : ''
     rounds.push({
       id: message.id,
       userText: message.content,
       reason: described.reason,
       score: described.score,
+      confidence: confidenceText,
       reply: replies.join('\n'),
     })
   }
@@ -204,6 +211,7 @@ export default function MockPanel() {
                 <div className="text-sm text-gray-800 dark:text-gray-100">{round.userText}</div>
                 <div className="text-xs text-gray-500 dark:text-gray-400">
                   {round.reason} · 精排分 {round.score}
+                  {round.confidence ? ` · ${round.confidence}` : ''}
                 </div>
                 <div className="text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap">
                   {round.reply || '等待回复'}

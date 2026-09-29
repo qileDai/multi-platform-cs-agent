@@ -36,6 +36,7 @@ class RetrievalResult:
     rerank_status: str = "skipped"  # used | unavailable | skipped
     facets: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
+    exact_faq: bool = False
 
 
 _ASK_HINT = re.compile(
@@ -123,6 +124,7 @@ async def _finish_retrieve(result: RetrievalResult, query: str, history: list[di
         result.passed = True
         result.reason = "passed"
         result.gaps = []
+        result.exact_faq = True
         return result
     return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
@@ -174,7 +176,7 @@ async def _maybe_broaden(result: RetrievalResult, query: str, history: list[dict
     wider = await rewrite.broaden_query(query, result.rewritten_queries, result.reason, history, summary)
     if not wider:
         return result
-    second = await retrieve(wider, history=[], top_k=top_k, broaden=False)
+    second = await retrieve(wider, history=history, summary=summary, top_k=top_k, broaden=False)
     if second.passed:
         second.rewritten_queries = list(result.rewritten_queries) + list(second.rewritten_queries)
         return second
@@ -298,7 +300,7 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool]
             dense = [
                 {**hit, "score_kind": "dense"}
                 for hit in vectorstore.query(vec, top_k=20)
-                if (hit.get("score") or 0.0) >= DENSE_MIN_SCORE
+                if (hit.get("score") or 0.0) >= settings.rag_dense_min_score
             ]
             if dense:
                 rankings.append(dense)
@@ -346,7 +348,7 @@ def _filter_reranked(hits: list[dict]) -> list[dict]:
     top_score = hits[0].get("score") or 0.0
     if top_score < settings.rag_rerank_threshold:
         return []
-    floor = top_score * RELATIVE_SCORE_RATIO
+    floor = top_score * settings.rag_relative_score_ratio
     kept = []
     for hit in hits:
         score = hit.get("score") or 0.0
@@ -365,7 +367,7 @@ def _select_dense_gap(hits: list[dict]) -> list[dict]:
     if not isinstance(top_score, (int, float)):
         logger.info("融合第一名没有向量分，判为未命中")
         return []
-    if float(top_score) < DENSE_ABSOLUTE_MIN:
+    if float(top_score) < settings.rag_dense_absolute_min:
         logger.info("向量检索第一名绝对分过低，判为未命中")
         return []
     rival_score: float | None = None
@@ -376,7 +378,7 @@ def _select_dense_gap(hits: list[dict]) -> list[dict]:
         if not isinstance(score, (int, float)):
             continue
         rival_score = float(score) if rival_score is None else max(rival_score, float(score))
-    if rival_score is None or float(top_score) >= rival_score + DENSE_SCORE_GAP:
+    if rival_score is None or float(top_score) >= rival_score + settings.rag_dense_score_gap:
         return [top]
     logger.info("向量检索第一名未明显高于其他资料，判为未命中")
     return []
@@ -412,7 +414,7 @@ def _select_degraded(hits: list[dict]) -> list[dict]:
         return [top]
     top_score = _bm25_score(top)
     rival_score = _bm25_score(ordered[1])
-    if rival_score <= 0 or top_score >= rival_score * DEGRADED_SCORE_GAP:
+    if rival_score <= 0 or top_score >= rival_score * settings.rag_degraded_score_gap:
         return [top]
     logger.info("降级检索第一名未明显高于其他资料，判为未命中")
     return []

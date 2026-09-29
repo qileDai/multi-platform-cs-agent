@@ -1,7 +1,7 @@
 """查询改写：多轮对话指代消解 + 同义多路召回。
 
 把「那这个多少钱」结合历史改写成独立完整问题，并生成 1 个同义改写。
-没有更早对话、问题里也没有指代时直接用原句。第一轮没检索到时再放宽一次。
+没有更早对话、也不是店铺事实问、问题里也没有指代时直接用原句。第一轮没检索到时再放宽一次。
 LLM 未配置或调用失败时返回原查询。
 """
 import json
@@ -21,6 +21,10 @@ _REWRITE_HEAD = (
 )
 _REWRITE_JSON = '{"standalone": "独立完整问题", "variants": ["同义改写"]}'
 _ANAPHORA = re.compile(r"这个|那个|这款|那款|它|刚才|上面|前面说的")
+_SHOP_FACT = re.compile(
+    r"多少钱|什么价|价格|几元|几块|包邮|运费|邮费|发货|退货|退换|换货|退款|发票|质保|保修|"
+    r"库存|有货|营业|几点|地址|尺码|颜色|优惠|折扣|几天|多久|周末"
+)
 _BROADEN_HEAD = (
     "上一轮检索没有命中。请把用户问题改成一句更宽的检索问法："
     "去掉口语废话，补上对话里的商品名，不要重复已经搜过的句子。"
@@ -52,11 +56,14 @@ def _render_prompt(history_text: str, query: str) -> str:
 
 
 def needs_rewrite(query: str, history: list[dict]) -> bool:
-    """没有更早对话、问题里也没有指代时，直接用原句。"""
+    """有更早对话、指代，或在问店铺事实时，生成检索问法。纯寒暄不改写。"""
     earlier = _earlier_history(query, history)
     if earlier:
         return True
-    return bool(_ANAPHORA.search(query or ""))
+    text = query or ""
+    if _ANAPHORA.search(text):
+        return True
+    return bool(_SHOP_FACT.search(text))
 
 
 async def rewrite_query(query: str, history: list[dict], summary: str = "") -> list[str]:

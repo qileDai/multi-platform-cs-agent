@@ -4,6 +4,7 @@ import logging
 import httpx
 
 from ..config import settings
+from ..core import monitor
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ async def rerank(query: str, documents: list[str], top_n: int = 3) -> list[dict]
                         "top_n": min(top_n, len(documents)),
                     },
                 )
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"rerank http {resp.status_code}")
                 parsed = parse_rerank_payload(resp.json())
             if not parsed:
                 logger.info("Rerank 返回空结果，第 %d 次", attempt + 1)
@@ -65,4 +68,5 @@ async def rerank(query: str, documents: list[str], top_n: int = 3) -> list[dict]
             last_error = exc
             logger.warning("Rerank 调用失败，第 %d 次", attempt + 1)
     logger.error("Rerank 两次都不可用，退回混合检索: %s", last_error)
+    monitor.record("rerank_failure", str(last_error or "empty")[:150])
     return None

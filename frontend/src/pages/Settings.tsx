@@ -611,6 +611,21 @@ export default function Settings() {
               >
                 导出 badcase（evals 格式，{`人工审阅后合入 backend/evals/cases.json`}）
               </button>
+              <button
+                onClick={async () => {
+                  const cases = await api.draftEvalCases()
+                  const blob = new Blob([JSON.stringify(cases, null, 2)], { type: 'application/json' })
+                  const a = document.createElement('a')
+                  a.href = URL.createObjectURL(blob)
+                  a.download = 'eval-drafts.json'
+                  a.click()
+                  URL.revokeObjectURL(a.href)
+                  toast.success(`已生成 ${cases.length} 条评测草稿`)
+                }}
+                className="text-xs text-blue-500 hover:underline"
+              >
+                生成评测草稿
+              </button>
             </div>
             {auditLogs.length === 0 ? (
               <div className="text-xs text-gray-300 text-center py-6">暂无操作记录</div>

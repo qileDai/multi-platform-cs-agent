@@ -32,7 +32,14 @@ export interface Message {
     extra: {
     intent?: string
     confidence?: number
-    citations?: string[]
+    citations?: Array<string | { title?: string; doc_id?: number | null; chunk_id?: string | null }>
+    gaps?: string[]
+    dropped?: string[]
+    send_failed?: boolean
+    send_error?: string
+    reflection?: { action?: string; issues?: string[] } | null
+    handoff_reason?: string
+    reply_ms?: number
     filtered_words?: string[]
     media_id?: string
     asr?: boolean
@@ -44,6 +51,14 @@ export interface Message {
     outbox_status?: 'pending' | 'leased' | 'acked' | 'failed' | 'discarded'
     badcase_note?: string
     grounding?: string
+    answer_confidence?: {
+      faithfulness?: number
+      context_precision?: number
+      score?: number
+      cause?: string
+      retried?: boolean
+      raw_context_precision?: number | null
+    }
     retrieval?: {
       queries?: string[]
       dense_count?: number
@@ -51,6 +66,8 @@ export interface Message {
       rerank_top_score?: number | null
       reason?: string
       rerank_status?: string
+      gaps?: string[]
+      selected?: Array<{ source?: string; score?: number | null; doc_id?: number | null; chunk_id?: string | null }>
     }
   }
   is_internal: boolean
@@ -108,6 +125,7 @@ export interface MissedQuestion {
   count: number
   status: string
   suggested_answer?: string
+  conversation_id?: number | null
   created_at: string
 }
 
@@ -150,6 +168,10 @@ export interface StatsOverview {
   today_comments: number
   today_leads: number
   today_wecom_adds: number
+  handoff_reasons_7d?: Record<string, number>
+  retrieval_miss_rate_7d?: number
+  bad_case_count_7d?: number
+  send_failed_count_7d?: number
 }
 
 export interface Ticket {
@@ -583,6 +605,7 @@ export const api = {
 
   // evals（badcase 导出为 cases.json 草稿，admin）
   exportBadCases: () => request<any[]>('/api/evals/export'),
+  draftEvalCases: () => request<any[]>('/api/evals/drafts', { method: 'POST' }),
 
   // messages
   listMessages: (conversationId: number) =>

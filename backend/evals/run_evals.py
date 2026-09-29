@@ -65,13 +65,33 @@ def check_case(case: dict, reply) -> list[str]:
     return failures
 
 
-async def run_case(case: dict) -> tuple[bool, list[str], object]:
-    rendered = prompt_mod.render_prompt(
+async def knowledge_for_case(case: dict, *, live_rag: bool) -> str:
+    """静态案例用用例里的知识。retrieve=true 且打开 live-rag 时先走检索。"""
+    if live_rag and case.get("retrieve"):
+        from app.rag.pipeline import retrieve
+        result = await retrieve(case.get("user") or "", history=[])
+        if result.passed and result.contexts:
+            blocks = []
+            for i, item in enumerate(result.contexts):
+                blocks.append(f"【资料{i + 1}】（来源：{item.get('source') or ''}）\n{item.get('content') or ''}")
+            return "\n\n".join(blocks)
+        return "无匹配资料"
+    return case.get("knowledge") or "无匹配资料"
+
+
+async def run_case(case: dict, *, live_rag: bool = False, prompt_text: str | None = None) -> tuple[bool, list[str], object]:
+    knowledge = await knowledge_for_case(case, live_rag=live_rag)
+    renderer = prompt_mod.render_template if prompt_text else prompt_mod.render_prompt
+    kwargs = dict(
         platform="douyin",
-        knowledge_context=case["knowledge"] or "无匹配资料",
+        knowledge_context=knowledge,
         history_text="（无历史，这是用户的第一条消息）",
         user_message=case["user"],
     )
+    if prompt_text:
+        rendered = renderer(prompt_text, **kwargs)
+    else:
+        rendered = renderer(**kwargs)
     reply = await _call_llm_with_retry(rendered)
     failures = check_case(case, reply)
     return not failures, failures, reply
@@ -80,6 +100,8 @@ async def run_case(case: dict) -> tuple[bool, list[str], object]:
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", type=str, default="", help="只跑指定用例，如 1,3,5")
+    parser.add_argument("--live-rag", action="store_true", help="retrieve=true 的案例先检索再生成")
+    parser.add_argument("--prompt", type=str, default="", help="用这份提示词文件代替线上 cs_agent.md")
     args = parser.parse_args()
 
     if not settings.llm_configured:
@@ -92,9 +114,15 @@ async def main():
         ids = {int(x) for x in args.only.split(",")}
         cases = [c for c in cases if c["id"] in ids]
 
+    prompt_text = ""
+    if args.prompt:
+        with open(args.prompt, encoding="utf-8") as f:
+            prompt_text = f.read()
     passed, failed = 0, 0
     for case in cases:
-        ok, failures, reply = await run_case(case)
+        ok, failures, reply = await run_case(
+            case, live_rag=args.live_rag, prompt_text=prompt_text or None,
+        )
         if ok:
             passed += 1
             print(f"✓ [{case['id']}] {case['name']}")

@@ -318,6 +318,14 @@ export default function Knowledge() {
                     <div className="text-sm text-gray-800 dark:text-gray-100 truncate">{m.question}</div>
                     <div className="text-[11px] text-orange-500 mt-0.5">被问 {m.count} 次{m.suggested_answer ? " · 有待确认答案" : ""}</div>
                   </div>
+                  {m.conversation_id != null && (
+                    <button
+                      onClick={() => navigate('/', { state: { conversationId: m.conversation_id } })}
+                      className="text-xs text-gray-500 shrink-0"
+                    >
+                      打开会话
+                    </button>
+                  )}
                   <button
                     onClick={() => startCreate({ title: m.question.slice(0, 30), question: m.question, answer: m.suggested_answer || "" }, m.id)}
                     className="text-xs text-primary-600 shrink-0"

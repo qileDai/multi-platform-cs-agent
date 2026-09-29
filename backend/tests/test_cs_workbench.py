@@ -729,14 +729,15 @@ async def test_rate_limit_keeps_body_when_already_human(db, conversation, monkey
     sent = await send_outbound(conversation.id, "面签要带身份证", sender_type="ai", allow_owned=True)
     db.expire_all()
     assert sent is None
-    body = db.query(Message).filter(
+    assert db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
-    ).one()
-    assert "身份证" in body.content
+    ).count() == 0
     note = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "system",
+        Message.is_internal.is_(True),
     ).one()
     assert "频控" in note.content
+    assert "身份证" in note.content
     assert conversation.mode == "human"
     ratelimit.reset_all()
 
@@ -808,3 +809,217 @@ def test_ai_reply_keeps_transferred_in_flag(db, conversation):
     out = _to_out(db, conversation, viewer_id=agent.id)
     assert out.awaiting_first_response is False
     assert out.transferred_in is True
+
+
+_REGISTRATION_SECTION = "\n".join([
+    "二、香港公司注册资料收集确认",
+    "1、公司名称",
+    "中文名：",
+    "英文名：",
+    "2、注册资本：X万港币",
+    "3、经营范围：",
+    "4、注册地址：",
+    "董事+股东：证件号码、住址",
+    "①证件照片（护照人像页，身份证正反面）",
+    "②手持证件照片",
+    "③签名样式（将名字签在白纸上）",
+    "④住址证明材料（如果提供的证件照片上没有地址，就需要额外提供）",
+])
+
+_ACCOUNT_FAQ = "\n".join([
+    "问：香港开户资料",
+    "答：1、香港公司全套注册资料（CR/BR/NNC1 / 公司章程）；",
+    "2、董事 / 股东个人资料：身份证 + 港澳通行证 / 护照（有效期 6 个月以上）",
+    "3、公司业务证明：国内公司营业执照（如有）+ 近 3 个月购销合同 / 提单 / 发票 / 银行流水（2-3 套，体现真实经营）；",
+    "4、董事 / 股东个人银行流水（近 6 个月，无断月，体现个人资金往来）；",
+    "5、开户调查问卷（我司提供模板，需您如实填写签字）。",
+])
+
+
+@pytest.mark.asyncio
+async def test_registration_howto_drops_account_opening_list(db, conversation, monkeypatch):
+    """精排分再高，开户段排在前面也只发注册这一节。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="行，香港公司我要注册，怎么弄",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rerank_top_score=0.9792618751525879,
+            contexts=[
+                {"content": _ACCOUNT_FAQ, "source": "香港开户资料", "doc_id": 6},
+                {"content": _REGISTRATION_SECTION, "source": "注册.md", "doc_id": 5},
+            ],
+        )
+
+    async def verdicts(_user, contexts, *, timeout=4.0):
+        return [0, 1][:len(contexts)]
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["清单我按资料发你\n\n1、开户调查问卷"],
+            intent="consult_feature", confidence=0.95,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", verdicts)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one()
+    assert "公司名称" in sent.content
+    assert "注册资本" in sent.content
+    assert "经营范围" in sent.content
+    assert "证件照片" in sent.content
+    assert "开户调查问卷" not in sent.content
+    assert "购销合同" not in sent.content
+    assert sent.content.count("4、") == 1
+    score = sent.extra["answer_confidence"]
+    assert score["score"] >= 0.6
+    assert score["context_precision"] >= 0.6
+    assert score["raw_context_precision"] < 0.6
+
+
+@pytest.mark.asyncio
+async def test_unscored_materials_question_hands_off(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="行，香港公司我要注册，怎么弄",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, rerank_top_score=0.979,
+            contexts=[{"content": _ACCOUNT_FAQ, "source": "香港开户资料", "doc_id": 6}],
+        )
+
+    async def no_verdict(*_a, **_k):
+        return None
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["1、开户调查问卷"], intent="consult_feature", confidence=0.99)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", no_verdict)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+    sent = "\n".join(
+        row.content for row in db.query(Message).filter(
+            Message.conversation_id == conversation.id, Message.sender_type == "ai",
+        )
+    )
+    assert "确认" in sent
+    assert "开户调查问卷" not in sent
+    assert "免责" not in sent
+
+
+@pytest.mark.asyncio
+async def test_two_relevant_topics_ask_which_one(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="行，香港公司我要注册，怎么弄",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True,
+            contexts=[
+                {"content": _ACCOUNT_FAQ, "source": "香港开户资料"},
+                {"content": _REGISTRATION_SECTION, "source": "注册.md"},
+            ],
+        )
+
+    async def both(_user, contexts, *, timeout=4.0):
+        return [1] * len(contexts)
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["1、开户调查问卷\n4、注册地址"], intent="consult_feature", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", both)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "注册" in sent and "开户" in sent
+    assert "开户调查问卷" not in sent
+    assert "1、" not in sent
+
+
+@pytest.mark.asyncio
+async def test_scope_question_without_knowledge_stays_in_scope(db, conversation, monkeypatch):
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="做不做香港开户",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(passed=False, contexts=[])
+
+    async def fake_llm(*_a, **_k):
+        from app.schemas import AgentReply
+        return AgentReply(reply_messages=["开户服务费 3800，资料要准备流水"], intent="consult_feature", confidence=0.2)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "开户" in sent
+    assert "3800" not in sent
+    assert "流水" not in sent
+
+
+@pytest.mark.asyncio
+async def test_greeting_skips_answer_confidence(db, conversation, monkeypatch):
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="你好"))
+    db.commit()
+    called = []
+
+    async def verdicts(*_a, **_k):
+        called.append(1)
+        return [1]
+
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", verdicts)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one()
+    assert called == []
+    assert "answer_confidence" not in (ai.extra or {})

@@ -3,6 +3,7 @@
 插件把网页私信 POST 过来，本模块入库并在同一次请求里生成回复。
 发送由插件完成，这里不调用平台适配器，也不写 RPA outbox。
 """
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -19,6 +20,41 @@ from ..schemas import InboundMessage
 from ..services import _apply_guide_code_hook, _broadcast_message, handoff
 
 logger = logging.getLogger(__name__)
+
+_reply_locks: dict[int, asyncio.Lock] = {}
+_reply_locks_guard = asyncio.Lock()
+
+
+async def _conversation_lock(conversation_id: int) -> asyncio.Lock:
+    async with _reply_locks_guard:
+        lock = _reply_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _reply_locks[conversation_id] = lock
+        return lock
+
+
+async def _note_skip(conversation_id: int, content: str) -> None:
+    """知你快回没有回复、也没有转人工系统行时，给工作台留一条内部说明。"""
+    db = SessionLocal()
+    try:
+        conversation = db.get(Conversation, conversation_id)
+        if conversation is None:
+            return
+        message = Message(
+            conversation_id=conversation_id,
+            sender_type="system",
+            msg_type="system",
+            content=content,
+            is_internal=True,
+            extra={"zhini_skip": True},
+        )
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+        await _broadcast_message(conversation, message)
+    finally:
+        db.close()
 
 REPLY_PATH = "/api/integrations/zhinikuaihui/reply"
 CONNECTION_REPLY = "连接成功，可以开始回复。"
@@ -102,6 +138,7 @@ async def _handle_reply(body: dict) -> dict:
     await _broadcast_saved(conversation_id, trigger_id)
 
     if status != "open":
+        await _note_skip(conversation_id, "会话已结束，这条没有自动回复")
         return _skip("会话已结束")
 
     risk = contentfilter.check_inbound(text)
@@ -119,11 +156,15 @@ async def _handle_reply(body: dict) -> dict:
         return _skip("AI 已关闭，请人工回复")
 
     if mode not in ("ai", "pending", "human"):
+        await _note_skip(conversation_id, "会话已由人工接待，这条没有自动回复")
         return _skip("会话已由人工接待")
 
-    reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
+    lock = await _conversation_lock(conversation_id)
+    async with lock:
+        reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
     reply_text = (reply_text or "").strip()[:4000]
     if not reply_text:
+        await _note_skip(conversation_id, "没有可发送的回复")
         return _skip("没有可发送的回复")
     return {"action": "reply", "reply": reply_text}
 

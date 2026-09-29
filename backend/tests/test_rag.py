@@ -87,6 +87,26 @@ class TestSplitText:
         assert notes
         assert notes[0].text.index("4、开户调查问卷") < notes[0].text.index("董事股东要清楚经营情况")
 
+    def test_adjacent_numbered_blocks_under_one_heading_stay_together(self):
+        text = (
+            "二、香港公司注册资料收集确认\n\n"
+            "1、公司名称\n中文名：\n英文名：\n2、注册资本：X万港币\n3、经营范围：\n4、注册地址：\n\n"
+            "董事+股东：证件号码、住址\n\n"
+            "①证件照片（护照人像页，身份证正反面）\n②手持证件照片\n"
+            "③签名样式（将名字签在白纸上）\n④住址证明材料\n\n"
+            "三、催资料\n\n"
+            "亲，资料还没收齐。"
+        )
+        sections = ingest.split_sections(text)
+        lists = [section for section in sections if "1、公司名称" in section.text]
+        assert len(lists) == 1
+        blob = lists[0].text
+        assert "2、注册资本" in blob
+        assert "董事+股东" in blob
+        assert "①证件照片" in blob
+        assert "④住址证明" in blob
+        assert "资料还没收齐" not in blob
+
     def test_overlap_ratio_between_sentence_sections(self):
         sentence = "这是用来测试重叠的一句话。"
         first = sentence * 20
@@ -487,7 +507,7 @@ async def test_rewrite_prompt_survives_json_braces(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rewrite_runs_on_first_turn(monkeypatch):
-    """没有更早对话、也没有指代时不改写。有更早对话才请求改写。"""
+    """寒暄首句不改写。店铺事实问和有更早对话时才请求改写。"""
     from app.rag import rewrite
 
     called = []
@@ -516,9 +536,14 @@ async def test_rewrite_runs_on_first_turn(monkeypatch):
 
     monkeypatch.setattr(rewrite.settings, "llm_api_key", "test-key")
     monkeypatch.setattr(rewrite, "AsyncOpenAI", lambda **kwargs: _Client())
-    skipped = await rewrite.rewrite_query("多少钱", [{"sender_type": "user", "content": "多少钱"}])
-    assert skipped == ["多少钱"]
+    skipped = await rewrite.rewrite_query("你好", [{"sender_type": "user", "content": "你好"}])
+    assert skipped == ["你好"]
     assert called == []
+    shop = await rewrite.rewrite_query("多少钱", [{"sender_type": "user", "content": "多少钱"}])
+    assert called
+    assert shop[0] == "商品价格"
+    assert "多少钱" in shop
+    called.clear()
     history = [
         {"sender_type": "user", "content": "看看这款"},
         {"sender_type": "user", "content": "多少钱"},

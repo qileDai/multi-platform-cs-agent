@@ -12,22 +12,25 @@ import re
 import time
 from datetime import datetime
 
-from openai import AsyncOpenAI
+from openai import APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from ..config import settings
 from ..core import monitor
 from ..database import SessionLocal
 from ..models import Conversation, Customer, KnowledgeDoc, LlmUsage, Message
-from ..rag import cache as answer_cache, pipeline
+from ..rag import cache as answer_cache, pipeline, rewrite
 from ..schemas import AgentReply
 from ..services import handoff, note_unmatched, record_missed_question, send_outbound
-from . import context, evidence, humanize, prompt as prompt_mod, tools
+from . import confidence, context, evidence, humanize, prompt as prompt_mod, tools
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
-REPLY_BUDGET_SECONDS = 12
+REPLY_BUDGET_SECONDS = 45
+DRAFT_RESERVE_SECONDS = 15
+MIN_LLM_SECONDS = 4
+FALLBACK_TIMEOUT_SECONDS = 15
 _CONFIRM_REPLY = "我先让同事帮您确认"
 _TASK_RE = re.compile(r"订单|物流|快递|退货|退换|换货|退款")
 _FACT_TOOLS = frozenset({"query_order", "query_logistics"})
@@ -99,18 +102,27 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     finally:
         db.close()
 
+    if not settings.ai_globally_enabled:
+        if not owned:
+            await handoff(conversation_id_, reason="ai_globally_disabled")
+        return ""
+
     if is_pure_greeting(user_text):
-        return await _deliver_ai(
+        text, _sent = await _deliver_ai(
             conversation_id_, [greeting_reply(user_text)], local=local, allow_owned=owned,
             extra={"intent": "chitchat", "confidence": 1.0, "citations": []},
+            anchor_user_message_id=user_message_id if local else None,
         )
+        return text
 
     # LLM 未配置：AI 接待降级转人工。已经是排队或人工时不再发降级句，留给客服。
     if not settings.llm_configured:
         if owned:
             return ""
-        text = await _deliver_ai(
-            conversation_id_, ["这会儿咨询有点多，我先帮您叫同事过来哈"], local=local)
+        text, _sent = await _deliver_ai(
+            conversation_id_, ["这会儿咨询有点多，我先帮您叫同事过来哈"], local=local,
+            anchor_user_message_id=user_message_id if local else None,
+        )
         await handoff(conversation_id_, reason="llm_not_configured")
         return text
 
@@ -123,17 +135,57 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     retrieval = await _retrieve_covering(user_text, recent, summary)
     _save_retrieval_trace(user_message_id, retrieval)
     agent_lines = _agent_fact_lines(recent)
-    if cached and _cache_still_grounded(cached, retrieval, agent_lines):
-        return await _deliver_ai(
+    confidence_meta = None
+    if retrieval.passed:
+        confidence_meta = await _select_for_answer(user_text, retrieval, recent, summary, started)
+        if confidence_meta["action"] == "clarify":
+            payload = confidence.answer_confidence_payload(
+                faithfulness_score=1.0, precision=confidence_meta["raw_precision"],
+                cause="ambiguous", retried=True, raw_precision=confidence_meta["raw_precision"],
+            )
+            text, _sent = await _deliver_ai(
+                conversation_id_, [confidence_meta["clarify"]], local=local, allow_owned=owned,
+                extra={"intent": "consult_feature", "confidence": 0.9, "citations": [],
+                       "grounded": True, "answer_confidence": payload},
+                anchor_user_message_id=user_message_id if local else None,
+            )
+            return text
+        if confidence_meta["action"] == "stop":
+            return await _risk_stop(
+                conversation_id_, user_text, platform, confidence_meta,
+                local=local, allow_owned=owned, owned=owned,
+            )
+        retrieval.contexts = confidence_meta["contexts"]
+    cache_ok = bool(cached) and _cache_still_grounded(cached, retrieval, agent_lines)
+    if cache_ok and confidence_meta is not None:
+        cache_ok = confidence.faithfulness(cached, retrieval.contexts) >= confidence.PASS_SCORE
+    if cache_ok:
+        text, _sent = await _deliver_ai(
             conversation_id_, cached, local=local, allow_owned=owned,
             extra={"intent": "other", "confidence": 1.0, "citations": [], "cache_hit": True, "grounded": True},
+            anchor_user_message_id=user_message_id if local else None,
         )
+        return text
     if cached:
         answer_cache.invalidate_messages(cached)
+
+    if not retrieval.passed and confidence.risk_tier(user_text) == "medium":
+        scope = confidence.scope_reply(user_text)
+        if scope:
+            text, _sent = await _deliver_ai(
+                conversation_id_, [scope], local=local, allow_owned=owned,
+                extra={"intent": "consult_feature", "confidence": 0.9, "citations": [], "grounded": True},
+                anchor_user_message_id=user_message_id if local else None,
+            )
+            return text
 
     tool_results: list[dict] = []
     tool_names_used: list[str] = []
     if retrieval.passed:
+        if _llm_timeout(started) is None:
+            return await _confirm_and_handoff(
+                conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned,
+            )
         reply = await _answer_from_knowledge(
             conversation_id_, customer_id, platform, user_text, history_text, retrieval, started,
             tool_results, tool_names_used,
@@ -148,10 +200,13 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         if reply is None:
             reply = AgentReply()
 
-    if retrieval.passed and (reply is None or _tool_rounds_exhausted(reply, len(tool_names_used))):
-        text = await _deliver_ai(
-            conversation_id_, ["不好意思，我这边卡了一下"], local=local, allow_owned=owned)
-        reason = "llm_parse_failed" if reply is None else "tool_rounds_exhausted"
+    exhausted = reply is not None and _tool_rounds_exhausted(reply, len(tool_names_used))
+    if (retrieval.passed and reply is None) or exhausted:
+        text, _sent = await _deliver_ai(
+            conversation_id_, ["不好意思，我这边卡了一下"], local=local, allow_owned=owned,
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        reason = "tool_rounds_exhausted" if exhausted else "llm_parse_failed"
         await handoff(conversation_id_, reason=reason)
         return text
 
@@ -170,7 +225,7 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     tool_ok = _tool_answered(tool_names_used, tool_results)
     need_fallback = (not forced_human) and (bool(gaps) or not kept) and not tool_ok
     used_fallback = False
-    if need_fallback and not _over_budget(started):
+    if need_fallback and _llm_timeout(started) is not None:
         fallback = await _llm_fallback(
             conversation_id_, user_text, kept, gaps, recent, started,
         )
@@ -202,12 +257,69 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         reply.handoff_reason = reply.handoff_reason or "low_confidence"
     if used_fallback and not shop_gap and not forced_human and kept and not reply.handoff:
         reply.handoff = False
+    reply_blob = "\n".join(kept)
+    if confidence_meta is None and ((reply.confidence < 0.6 and _expects_shop_fact(reply_blob)) or bool(dropped)):
+        reply.handoff = True
+        reply.handoff_reason = reply.handoff_reason or "low_confidence"
+
+    gate_payload = None
+    if confidence_meta is not None and confidence_meta.get("action") == "use" and not forced_human:
+        score_contexts = list(retrieval.contexts)
+        tool_blob = evidence.evidence_text([], tool_results, agent_lines)
+        if tool_blob.strip():
+            score_contexts.append({"content": tool_blob, "source": "tool"})
+        faith = confidence.faithfulness(kept, score_contexts)
+        precision = confidence.used_precision(confidence_meta["verdicts"])
+        if faith < confidence.PASS_SCORE and not confidence_meta.get("retried"):
+            stripped = confidence.supported_messages(kept, score_contexts)
+            confidence_meta["retried"] = True
+            confidence_meta["cause"] = "unfaithful"
+            kept = stripped
+            faith = confidence.faithfulness(kept, score_contexts)
+        gate_payload = confidence.answer_confidence_payload(
+            faithfulness_score=faith,
+            precision=precision,
+            cause=confidence_meta.get("cause") or "",
+            retried=bool(confidence_meta.get("retried")),
+            raw_precision=confidence_meta.get("raw_precision"),
+        )
+        if not confidence.passed(faith, precision):
+            confidence_meta["faithfulness"] = faith
+            confidence_meta["precision"] = precision
+            return await _risk_stop(
+                conversation_id_, user_text, platform, confidence_meta,
+                local=local, allow_owned=owned, owned=owned,
+            )
+        if not shop_gap:
+            reply.handoff = False
+            reply.handoff_reason = ""
+
+    reflection = None
+    remaining = REPLY_BUDGET_SECONDS - (time.monotonic() - started)
+    risky = bool(dropped) or reply.confidence < 0.6 or bool(re.search(r"\d", reply_blob))
+    if gate_payload is None and retrieval.passed and remaining > 3 and risky and kept and not _over_budget(started):
+        from . import reflect
+        reflection = await reflect.review_reply(kept, blob, timeout=min(4.0, remaining - 0.5))
+        if reflection is not None:
+            action = reflection.get("action")
+            revised = [line for line in (reflection.get("messages") or []) if isinstance(line, str) and line.strip()]
+            if action == "handoff":
+                reply.handoff = True
+                reply.handoff_reason = reply.handoff_reason or "low_confidence"
+                if revised:
+                    kept = revised
+            elif action == "revise" and revised:
+                kept, more_dropped = evidence.partition_messages(revised, blob, retrieval.contexts)
+                dropped.extend(more_dropped)
+                if not kept:
+                    kept = [_CONFIRM_REPLY]
+                    reply.handoff = True
+                    reply.handoff_reason = reply.handoff_reason or "low_confidence"
 
     messages = kept[:3]
     if len(retrieval.facets) < 2 and len(messages) > 1:
         messages = ["\n".join(messages)]
-    _apply_side_effects(customer_id, reply)
-    citations = [c["source"] for c in retrieval.contexts]
+    citations = _citation_payload(retrieval.contexts)
     must_handoff = bool(reply.handoff) or shop_gap
     extra = {
         "intent": reply.intent,
@@ -218,12 +330,21 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         "gaps": gaps,
         "dropped": dropped,
         "fallback": used_fallback,
+        "reflection": reflection,
+        "handoff_reason": reply.handoff_reason if must_handoff else "",
+        "answer_confidence": gate_payload,
     }
     if tool_names_used:
         extra["tool_calls"] = tool_names_used
+    extra["reply_ms"] = int((time.monotonic() - started) * 1000)
     if messages:
-        text = await _deliver_ai(conversation_id_, messages, local=local, allow_owned=owned, extra=extra)
-        if retrieval.passed and not must_handoff:
+        text, sent = await _deliver_ai(
+            conversation_id_, messages, local=local, allow_owned=owned, extra=extra,
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        if sent:
+            _apply_side_effects(customer_id, reply)
+        if sent and retrieval.passed and not must_handoff:
             _bump_knowledge_hits(retrieval.contexts)
             if not _FACT_TOOLS.intersection(tool_names_used):
                 doc_ids = [item["doc_id"] for item in retrieval.contexts if isinstance(item.get("doc_id"), int)]
@@ -317,7 +438,8 @@ def _cached_misses_numbered_items(messages: list[str], contexts: list[dict]) -> 
 async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], gaps: list[str],
                         recent: list[dict], started: float) -> AgentReply | None:
     """知识或主回复接不住时再叫一次模型。只许复述已核对事实，或把缺口说成转人工。"""
-    if _over_budget(started):
+    timeout = _llm_timeout(started)
+    if timeout is None:
         return None
     facts = "\n".join(kept) or "（没有已核对事实）"
     missing = "、".join(gaps) or "知识库没有直接答案"
@@ -340,7 +462,9 @@ async def _llm_fallback(conversation_id: int, user_text: str, kept: list[str], g
         '"handoff":false,"handoff_reason":"","tags":[],'
         '"lead":{"phone":"","wechat":"","note":""},"quick_action":"none","tool_call":null}'
     )
-    return await _call_llm_with_retry(prompt, conversation_id=conversation_id)
+    return await _call_llm_with_retry(
+        prompt, conversation_id=conversation_id, timeout=timeout,
+    )
 
 
 def _tool_answered(names: list[str], results: list[dict]) -> bool:
@@ -359,37 +483,165 @@ def _agent_fact_lines(recent: list[dict]) -> list[str]:
 
 
 async def _confirm_and_handoff(conversation_id: int, user_text: str, platform: str, *,
-                               local: bool, allow_owned: bool, owned: bool, record: bool = True) -> str:
+                               local: bool, allow_owned: bool, owned: bool, record: bool = True,
+                               meta: dict | None = None) -> str:
     if record:
         record_missed_question(user_text, platform, conversation_id)
     if owned:
         await note_unmatched(conversation_id)
         return ""
-    text = await _deliver_ai(
-        conversation_id, [_CONFIRM_REPLY], local=local, allow_owned=allow_owned,
-        extra={"intent": "other", "confidence": 0.0, "citations": [], "grounded": False},
+    extra = {"intent": "other", "confidence": 0.0, "citations": [], "grounded": False}
+    if meta:
+        extra.update(meta)
+    text, _sent = await _deliver_ai(
+        conversation_id, [_CONFIRM_REPLY], local=local, allow_owned=allow_owned, extra=extra,
     )
     await handoff(conversation_id, reason="low_confidence")
     return text
 
 
+async def _select_for_answer(user_text: str, retrieval, recent: list[dict], summary: str,
+                             started: float) -> dict:
+    """写草稿前先判定段落是否相关。精排分不参与。失败或来不及打分则停。"""
+    remaining = REPLY_BUDGET_SECONDS - (time.monotonic() - started)
+    if not retrieval.exact_faq and remaining < DRAFT_RESERVE_SECONDS + 2:
+        return _stopped("unscored", retried=False, raw_precision=0.0)
+    if retrieval.exact_faq:
+        verdicts = [1] * len(retrieval.contexts)
+    else:
+        verdicts = await confidence.judge_relevance(
+            user_text, retrieval.contexts,
+            timeout=min(4.0, remaining - DRAFT_RESERVE_SECONDS),
+        )
+    if verdicts is None:
+        return _stopped("unscored", retried=False, raw_precision=0.0)
+    return await _route_verdicts(
+        user_text, list(retrieval.contexts), verdicts, recent, summary, started, retried=False,
+    )
+
+
+def _stopped(cause: str, *, retried: bool, raw_precision: float) -> dict:
+    return {
+        "action": "stop",
+        "cause": cause,
+        "retried": retried,
+        "contexts": [],
+        "verdicts": [],
+        "raw_precision": raw_precision,
+        "clarify": "",
+    }
+
+
+async def _route_verdicts(user_text: str, contexts: list[dict], verdicts: list[int],
+                          recent: list[dict], summary: str, started: float, *, retried: bool) -> dict:
+    raw = confidence.context_precision(verdicts)
+    cause = confidence.diagnose(user_text, contexts, verdicts)
+    if cause == "ambiguous":
+        keys = confidence.ambiguous_keys(user_text, contexts, verdicts)
+        return {
+            "action": "clarify",
+            "cause": "ambiguous",
+            "retried": True,
+            "contexts": [],
+            "verdicts": verdicts,
+            "raw_precision": raw,
+            "clarify": confidence.clarify_line(keys),
+        }
+    if cause == "recall" and not retried:
+        wider = await rewrite.broaden_query(
+            user_text, [], "irrelevant_context", recent, summary,
+        )
+        if not wider or _over_budget(started):
+            return _stopped("out_of_kb", retried=True, raw_precision=raw)
+        second = await pipeline.retrieve(wider, history=recent, summary=summary, top_k=3, broaden=False)
+        if not second.passed or not second.contexts:
+            return _stopped("out_of_kb", retried=True, raw_precision=raw)
+        if second.exact_faq:
+            second_verdicts = [1] * len(second.contexts)
+        else:
+            remaining = REPLY_BUDGET_SECONDS - (time.monotonic() - started)
+            if remaining < DRAFT_RESERVE_SECONDS + 2:
+                return _stopped("unscored", retried=True, raw_precision=raw)
+            second_verdicts = await confidence.judge_relevance(
+                user_text, second.contexts,
+                timeout=min(4.0, remaining - DRAFT_RESERVE_SECONDS),
+            )
+        if second_verdicts is None:
+            return _stopped("unscored", retried=True, raw_precision=raw)
+        return await _route_verdicts(
+            user_text, list(second.contexts), second_verdicts, recent, summary, started, retried=True,
+        )
+    if cause == "recall":
+        return _stopped("out_of_kb", retried=retried, raw_precision=raw)
+    kept_contexts = [item for item, verdict in zip(contexts, verdicts) if verdict]
+    if not kept_contexts:
+        return _stopped("out_of_kb", retried=retried or cause == "noise", raw_precision=raw)
+    return {
+        "action": "use",
+        "cause": "noise" if cause == "noise" else "",
+        "retried": retried or cause == "noise",
+        "contexts": kept_contexts,
+        "verdicts": [1] * len(kept_contexts),
+        "raw_precision": raw,
+        "clarify": "",
+    }
+
+
+async def _risk_stop(conversation_id: int, user_text: str, platform: str, meta: dict, *,
+                     local: bool, allow_owned: bool, owned: bool) -> str:
+    """重试后仍低。高风险转人工，做不做只答范围，闲聊用固定话术。"""
+    payload = confidence.answer_confidence_payload(
+        faithfulness_score=meta.get("faithfulness", 0.0),
+        precision=meta.get("precision", 0.0),
+        cause=meta.get("cause") or "low_confidence",
+        retried=bool(meta.get("retried")),
+        raw_precision=meta.get("raw_precision"),
+    )
+    tier = confidence.risk_tier(user_text)
+    if tier == "medium":
+        scope = confidence.scope_reply(user_text)
+        if scope:
+            text, _sent = await _deliver_ai(
+                conversation_id, [scope], local=local, allow_owned=allow_owned,
+                extra={"intent": "consult_feature", "confidence": 0.9, "citations": [],
+                       "grounded": True, "answer_confidence": payload},
+            )
+            return text
+    if tier == "low":
+        text, _sent = await _deliver_ai(
+            conversation_id, ["有啥想了解的随时问呀"], local=local, allow_owned=allow_owned,
+            extra={"intent": "chitchat", "confidence": 0.9, "citations": [],
+                   "grounded": True, "answer_confidence": payload},
+        )
+        return text
+    return await _confirm_and_handoff(
+        conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned,
+        meta={"answer_confidence": payload},
+    )
+
+
 async def _answer_from_knowledge(conversation_id: int, customer_id: int, platform: str, user_text: str,
                                  history_text: str, retrieval, started: float,
                                  tool_results: list[dict], tool_names: list[str]) -> AgentReply | None:
-    if _over_budget(started):
+    timeout = _llm_timeout(started)
+    if timeout is None:
         return None
     rewritten = retrieval.rewritten_queries[0] if retrieval.rewritten_queries else user_text
     rendered = prompt_mod.render_prompt(
         platform=platform,
-        knowledge_context=_format_knowledge_context(retrieval.contexts, retrieval.gaps),
+        knowledge_context=_format_knowledge_context(
+            retrieval.contexts, retrieval.gaps, user_text,
+        ),
         history_text=history_text,
         user_message=user_text,
         customer_profile=context.customer_profile_text(conversation_id),
         rewritten_question=rewritten,
     )
-    reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id)
+    reply = await _call_llm_with_retry(
+        rendered, conversation_id=conversation_id, timeout=timeout,
+    )
     return await _consume_tools(
-        conversation_id, customer_id, platform, rendered, reply, tool_results, tool_names,
+        conversation_id, customer_id, platform, rendered, reply, tool_results, tool_names, started,
     )
 
 
@@ -397,11 +649,12 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
                                     recent: list[dict], started: float, tool_results: list[dict],
                                     tool_names: list[str], *, local: bool, allow_owned: bool, owned: bool):
     """没检索到时：办事先调工具，否则只用人工原话，再不行就兜底并转人工。"""
-    if _over_budget(started):
+    if _llm_timeout(started) is None:
         return await _confirm_and_handoff(
             conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
     if _TASK_RE.search(user_text or ""):
-        if _over_budget(started):
+        task_timeout = _llm_timeout(started)
+        if task_timeout is None:
             return await _confirm_and_handoff(
                 conversation_id, user_text, platform, local=local, allow_owned=allow_owned, owned=owned)
         rendered = (
@@ -412,9 +665,11 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
             + tools.tools_prompt_text()
             + f"\n\n用户说：{user_text}"
         )
-        reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id)
+        reply = await _call_llm_with_retry(
+            rendered, conversation_id=conversation_id, timeout=task_timeout,
+        )
         reply = await _consume_tools(
-            conversation_id, customer_id, platform, rendered, reply, tool_results, tool_names,
+            conversation_id, customer_id, platform, rendered, reply, tool_results, tool_names, started,
         )
         if reply is not None and (_tool_answered(tool_names, tool_results) or reply.reply_messages):
             reply.handoff = not _tool_answered(tool_names, tool_results)
@@ -422,7 +677,7 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
                 reply.handoff_reason = reply.handoff_reason or "low_confidence"
             return reply
     remembered = await _reply_from_dialogue(
-        conversation_id, user_text, recent, local=local, allow_owned=allow_owned)
+        conversation_id, user_text, recent, local=local, allow_owned=allow_owned, started=started)
     if remembered is not None:
         return remembered
     if owned:
@@ -433,17 +688,23 @@ async def _answer_without_knowledge(conversation_id: int, customer_id: int, plat
 
 
 async def _consume_tools(conversation_id: int, customer_id: int, platform: str, rendered: str,
-                         reply: AgentReply | None, tool_results: list[dict], tool_names: list[str]) -> AgentReply | None:
+                         reply: AgentReply | None, tool_results: list[dict], tool_names: list[str],
+                         started: float) -> AgentReply | None:
     tool_ctx = tools.ToolContext(conversation_id=conversation_id, customer_id=customer_id, platform=platform)
     rounds = 0
     while reply is not None and reply.tool_call and rounds < MAX_TOOL_ROUNDS:
+        round_timeout = _llm_timeout(started)
+        if round_timeout is None:
+            break
         rounds += 1
         call = reply.tool_call
         tool_names.append(call.name)
         result = await tools.execute_tool(call.name, call.args, tool_ctx)
         tool_results.append(result)
         rendered = rendered + tools.tool_result_text(call.name, result, allow_chain=rounds < MAX_TOOL_ROUNDS)
-        reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id)
+        reply = await _call_llm_with_retry(
+            rendered, conversation_id=conversation_id, timeout=round_timeout,
+        )
     return reply
 
 
@@ -463,7 +724,7 @@ def _earlier_dialogue(user_text: str, recent: list[dict]) -> list[dict]:
 
 
 async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: list[dict], *,
-                               local: bool, allow_owned: bool) -> str | None:
+                               local: bool, allow_owned: bool, started: float) -> str | None:
     """知识库没有时，只根据刚才的对话回答。对话里没有这个事实就返回 None。"""
     earlier = _earlier_dialogue(user_text, recent)
     if not earlier:
@@ -479,16 +740,22 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
         "对话里没有这个事实时输出 JSON：{\"reply_messages\":[],\"intent\":\"other\",\"confidence\":0,\"handoff\":false}。\n\n"
         f"已有对话：\n" + "\n".join(lines) + f"\n\n用户现在问：{user_text}"
     )
-    reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id)
+    dialogue_timeout = _llm_timeout(started)
+    if dialogue_timeout is None:
+        return None
+    reply = await _call_llm_with_retry(
+        rendered, conversation_id=conversation_id, timeout=dialogue_timeout,
+    )
     if reply is None or reply.handoff or not reply.reply_messages:
         return None
     facts = "\n".join(row["content"] for row in earlier)
     if evidence.claims_unsupported(reply.reply_messages[:1], facts):
         return None
-    return await _deliver_ai(
+    text, _sent = await _deliver_ai(
         conversation_id, reply.reply_messages[:1], local=local, allow_owned=allow_owned,
         extra={"intent": "other", "confidence": reply.confidence, "citations": [], "from_dialogue": True, "grounded": True},
     )
+    return text
 
 
 def _numbered_items(text: str) -> list[str]:
@@ -520,20 +787,70 @@ def _format_source_list(items: list[str]) -> str:
 
 
 def _reply_with_source_list(user_text: str, contexts: list[dict], facets: list[str]) -> list[str] | None:
-    """召回正文里的编号条目用原文作答，不看问法。点名一条时只发那一条。"""
+    """召回正文里的编号条目用原文作答。不同主题不拼成一条。点名一条时只发那一条。"""
     if len(facets) >= 2:
         groups: list[list[str]] = []
         for facet in facets:
             own = [item for item in contexts if pipeline.facet_covered(facet, [item])]
+            if _topic_count(own) >= 2:
+                return None
             chosen = _choose_numbered_items(user_text, _collect_numbered_items(own))
             if not chosen:
                 return None
             groups.append(chosen)
         return [_format_source_list(items) for items in groups]
-    chosen = _choose_numbered_items(user_text, _collect_numbered_items(contexts))
+    if _topic_count(contexts) >= 2:
+        return None
+    lines = _section_lines(contexts)
+    numbered = [line for line in lines if _LIST_ITEM_RE.match(line)]
+    chosen = _choose_numbered_items(user_text, numbered)
     if not chosen:
         return None
+    if len(chosen) == 1 and len(numbered) > 1:
+        return [_format_source_list(chosen)]
+    if any(not _LIST_ITEM_RE.match(line) for line in lines):
+        body = [_format_list_item(line) if _LIST_ITEM_RE.match(line) else line for line in lines]
+        return [f"{_LIST_LEAD}\n\n" + "\n".join(body)]
     return [_format_source_list(chosen)]
+
+
+def _topic_count(contexts: list[dict]) -> int:
+    keys = []
+    for item in contexts or []:
+        key = confidence.topic_key(confidence.heading_of(item))
+        if key and key not in keys:
+            keys.append(key)
+    return len(keys)
+
+
+def _section_lines(contexts: list[dict]) -> list[str]:
+    """同一主题里带编号的段落，保留夹在条目之间的字段行。"""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for item in contexts or []:
+        raw_lines = []
+        for raw in (item.get("content") or "").splitlines():
+            line = raw.strip()
+            if line.startswith("答：") or line.startswith("答:"):
+                line = line.split("：", 1)[-1].split(":", 1)[-1].strip()
+            if line:
+                raw_lines.append(line)
+        if not any(_LIST_ITEM_RE.match(line) for line in raw_lines):
+            continue
+        heading = confidence.heading_of(item)
+        for line in raw_lines:
+            if not line or line.startswith("【"):
+                continue
+            if line.startswith("问：") or line.startswith("问:"):
+                continue
+            if heading and line == heading:
+                continue
+            key = re.sub(r"\s+", "", line)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+    return lines
 
 
 def _collect_numbered_items(contexts: list[dict]) -> list[str]:
@@ -598,6 +915,15 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
             "rerank_status": retrieval.rerank_status,
             "facets": list(retrieval.facets),
             "gaps": list(retrieval.gaps),
+            "selected": [
+                {
+                    "chunk_id": item.get("chunk_id"),
+                    "doc_id": item.get("doc_id"),
+                    "source": item.get("source"),
+                    "score": item.get("score"),
+                }
+                for item in retrieval.contexts
+            ],
         }
         msg.extra = extra
         db.commit()
@@ -605,14 +931,47 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
         db.close()
 
 
-def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = None) -> str:
-    """每条资料分开给。数字冲突时不要选边，缺口不要编。"""
+_CHUNK_BUDGET = 500
+_TOTAL_BUDGET = 1200
+
+
+def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = None,
+                              query: str = "") -> str:
+    """每条资料分开给。超预算时只留和问句有词面重叠的句子，来源标签保留。"""
     blocks = []
+    used = 0
     for i, item in enumerate(contexts):
-        blocks.append(f"【资料{i + 1}】（来源：{item['source']}）\n{item['content']}")
+        room = _TOTAL_BUDGET - used
+        if room <= 0:
+            break
+        content = _trim_knowledge(item.get("content") or "", query, min(_CHUNK_BUDGET, room))
+        used += len(content)
+        blocks.append(f"【资料{i + 1}】（来源：{item['source']}）\n{content}")
     if gaps:
         blocks.append("这些问题没有资料，不要编，请同事确认：" + "、".join(gaps))
     return "\n\n".join(blocks)
+
+
+def _trim_knowledge(content: str, query: str, budget: int) -> str:
+    text = content or ""
+    if len(text) <= budget:
+        return text
+    sentences = [part for part in re.split(r"(?<=[。！？\n])", text) if part.strip()]
+    needles = _overlap_needles(query)
+    picked = [part for part in sentences if any(needle in part for needle in needles)]
+    trimmed = "".join(picked) if picked else text
+    return trimmed[:budget]
+
+
+def _overlap_needles(query: str) -> list[str]:
+    compact = re.sub(r"\s+", "", query or "")
+    needles = []
+    for size in (4, 2):
+        for i in range(0, max(0, len(compact) - size + 1)):
+            piece = compact[i:i + size]
+            if piece not in needles:
+                needles.append(piece)
+    return needles or ([compact] if compact else [])
 
 
 def _bump_knowledge_hits(contexts: list[dict]) -> None:
@@ -637,32 +996,90 @@ def _bump_knowledge_hits(contexts: list[dict]) -> None:
         db.close()
 
 
+def _llm_timeout(started: float) -> float | None:
+    """主回复这次调用最多再用剩余预算。不足 4 秒就不要打，避免 1 秒读超时。"""
+    remaining = REPLY_BUDGET_SECONDS - (time.monotonic() - started)
+    if remaining < MIN_LLM_SECONDS:
+        return None
+    return remaining
+
+
+def _has_newer_user_message(conversation_id: int, user_message_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        latest = (
+            db.query(Message.id)
+            .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
+            .order_by(Message.id.desc())
+            .first()
+        )
+        return latest is not None and latest[0] != user_message_id
+    finally:
+        db.close()
+
+
+def _citation_payload(contexts: list[dict]) -> list[dict]:
+    items = []
+    for item in contexts:
+        items.append({
+            "title": item.get("source") or "",
+            "doc_id": item.get("doc_id"),
+            "chunk_id": item.get("chunk_id"),
+        })
+    return items
+
+
 async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
-                      extra: dict | None = None, allow_owned: bool = False) -> str:
-    """发出 AI 正文。local 时拼成一条本地消息并返回实际入库文本。"""
+                      extra: dict | None = None, allow_owned: bool = False,
+                      anchor_user_message_id: int | None = None) -> tuple[str, bool]:
+    """发出 AI 正文。返回 (给调用方的文本, 是否至少有一条真正发出或入库)。"""
     parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
     if not parts:
-        return ""
+        return "", False
+    if anchor_user_message_id is not None and _has_newer_user_message(conversation_id, anchor_user_message_id):
+        logger.info("已有更新的用户消息，放弃这次发送 conversation=%s", conversation_id)
+        return "", False
     if local:
         from ..services import record_local_ai_message
         saved = await record_local_ai_message(
             conversation_id, "\n".join(parts)[:4000], extra, allow_owned=allow_owned)
-        return saved.content if saved is not None else ""
+        if saved is None:
+            return "", False
+        return saved.content, True
     if len(parts) == 1:
-        await send_outbound(
+        sent = await send_outbound(
             conversation_id, parts[0], sender_type="ai", extra=extra, allow_owned=allow_owned)
-        return parts[0] if allow_owned else ""
-    await _send_replies(conversation_id, parts, extra or {}, allow_owned=allow_owned)
-    return "\n".join(parts) if allow_owned else ""
+        ok = sent is not None and not (sent.extra or {}).get("send_failed")
+        shown = parts[0] if allow_owned or ok else ""
+        return shown, ok
+    ok = await _send_replies(conversation_id, parts, extra or {}, allow_owned=allow_owned)
+    shown = "\n".join(parts) if allow_owned or ok else ""
+    return shown, ok
 
 
 async def _send_replies(conversation_id: int, messages: list[str], extra: dict,
-                        allow_owned: bool = False):
-    async def _send(content: str) -> bool:
+                        allow_owned: bool = False) -> bool:
+    """逐条发送。某一条没发出去时，把后面几条记成未送达，不再整段重生成。"""
+    from ..services import save_unsent_outbound
+
+    chunks: list[str] = []
+    for msg in messages:
+        chunks.extend(humanize.split_long_message(msg.strip()))
+    chunks = [c for c in chunks if c]
+    delivered = False
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            await asyncio.sleep(humanize.typing_delay_ms(chunks[i - 1]) / 1000)
         sent = await send_outbound(
-            conversation_id, content, sender_type="ai", extra=extra, allow_owned=allow_owned)
-        return sent is not None
-    await humanize.send_humanized(messages, _send)
+            conversation_id, chunk, sender_type="ai", extra=extra, allow_owned=allow_owned)
+        if sent is None:
+            return delivered
+        if (sent.extra or {}).get("send_failed"):
+            for rest in chunks[i + 1:]:
+                await save_unsent_outbound(conversation_id, rest, extra=extra)
+            return delivered
+        delivered = True
+    return delivered
 
 
 def _tool_rounds_exhausted(reply: AgentReply, tool_rounds: int) -> bool:
@@ -675,10 +1092,11 @@ def _tool_rounds_exhausted(reply: AgentReply, tool_rounds: int) -> bool:
     )
 
 
-async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0) -> AgentReply | None:
+async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0,
+                               timeout: float | None = None) -> AgentReply | None:
     """主模型调用（解析失败重试 1 次）。硬失败或解析失败时，改走备用模型再试一轮。"""
     reply, hard_failed = await _call_llm_once(
-        rendered_prompt, conversation_id=conversation_id,
+        rendered_prompt, conversation_id=conversation_id, timeout=timeout,
         base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model,
     )
     if reply is not None or not settings.llm_fallback_configured:
@@ -689,7 +1107,7 @@ async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0
     else:
         logger.warning("主 LLM 没有给出可用 JSON，切换备用模型 %s", settings.llm_fallback_model)
     reply, _ = await _call_llm_once(
-        rendered_prompt, conversation_id=conversation_id,
+        rendered_prompt, conversation_id=conversation_id, timeout=FALLBACK_TIMEOUT_SECONDS,
         base_url=settings.llm_fallback_base_url or settings.llm_base_url,
         api_key=settings.llm_fallback_api_key, model=settings.llm_fallback_model,
     )
@@ -717,12 +1135,17 @@ def _record_usage(conversation_id: int, model: str, usage) -> None:
 
 
 async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
-                         model: str, conversation_id: int = 0) -> tuple[AgentReply | None, bool]:
+                         model: str, conversation_id: int = 0,
+                         timeout: float | None = None) -> tuple[AgentReply | None, bool]:
     """调用指定模型并用 pydantic 校验契约；解析失败带错误反馈重试 1 次。
 
     返回 (reply, hard_failed)：hard_failed=True 表示网络/服务级异常（调用方可用备用模型兜底）。
+    timeout 为 None 时沿用 SDK 默认。接待路径传入剩余预算。
     """
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    client_kwargs = {"base_url": base_url, "api_key": api_key}
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
+    client = AsyncOpenAI(**client_kwargs)
     messages = [{"role": "user", "content": rendered_prompt}]
     raw = ""
 
@@ -745,6 +1168,10 @@ async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
                 messages.append({"role": "user", "content":
                     f"你的输出不符合契约，错误：{exc}。请只输出正确的 JSON 对象，不要输出其他内容。"})
             continue
+        except APITimeoutError:
+            logger.warning("LLM 读超时 model=%s timeout=%s", model, timeout)
+            monitor.record("llm_failure", f"model={model} timeout={timeout}")
+            return None, True
         except Exception:  # noqa: BLE001
             logger.exception("LLM 调用失败 model=%s", model)
             monitor.record("llm_failure", f"model={model}")

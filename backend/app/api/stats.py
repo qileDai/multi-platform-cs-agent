@@ -49,6 +49,30 @@ def overview(agent: Agent = Depends(get_current_agent), db: Session = Depends(ge
         FunnelEvent.stage == "wecom", FunnelEvent.created_at >= today_start).scalar() or 0
 
     today_prompt, today_completion = _usage_sum(db, today_start)
+    since_7d = today_start - timedelta(days=6)
+    handoff_reasons = {
+        reason or "": count
+        for reason, count in db.query(HandoffEvent.reason, func.count())
+        .filter(HandoffEvent.created_at >= since_7d)
+        .group_by(HandoffEvent.reason)
+        .all()
+    }
+    bad_cases = db.query(func.count(Message.id)).filter(
+        Message.bad_case.is_(True), Message.created_at >= since_7d,
+    ).scalar() or 0
+    recent_extra = db.query(Message.sender_type, Message.extra).filter(Message.created_at >= since_7d).all()
+    retrieval_total = 0
+    retrieval_miss = 0
+    send_failed = 0
+    for sender_type, extra in recent_extra:
+        payload = extra or {}
+        if sender_type == "user" and isinstance(payload.get("retrieval"), dict):
+            retrieval_total += 1
+            if payload["retrieval"].get("reason") not in (None, "passed"):
+                retrieval_miss += 1
+        if payload.get("send_failed") or payload.get("send_retried"):
+            send_failed += 1
+    miss_rate = retrieval_miss / retrieval_total if retrieval_total else 0.0
     return StatsOverview(
         today_conversations=today_convs,
         today_messages=today_msgs,
@@ -65,6 +89,10 @@ def overview(agent: Agent = Depends(get_current_agent), db: Session = Depends(ge
         today_comments=today_comments,
         today_leads=today_leads,
         today_wecom_adds=today_wecom_adds,
+        handoff_reasons_7d=handoff_reasons,
+        retrieval_miss_rate_7d=round(miss_rate, 3),
+        bad_case_count_7d=int(bad_cases),
+        send_failed_count_7d=send_failed,
     )
 
 

@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     rerank_api_key: str = ""
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     rag_rerank_threshold: float = 0.35
+    rag_dense_min_score: float = 0.3
+    rag_dense_absolute_min: float = 0.45
+    rag_relative_score_ratio: float = 0.65
+    rag_degraded_score_gap: float = 1.5
+    rag_dense_score_gap: float = 0.08
     # 订单 / 物流真实接口。留空则工具返回未接入，不把演示数据说给用户。
     order_api_url: str = ""
     logistics_api_url: str = ""

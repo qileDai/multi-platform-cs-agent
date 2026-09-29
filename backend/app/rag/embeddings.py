@@ -4,6 +4,7 @@ import logging
 from openai import AsyncOpenAI
 
 from ..config import settings
+from ..core import monitor
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]] | None:
             last_error = exc
             logger.warning("Embedding 调用失败，第 %d 次", attempt + 1)
     logger.error("Embedding 两次都失败，降级纯 BM25: %s", last_error)
+    monitor.record("embedding_failure", str(last_error or "")[:150])
     return None
 
 

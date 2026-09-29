@@ -29,6 +29,16 @@ def _setup_db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _default_relevance_judge(monkeypatch):
+    """测试默认每段都相关。需要指定判定时再覆盖 judge_relevance。"""
+
+    async def all_relevant(_user_text, contexts, *, timeout=4.0):
+        return [1] * len(contexts or [])
+
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", all_relevant)
+
+
 @pytest.fixture()
 def db():
     session = SessionLocal()

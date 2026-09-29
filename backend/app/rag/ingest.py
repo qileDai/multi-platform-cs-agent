@@ -22,7 +22,7 @@ from . import bm25, cache as answer_cache, embeddings, vectorstore
 
 logger = logging.getLogger(__name__)
 
-INDEX_VERSION = "4"  # 切块策略变化时递增，启动时触发重建
+INDEX_VERSION = "5"  # 切块策略变化时递增，启动时触发重建
 OVERLAP_TARGET = 0.15
 OVERLAP_MIN = 0.10
 OVERLAP_MAX = 0.20
@@ -198,7 +198,44 @@ def split_text(text: str) -> list[str]:
 
 def split_sections(text: str) -> list[Section]:
     """纯文本语义块。无嵌入时不把长段再切开。过短碎片不返回。"""
-    return _apply_overlap(_structural_sections(text))
+    return _apply_overlap(_merge_adjacent_list_blocks(_structural_sections(text)))
+
+
+def _has_list_line(text: str) -> bool:
+    return any(_LIST_LINE_RE.match(line.strip()) for line in (text or "").splitlines() if line.strip())
+
+
+def _is_trailing_narrative(text: str) -> bool:
+    """编号清单后面另起的叙述，以句号收束且自身没有编号。"""
+    body = (text or "").strip()
+    if not body or _has_list_line(body):
+        return False
+    return bool(re.search(r"[。！？]$", body))
+
+
+def _merge_adjacent_list_blocks(sections: list[Section]) -> list[Section]:
+    """同一标题下，相邻编号块和夹在中间的字段行合成一块。后面的叙述话术不并进去。"""
+    merged: list[Section] = []
+    index = 0
+    while index < len(sections):
+        current = sections[index]
+        if not _has_list_line(_body_of(current)):
+            merged.append(current)
+            index += 1
+            continue
+        parts = [_body_of(current)]
+        heading = current.heading
+        nxt = index + 1
+        while nxt < len(sections) and sections[nxt].heading == heading:
+            body = _body_of(sections[nxt])
+            if _is_trailing_narrative(body):
+                break
+            parts.append(body)
+            nxt += 1
+        text = f"{heading}\n" + "\n".join(part for part in parts if part) if heading else "\n".join(parts)
+        merged.append(Section(heading=heading, text=text.strip()))
+        index = nxt
+    return merged
 
 
 def _structural_sections(text: str) -> list[Section]:

@@ -1,16 +1,37 @@
 # 部署文档
 
-## 方式一：Docker Compose（推荐）
+## 方式一：Docker Compose（推荐，知你快回）
+
+域名先解析到这台机器。编排只起后端、前端和 Caddy，不启动 RPA Worker。对外只开 80 和 443。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。
 
 ```bash
 cp backend/.env.example backend/.env
-# 编辑 backend/.env，至少填入 LLM_API_KEY
+```
+
+编辑 `backend/.env`，至少填这四项：
+
+- `SITE_DOMAIN`：域名，例如 `cs.example.com`（不要带 `https://`）
+- `LLM_API_KEY`
+- `ZHINI_REPLY_API_KEY`：随机串，`python -c "import secrets;print(secrets.token_hex(16))"`
+- `SECRET_KEY`：换成另一把随机串
+
+然后启动：
+
+```bash
 docker compose up -d --build
 ```
 
-- 前端：http://localhost:5173
-- 后端 API：http://localhost:8000（Swagger 文档 /docs）
-- 数据持久化在 docker volume `cs-data`（SQLite + Chroma + 上传文档）
+工作台：`https://你的域名`。首次登录 `admin` / `admin123`，登录后立刻改掉。
+
+知你快回插件：
+
+1. 回复来源选「使用自己的回复接口」。
+2. 接口地址填 `https://你的域名/api/integrations/zhinikuaihui/reply`。
+3. 身份验证填同一把 `ZHINI_REPLY_API_KEY`。
+4. 等待时间选 60 秒。
+5. 点测试并保存。浏览器弹出该域名的访问授权时点允许。
+
+Compose 会强制 `MOCK_ENABLED=false`、`DOUYIN_CHANNEL=api`、`XHS_CHANNEL=api`，并把 `RPA_API_KEY` 置空。`.env` 里即使写了 RPA 密钥，这套部署也不会走 RPA。
 
 ## 方式二：本地开发
 

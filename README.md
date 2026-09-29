@@ -52,12 +52,14 @@ API 文档（Swagger UI）：http://localhost:8000/docs
 
 ### 方式二：Docker Compose
 
+域名解析到服务器后：
+
 ```bash
-cp backend/.env.example backend/.env   # 编辑填入密钥
+cp backend/.env.example backend/.env   # 填 SITE_DOMAIN、LLM_API_KEY、ZHINI_REPLY_API_KEY、SECRET_KEY
 docker compose up -d --build
 ```
 
-前端 http://localhost:5173 ，后端 http://localhost:8000 。
+工作台是 `https://你的域名`。知你快回插件地址、等待时间和密钥见 [部署文档](docs/deployment.md)。这套编排不启动 RPA。
 
 ## 目录结构
 

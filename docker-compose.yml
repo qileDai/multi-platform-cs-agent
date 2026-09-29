@@ -2,14 +2,17 @@ services:
   backend:
     build: ./backend
     container_name: cs-agent-backend
-    ports:
-      - "8000:8000"
     env_file:
       - ./backend/.env
     environment:
-      - DATABASE_URL=sqlite:////data/app.db
-      - CHROMA_DIR=/data/chroma
-      - UPLOAD_DIR=/data/uploads
+      DATABASE_URL: sqlite:////data/app.db
+      CHROMA_DIR: /data/chroma
+      UPLOAD_DIR: /data/uploads
+      BACKUP_DIR: /data/backups
+      MOCK_ENABLED: "false"
+      DOUYIN_CHANNEL: api
+      XHS_CHANNEL: api
+      RPA_API_KEY: ""
     volumes:
       - cs-data:/data
     restart: unless-stopped
@@ -17,11 +20,27 @@ services:
   frontend:
     build: ./frontend
     container_name: cs-agent-frontend
-    ports:
-      - "5173:80"
     depends_on:
       - backend
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2
+    container_name: cs-agent-caddy
+    env_file:
+      - ./backend/.env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - frontend
+    restart: unless-stopped
+
 volumes:
   cs-data:
+  caddy-data:
+  caddy-config:

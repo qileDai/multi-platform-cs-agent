@@ -236,9 +236,20 @@ docker volume inspect cs-agent_cs-data
 
 ## 11. 常见故障
 
-**`https://www.cndistribution.com/cs/` 返回 502**
+**本机 `curl http://127.0.0.1:8080/api/health` 返回 Nginx 的 502**
 
-容器没在听 8080。在 `/www/cs-agent` 执行 `docker compose ps` 和 `curl -sS http://127.0.0.1:8080/api/health`。本机 curl 失败就看 `docker compose logs --tail 100 backend`。本机 curl 成功、域名 502，说明宝塔这段 `proxy_pass` 没保存上，或写到了只监听 80 的那个 `server` 里。
+这是容器里的前端 Nginx 发出来的，说明它没有连上后端。先看进程是否还在：
+
+```bash
+docker compose ps
+docker compose logs --tail 200 backend
+```
+
+`cs-agent-backend` 若是 `Restarting`，就是后端进程启动后立刻退出，8000 上没有服务。`docker compose up -d` 显示 Running 只表示容器刚被拉起，过几秒再执行一次 `docker compose ps`。日志里的 traceback 才是退出原因。改完依赖后需要 `docker compose up -d --build`，不能只 `up -d`。
+
+**域名打开 `/cs/` 返回 502，但本机 curl 8080 已经是 JSON**
+
+宝塔这段 `proxy_pass` 没保存上，或写到了只监听 80 的那个 `server` 里。本机 `curl http://127.0.0.1:8080/api/health` 应先返回 JSON，再查域名。
 
 **打开 `/cs/` 仍是原网站，或变成目录列表**
 

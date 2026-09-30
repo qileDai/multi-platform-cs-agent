@@ -14,7 +14,11 @@ import Knowledge from './pages/Knowledge'
 import Login from './pages/Login'
 import MockPanel from './pages/MockPanel'
 import PublishCalendar from './pages/PublishCalendar'
-import Settings from './pages/Settings'
+import AutomationSettings from './pages/settings/AutomationSettings'
+import ChannelSettings from './pages/settings/ChannelSettings'
+import OpsSettings from './pages/settings/OpsSettings'
+import ServiceSettings from './pages/settings/ServiceSettings'
+import SettingsLayout from './pages/settings/SettingsLayout'
 import Tickets from './pages/Tickets'
 import Workbench from './pages/Workbench'
 import { useAuth } from './store'
@@ -51,7 +55,13 @@ export default function App() {
           <Route path="/funnel" element={<Funnel />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/inspiration" element={<Inspiration />} />
-          <Route path="/settings" element={<Settings />} />
+          <Route path="/settings" element={<SettingsLayout />}>
+            <Route index element={<Navigate to="service" replace />} />
+            <Route path="service" element={<ServiceSettings />} />
+            <Route path="automation" element={<AutomationSettings />} />
+            <Route path="channels" element={<ChannelSettings />} />
+            <Route path="ops" element={<OpsSettings />} />
+          </Route>
           <Route path="/mock" element={<MockPanel />} />
         </Route>
       </Routes>

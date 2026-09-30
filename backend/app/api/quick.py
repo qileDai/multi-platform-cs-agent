@@ -36,6 +36,30 @@ def create(req: QuickReplyIn, agent: Agent = Depends(get_current_agent),
     return item
 
 
+@router.put("/{item_id}", response_model=QuickReplyOut)
+def update_item(item_id: int, req: QuickReplyIn, agent: Agent = Depends(get_current_agent),
+                db: Session = Depends(get_db)):
+    item = db.get(QuickReply, item_id)
+    if item is None:
+        raise HTTPException(404, "不存在")
+    if item.agent_id is not None and item.agent_id != agent.id and agent.role != "admin":
+        raise HTTPException(403, "只能修改自己的个人快捷回复")
+    title = (req.title or "").strip()
+    content = (req.content or "").strip()
+    if not title or not content:
+        raise HTTPException(400, "标题和内容不能为空")
+    item.title = title
+    item.content = content
+    if req.personal:
+        if item.agent_id is None:
+            item.agent_id = agent.id
+    else:
+        item.agent_id = None
+    db.commit()
+    db.refresh(item)
+    return item
+
+
 @router.delete("/{item_id}")
 def delete(item_id: int, agent: Agent = Depends(get_current_agent),
            db: Session = Depends(get_db)):

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -261,9 +262,23 @@ def list_banned(agent: Agent = Depends(get_current_agent), db: Session = Depends
 @router.post("/banned-words", response_model=BannedWordOut)
 def add_banned(req: BannedWordIn, agent: Agent = Depends(require_admin),
                db: Session = Depends(get_db)):
-    word = BannedWord(word=req.word, category=req.category, direction=req.direction)
+    word = BannedWord()
+    _apply_banned(word, req)
     db.add(word)
-    db.commit()
+    _commit_banned(db)
+    db.refresh(word)
+    _reload_banned_words(db)
+    return word
+
+
+@router.put("/banned-words/{word_id}", response_model=BannedWordOut)
+def update_banned(word_id: int, req: BannedWordIn, agent: Agent = Depends(require_admin),
+                  db: Session = Depends(get_db)):
+    word = db.get(BannedWord, word_id)
+    if word is None:
+        raise HTTPException(404, "不存在")
+    _apply_banned(word, req)
+    _commit_banned(db)
     db.refresh(word)
     _reload_banned_words(db)
     return word
@@ -278,6 +293,23 @@ def delete_banned(word_id: int, agent: Agent = Depends(require_admin),
         db.commit()
         _reload_banned_words(db)
     return {"ok": True}
+
+
+def _apply_banned(word: BannedWord, req: BannedWordIn) -> None:
+    text = (req.word or "").strip()
+    if not text:
+        raise HTTPException(400, "违禁词不能为空")
+    word.word = text
+    word.category = (req.category or "极限词").strip() or "极限词"
+    word.direction = req.direction
+
+
+def _commit_banned(db: Session) -> None:
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该违禁词已存在")
 
 
 def _reload_banned_words(db: Session):

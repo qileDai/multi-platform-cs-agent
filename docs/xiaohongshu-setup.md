@@ -58,7 +58,7 @@ flowchart LR
 - 操作平台：商业开放平台 → 应用管理 → 消息推送
 - 操作：开启推送服务，推送地址填写：
   ```
-  https://你的域名/webhooks/xiaohongshu
+  https://www.cndistribution.com/cs/webhooks/xiaohongshu
   ```
 - 预期结果：地址检测状态为「正常」（系统对检测包自动返回成功 ACK）
 - 截图占位：_[推送地址配置页]_

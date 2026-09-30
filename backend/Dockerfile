@@ -8,7 +8,7 @@ ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgomp1 ffmpeg \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgomp1 libstdc++6 libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

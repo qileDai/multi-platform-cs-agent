@@ -1,24 +1,28 @@
 """Chroma 向量库封装：本地持久化，零运维。接口抽象，未来可平滑迁移 Milvus。"""
 import logging
 
-import chromadb
-
 from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-_client: chromadb.PersistentClient | None = None
+_client = None
 _collection = None
 COLLECTION_NAME = "knowledge_chunks"
 
 
 def _get_collection():
+    """首次使用时再导入 chromadb。导入失败只影响向量检索，不在进程启动时退出。"""
     global _client, _collection
     if _collection is None:
-        _client = chromadb.PersistentClient(path=settings.chroma_dir)
-        _collection = _client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-        )
+        try:
+            import chromadb
+            _client = chromadb.PersistentClient(path=settings.chroma_dir)
+            _collection = _client.get_or_create_collection(
+                name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            )
+        except Exception:
+            logger.exception("向量库不可用，本次检索失败")
+            raise
     return _collection
 
 

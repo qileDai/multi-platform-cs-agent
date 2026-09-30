@@ -2,9 +2,9 @@
 
 ## 方式一：Docker Compose（推荐，知你快回）
 
-证书和反向代理由宝塔做。这套编排只起后端和前端，不启动 Caddy，也不启动 RPA Worker。前端只监听本机 `127.0.0.1:8080`，不要把 8080 对公网开放。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。
+证书和反向代理由宝塔做。这套编排只起后端和前端，不启动 Caddy，也不启动 RPA Worker。前端只监听本机 `127.0.0.1:8080`，不要把 8080 对公网开放。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。面板上的点击顺序、配置文件粘贴位置和故障对照见 [宝塔配置说明](baota.md)。
 
-已有网站不要改。给客服系统单独用一个子域名，例如 `cs.cndistribution.com`，A 记录指向这台服务器。
+不新建站点，也不占用新域名。现有网站 `www.cndistribution.com` 保持原样，只把子目录 `/cs/` 反代到客服系统。生产镜像按 `VITE_BASE=/cs/` 构建，浏览器里的页面、接口和 WebSocket 都在这个前缀下。
 
 ```bash
 cp backend/.env.example backend/.env
@@ -16,33 +16,53 @@ cp backend/.env.example backend/.env
 - `ZHINI_REPLY_API_KEY`：随机串，`python -c "import secrets;print(secrets.token_hex(16))"`
 - `SECRET_KEY`：换成另一把随机串
 
-`SITE_DOMAIN` 只作备查，填子域名，不要带 `https://`。然后启动：
+`SITE_DOMAIN` 只作备查，填 `www.cndistribution.com`，不要带 `https://` 和路径。然后启动：
 
 ```bash
 docker compose up -d --build
 ```
 
-宝塔里添加站点 `cs.cndistribution.com`，PHP 选纯静态。申请 SSL 并开启强制 HTTPS。反向代理目标填 `http://127.0.0.1:8080`，发送域名填 `$host`，关闭缓存，并在代理配置里加上：
+Compose 会强制 `APP_ENV=production`。这样已修改的管理员密码不会在每次重启时被重置为 `admin123`。同时强制 `MOCK_ENABLED=false`、`DOUYIN_CHANNEL=api`、`XHS_CHANNEL=api`，并把 `RPA_API_KEY` 置空。`.env` 里即使写了 RPA 密钥，这套部署也不会走 RPA。
+
+在宝塔里打开已有站点 `www.cndistribution.com` 的配置文件，加上下面这段。不要用面板新建一个整站反代，`proxy_pass` 末尾的斜杠负责剥掉 `/cs/`。`^~` 用来压过宝塔对 js/css 的正则规则。这段不要开缓存。上传上限和读超时要和容器里的 Nginx 一致，否则大文件或生成请求会在宝塔这一层被掐断。
 
 ```nginx
-proxy_http_version 1.1;
-proxy_set_header Upgrade $http_upgrade;
-proxy_set_header Connection "upgrade";
-proxy_set_header X-Forwarded-Proto $scheme;
-proxy_read_timeout 90s;
+location = /cs {
+    return 301 /cs/;
+}
+location ^~ /cs/ {
+    client_max_body_size 500m;
+    proxy_pass http://127.0.0.1:8080/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $http_connection;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
 ```
 
-工作台：`https://cs.cndistribution.com`。首次登录 `admin` / `admin123`，登录后立刻改掉。
+改完后重载 Nginx。工作台：`https://www.cndistribution.com/cs/`。首次登录 `admin` / `admin123`，登录后立刻改掉。
 
 知你快回插件：
 
 1. 回复来源选「使用自己的回复接口」。
-2. 接口地址填 `https://cs.cndistribution.com/api/integrations/zhinikuaihui/reply`。
+2. 接口地址填 `https://www.cndistribution.com/cs/api/integrations/zhinikuaihui/reply`。
 3. 身份验证填同一把 `ZHINI_REPLY_API_KEY`。
 4. 等待时间选 60 秒。
 5. 点测试并保存。浏览器弹出该域名的访问授权时点允许。
 
-Compose 会强制 `MOCK_ENABLED=false`、`DOUYIN_CHANNEL=api`、`XHS_CHANNEL=api`，并把 `RPA_API_KEY` 置空。`.env` 里即使写了 RPA 密钥，这套部署也不会走 RPA。
+对外地址：
+
+- 工作台：`https://www.cndistribution.com/cs/`
+- 平台 webhook：`https://www.cndistribution.com/cs/webhooks/{platform}`
+- 抖音 OAuth：`https://www.cndistribution.com/cs/api/accounts/oauth/callback`
+- 企微回调：`https://www.cndistribution.com/cs/api/wecom/callback`
+
+页面和接口同源，`CORS_ORIGINS` 保持为空。
 
 ## 方式二：本地开发
 
@@ -62,7 +82,7 @@ uvicorn app.main:app --reload --port 8000
 ```powershell
 cd frontend
 npm install
-npm run dev               # 已配置代理到 localhost:8000
+npm run dev               # 不设 VITE_BASE，页面在 http://127.0.0.1:5173/，代理到 localhost:8000
 ```
 
 ## 环境变量清单
@@ -77,7 +97,8 @@ npm run dev               # 已配置代理到 localhost:8000
 | `RAG_RERANK_THRESHOLD` | 否 | 无命中阈值，默认 0.35 |
 | `DOUYIN_*` | 否 | 抖音凭证，见 platform-integration.md |
 | `XHS_*` | 否 | 小红书凭证，见 platform-integration.md |
-| `DATABASE_URL` | 否 | 默认 SQLite，可换 PostgreSQL |
+| `APP_ENV` | 生产由 Compose 强制 | `production` 时不重置已改的管理员密码。Compose 覆盖 `.env` |
+| `DATABASE_URL` | 否 | 默认 SQLite。Compose 会覆盖 `.env`，换 PostgreSQL 必须改 Compose |
 | `AI_GLOBALLY_ENABLED` | 否 | AI 总开关，默认 true；设置页可运行时切换（admin） |
 | `CORS_ORIGINS` | 生产按部署填 | 跨域白名单（逗号分隔）。空 = 仅同源（nginx/vite 反代无需填）。禁止 `*` |
 | `MOCK_ENABLED` | 生产必须 false | Mock 注入口 `/api/mock/incoming`。开发默认 true，生产关闭后 404 |
@@ -106,12 +127,15 @@ docker run -d --name cs-postgres \
 
 ### 2. 配置
 
-```
-# backend/.env
-DATABASE_URL=postgresql+psycopg2://postgres:<强密码>@127.0.0.1:5432/cs_agent
+`docker-compose.yml` 里 backend 的 `environment.DATABASE_URL` 会覆盖 `backend/.env`。只改 `.env` 时，容器仍然使用卷上的 SQLite `sqlite:////data/app.db`。
+
+换库时改 Compose 里的这一项，并在 `backend/requirements.txt` 加入 `psycopg2-binary` 后重新构建镜像。容器里的 `127.0.0.1` 是容器自己，不是宿主机，数据库地址要写成宿主机可达地址，或把 Postgres 放进同一个 Compose 网络。
+
+```yaml
+DATABASE_URL: postgresql+psycopg2://postgres:<强密码>@<数据库主机>:5432/cs_agent
 ```
 
-首次启动 `init_db()` 自动建全量表（无需手动 DDL）。驱动依赖：`pip install psycopg2-binary`。
+首次启动 `init_db()` 自动建全量表（无需手动 DDL）。
 
 ### 3. 从 SQLite 迁移存量数据（可选）
 
@@ -148,9 +172,9 @@ cd backend && pytest tests/ -q   # 测试用例与数据库方言无关，全绿
 1. `SECRET_KEY` 改为强随机串
 2. 登录后台修改默认管理员密码（admin / admin123）
 3. `MOCK_ENABLED=false`，`CORS_ORIGINS` 按部署填写（同源反代保持为空）
-4. webhook 地址需要公网 HTTPS（可用 nginx/caddy 反代 + 证书）
-5. 抖音/小红书后台配置 webhook 为 `https://你的域名/webhooks/{platform}`
-6. 数据库建议换 PostgreSQL（改 `DATABASE_URL` 即可）
+4. webhook 地址需要公网 HTTPS（由现有站点 `www.cndistribution.com` 的证书终止）
+5. 抖音/小红书后台配置 webhook 为 `https://www.cndistribution.com/cs/webhooks/{platform}`
+6. 数据库建议换 PostgreSQL（改 Compose 的 `DATABASE_URL` 并安装 `psycopg2-binary`，只改 `.env` 无效）
 
 ## 常见问题
 

@@ -1,6 +1,6 @@
 /** 全局状态：认证 + WebSocket 事件总线 */
 import { create } from 'zustand'
-import { Agent, api, getToken, setToken } from './api/client'
+import { Agent, api, appBase, getToken, setToken } from './api/client'
 
 interface AuthState {
   agent: Agent | null
@@ -22,7 +22,7 @@ export const useAuth = create<AuthState>((set) => ({
   logout: () => {
     setToken(null)
     set({ agent: null })
-    window.location.href = '/login'
+    window.location.href = `${appBase()}/login`
   },
   loadMe: async () => {
     if (!getToken()) {
@@ -67,7 +67,7 @@ function ensureWs() {
   const token = getToken()
   if (!token) return // 未登录不连接（服务端鉴权，4401 关闭）；登录后组件挂载会再次触发
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  ws = new WebSocket(`${proto}://${window.location.host}/ws?token=${encodeURIComponent(token)}`)
+  ws = new WebSocket(`${proto}://${window.location.host}${appBase()}/ws?token=${encodeURIComponent(token)}`)
   ws.onmessage = (e) => {
     try {
       const { event, data } = JSON.parse(e.data)

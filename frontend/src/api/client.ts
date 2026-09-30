@@ -492,9 +492,14 @@ export interface InspirationItem {
   created_at: string
 }
 
+/** 生产构建的公共前缀，例如 /cs。本地开发 BASE_URL 为 /，这里得到空字符串。 */
+export function appBase(): string {
+  return (import.meta.env.BASE_URL || '/').replace(/\/$/, '')
+}
+
 /** 媒体 URL 构造：<img>/<audio> 标签无法带 Authorization 头，JWT 走 query 参数 */
 export function mediaUrl(mediaId: string): string {
-  return `/api/media/${mediaId}?token=${encodeURIComponent(getToken() || '')}`
+  return `${appBase()}/api/media/${mediaId}?token=${encodeURIComponent(getToken() || '')}`
 }
 
 const TOKEN_KEY = 'cs_agent_token'
@@ -514,7 +519,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }
-  const resp = await fetch(path, { ...options, headers: { ...headers, ...(options.headers as any) } })
+  const resp = await fetch(`${appBase()}${path}`, { ...options, headers: { ...headers, ...(options.headers as any) } })
   // #region agent log
   if (path === '/api/auth/login') {
     fetch('http://127.0.0.1:7468/ingest/3569a161-5930-4d96-8a6f-489725b55d4c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'aaecc8'},body:JSON.stringify({sessionId:'aaecc8',hypothesisId:'C',location:'client.ts:request',message:'login response',data:{status:resp.status,ok:resp.ok,path},timestamp:Date.now()})}).catch(()=>{});
@@ -530,7 +535,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       throw new Error(detail)
     }
     setToken(null)
-    window.location.href = '/login'
+    window.location.href = `${appBase()}/login`
     throw new Error('未登录')
   }
   if (!resp.ok) {

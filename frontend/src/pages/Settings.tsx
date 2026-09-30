@@ -1,6 +1,6 @@
 import { ClipboardList, ListChecks, MessageSquare, Plug, Users, Workflow } from 'lucide-react'
 import { FormEvent, useEffect, useRef, useState } from 'react'
-import { api, Agent, AuditLogItem, AutoSwitches, BannedWord, QueueOpsOverview, QuickReply, RpaFailedMessage, RpaWorker } from '../api/client'
+import { api, appBase, Agent, AuditLogItem, AutoSwitches, BannedWord, QueueOpsOverview, QuickReply, RpaFailedMessage, RpaWorker } from '../api/client'
 import { confirmDialog } from '../components/ui/dialogs'
 import { toast } from '../components/ui/toast'
 import { useAuth } from '../store'
@@ -299,7 +299,7 @@ export default function Settings() {
           </div>
           <p className="mt-4 text-xs leading-5 text-gray-500 dark:text-gray-400">
             知你快回插件的接口地址填
-            <code className="mx-1">https://你的域名/api/integrations/zhinikuaihui/reply</code>
+            <code className="mx-1">{`${window.location.origin}${appBase()}/api/integrations/zhinikuaihui/reply`}</code>
             ，身份验证填 ZHINI_REPLY_API_KEY，等待时间选 60 秒。密钥只写在后端 .env，这里不显示明文。
           </p>
         </div>

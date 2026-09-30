@@ -1,8 +1,10 @@
 FROM node:20-alpine AS build
 WORKDIR /app
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
+ARG VITE_BASE=/cs/
+ENV VITE_BASE=$VITE_BASE
 RUN npm run build
 
 FROM nginx:alpine

@@ -46,7 +46,7 @@
 3. 企业号授权应用（OAuth），获取 `access_token`；申请解码权限后需商家重新扫码授权
 4. 控制台「设置 - 开发配置 - Webhooks」配置回调地址：
    ```
-   https://你的域名/webhooks/douyin
+   https://www.cndistribution.com/cs/webhooks/douyin
    ```
    订阅事件：`im_receive_msg`（接收私信）
 5. 填写 `backend/.env`：
@@ -103,7 +103,7 @@ DOUYIN_CHANNEL=rpa
 3. 登录聚光平台 →「工具 - 三方客服管理」→ 授权你的应用（勾选：私信消息读取、私信消息回复、用户基础信息读取）
 4. 配置消息推送回调地址：
    ```
-   https://你的域名/webhooks/xiaohongshu
+   https://www.cndistribution.com/cs/webhooks/xiaohongshu
    ```
 5. OAuth 换取 `accessToken` / `refreshToken`（ark 网关 `oauth.getAccessToken`），可用内置脚本完成并落库：
    ```
@@ -242,7 +242,7 @@ AI 客服在用户明确愿意加微信时调用 `push_wecom_code` 工具：按�
 
 接口地址必须是公网 HTTPS，插件拒绝 `http://localhost` 和带账号密码的 URL：
 
-`https://你的域名/api/integrations/zhinikuaihui/reply`
+`https://www.cndistribution.com/cs/api/integrations/zhinikuaihui/reply`
 
 1. 后端 `.env` 设置 `ZHINI_REPLY_API_KEY`（随机字符串，不能留空）。
 2. 在抖音或小红书网页私信页打开知你快回，回复内容来源选「使用自己的回复接口」。

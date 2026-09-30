@@ -14,10 +14,11 @@
 
 ## 必配（公网回调）
 
-- [ ] 全站 HTTPS（证书由 nginx/caddy 终止）。WebSocket `?token=` 与媒体/素材签名 URL 都会进访问日志，明文 HTTP 等于泄密。
-- [ ] 抖音 / 小红书 webhook：`https://你的域名/webhooks/{platform}`（需平台后台配置事件订阅）。
-- [ ] 抖音 OAuth 回调：`DOUYIN_OAUTH_REDIRECT_URI` 与开放平台控制台一致（公网 HTTPS）。
-- [ ] 企微回调：`WECOM_TOKEN` + `WECOM_ENCODING_AES_KEY`，回调 URL 配到企微后台。
+- [ ] 全站 HTTPS（证书由现有站点 `www.cndistribution.com` 终止）。WebSocket `?token=` 与媒体/素材签名 URL 都会进访问日志，明文 HTTP 等于泄密。
+- [ ] 宝塔只反代 `/cs/` 到 `http://127.0.0.1:8080/`，`proxy_pass` 带结尾斜杠，`client_max_body_size 500m`，关闭该段缓存。
+- [ ] 抖音 / 小红书 webhook：`https://www.cndistribution.com/cs/webhooks/{platform}`（需平台后台配置事件订阅）。
+- [ ] 抖音 OAuth 回调：`DOUYIN_OAUTH_REDIRECT_URI=https://www.cndistribution.com/cs/api/accounts/oauth/callback`，与开放平台控制台一致。
+- [ ] 企微回调：`WECOM_TOKEN` + `WECOM_ENCODING_AES_KEY`，回调 URL 为 `https://www.cndistribution.com/cs/api/wecom/callback`。
 - [ ] RPA Worker：`RPA_API_KEY` 与 worker `.env` 一致；账号页确认心跳在线。
 
 ## 建议
@@ -30,9 +31,9 @@
 
 ## 上线后冒烟
 
-1. `/api/health` 返回 `ok`，`llm: true`。
-2. 不带 token 访问 `/api/health/detail` → 401；管理员 JWT → 200。
-3. 浏览器未登录时不应出现 `/ws` 连接；登录后 `/ws?token=` 握手成功。
-4. `MOCK_ENABLED=false` 时 `POST /api/mock/incoming` → 404。
+1. `https://www.cndistribution.com/cs/api/health` 返回 `ok`，`llm: true`。本机容器上等价于 `http://127.0.0.1:8080/api/health`。
+2. 不带 token 访问 `/cs/api/health/detail` → 401；管理员 JWT → 200。
+3. 浏览器未登录打开工作台时不应出现 `/cs/ws` 连接；登录后 `/cs/ws?token=` 握手成功。
+4. `MOCK_ENABLED=false` 时 `POST /cs/api/mock/incoming` → 404。
 5. 设置页「队列运维」能看到 pending/failed 计数；故意失败一条任务后可点重试。
 6. 账号页健康度、创作台走完「生成 → 合规 → 提交 → 审批」后，发布弹窗能选到该版本。

@@ -5,6 +5,7 @@ services:
     env_file:
       - ./backend/.env
     environment:
+      APP_ENV: production
       DATABASE_URL: sqlite:////data/app.db
       CHROMA_DIR: /data/chroma
       UPLOAD_DIR: /data/uploads

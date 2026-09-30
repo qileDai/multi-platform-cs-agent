@@ -24,6 +24,7 @@ def _set_sqlite_pragma(dbapi_conn, connection_record):
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
 
@@ -78,3 +79,4 @@ def init_db():
     _ensure_column("knowledge_docs", "category", "category VARCHAR(64) DEFAULT '未分类'")
     _ensure_column("knowledge_docs", "similar_questions", "similar_questions TEXT DEFAULT '[]'")
     _ensure_column("knowledge_docs", "hit_count", "hit_count INTEGER DEFAULT 0")
+    _ensure_column("missed_questions", "suggested_answer", "suggested_answer TEXT DEFAULT ''")

@@ -2,6 +2,7 @@ import {
   Activity,
   Coins,
   Cpu,
+  Flag,
   MessageSquare,
   PieChart as PieIcon,
   Timer,
@@ -74,9 +75,13 @@ export default function Dashboard() {
     { label: '今日加企微', value: overview.today_wecom_adds, icon: Users, color: 'text-emerald-600 bg-emerald-50', hint: '漏斗 wecom 层' },
     { label: '在线客服', value: overview.active_agents, icon: Users, color: 'text-teal-600 bg-teal-50' },
     { label: '待人工', value: overview.pending_conversations, icon: Timer, color: 'text-red-600 bg-red-50' },
+    { label: '7日检索未通过', value: `${Math.round((overview.retrieval_miss_rate_7d || 0) * 100)}%`, icon: Cpu, color: 'text-orange-600 bg-orange-50' },
+    { label: '7日不佳', value: overview.bad_case_count_7d || 0, icon: Flag, color: 'text-red-600 bg-red-50' },
+    { label: '7日发送失败', value: overview.send_failed_count_7d || 0, icon: Activity, color: 'text-rose-600 bg-rose-50' },
   ]
 
   const platformTotal = Object.values(overview.platform_breakdown).reduce((a, b) => a + b, 0)
+  const handoffReasons = Object.entries(overview.handoff_reasons_7d || {})
 
   return (
     <div className="h-full overflow-y-auto bg-gray-50 dark:bg-gray-950 p-6">
@@ -98,6 +103,12 @@ export default function Dashboard() {
             </div>
           ))}
         </div>
+
+        {handoffReasons.length > 0 && (
+          <div className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+            近 7 日转人工：{handoffReasons.map(([reason, count]) => `${reason} ${count}`).join(' · ')}
+          </div>
+        )}
 
         <div className="grid grid-cols-3 gap-4 mb-4">
           {/* 会话趋势面积图 */}

@@ -36,19 +36,34 @@ export default function Workbench() {
   const currentIdRef = useRef<number | null>(null)
   currentIdRef.current = currentId
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (follow = true) => {
     const [list, c] = await Promise.all([
       api.listConversations(tab, platform),
       api.conversationCounts().catch(() => null),
     ])
     setConversations(list)
     if (c) setCounts({ mine: c.mine ?? 0, active: c.active ?? 0, pending: c.pending ?? 0, closed: c.closed ?? 0 })
+    const viewing = currentIdRef.current
+    if (follow && viewing != null && !list.some((item) => item.id === viewing)) {
+      try {
+        const conv = await api.getConversation(viewing)
+        if (conv.status === 'open') {
+          const next = tabForConversation(conv, agent?.id)
+          if (next !== tab) {
+            setTab(next)
+            window.setTimeout(() => setCurrentId(viewing), 100)
+          }
+        }
+      } catch {
+        /* 会话已不存在 */
+      }
+    }
     return list
-  }, [tab, platform])
+  }, [tab, platform, agent?.id])
 
   useEffect(() => {
     setCurrentId(null)
-    refresh()
+    refresh(false)
   }, [tab, platform])
 
   useEffect(() => {
@@ -119,7 +134,7 @@ export default function Workbench() {
           setCurrentId(id)
           setDraft('')
           stopTitleFlash()
-          api.getConversation(id).then(refresh).catch(() => {})
+          api.getConversation(id).then(() => refresh()).catch(() => {})
         }}
       />
       <div

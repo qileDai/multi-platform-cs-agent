@@ -23,6 +23,9 @@ THRESHOLDS: dict[str, tuple[int, int]] = {
     "account_health": (1, 3600),    # 账号健康度预警：单次即告（调用方已按天去重），冷却期防刷屏
     "stats_collect_failure": (5, 3600),  # 数据回采失败 1 小时 5 次
     "queue_task_failed": (3, 3600),   # 队列任务重试用尽最终失败 1 小时 3 次（全类型）
+    "outbound_send_failed": (3, 300),  # 5 分钟内出站发送失败 3 次
+    "rerank_failure": (3, 300),
+    "embedding_failure": (3, 300),
 }
 
 _counters: dict[str, deque] = {}

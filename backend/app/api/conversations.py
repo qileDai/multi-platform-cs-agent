@@ -45,13 +45,22 @@ def _to_out(db: Session, conv: Conversation, agents: dict[int, Agent] | None = N
         .order_by(Message.id.desc())
         .first()
     )
+    # 等待计时认 AI 和人工回复；转入标记仍只看人工，避免 AI 补答把「转入」弄丢。
+    last_reply = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv.id,
+                Message.sender_type.in_(("ai", "agent")),
+                Message.is_internal == False)  # noqa: E712
+        .order_by(Message.id.desc())
+        .first()
+    )
     now = datetime.utcnow()
     wait_seconds = 0
     awaiting_first = False
     overdue = False
     if conv.status == "open" and conv.mode in ("pending", "human") and last_user:
-        no_human_after = last_human is None or last_human.id < last_user.id
-        if no_human_after:
+        no_reply_after = last_reply is None or last_reply.id < last_user.id
+        if no_reply_after:
             awaiting_first = True
             wait_seconds = max(0, int((now - last_user.created_at).total_seconds()))
             overdue = wait_seconds >= FIRST_RESPONSE_OVERDUE_SECONDS
@@ -294,7 +303,15 @@ async def agent_reply(conversation_id: int, req: AgentMessageSend,
         return MessageOut.model_validate(msg)
     msg = await send_outbound(conversation_id, req.content, sender_type="agent",
                               sender_id=agent.id, msg_type=req.msg_type, media_id=req.media_id)
+    if msg is not None and req.msg_type == "text":
+        from ..services import note_agent_correction
+        note_agent_correction(conversation_id, req.content)
     if msg is None:
         raise HTTPException(429, "触发平台频控，已自动转人工排队")
-    db.refresh(msg)
-    return MessageOut.model_validate(msg)
+    # send_outbound 用的是另一个已关闭的会话，不能 refresh 那个对象
+    msg_id = msg.id
+    db.rollback()
+    saved = db.get(Message, msg_id)
+    if saved is None:
+        raise HTTPException(500, "消息已发出，但读取回执失败")
+    return MessageOut.model_validate(saved)

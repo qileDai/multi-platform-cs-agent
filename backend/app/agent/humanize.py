@@ -41,7 +41,10 @@ def typing_delay_ms(text: str) -> int:
 
 
 async def send_humanized(messages: list[str], send_func):
-    """逐条发送，条间加入打字延迟。send_func: async (content) -> None"""
+    """逐条发送，条间加入打字延迟。
+
+    send_func 返回 False 时停掉后续气泡（例如 AI 出站被模式复检拦住）。
+    """
     chunks: list[str] = []
     for msg in messages:
         chunks.extend(split_long_message(msg.strip()))
@@ -50,4 +53,6 @@ async def send_humanized(messages: list[str], send_func):
     for i, chunk in enumerate(chunks):
         if i > 0:
             await asyncio.sleep(typing_delay_ms(chunks[i - 1]) / 1000)
-        await send_func(chunk)
+        kept_going = await send_func(chunk)
+        if kept_going is False:
+            return

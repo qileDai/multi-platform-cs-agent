@@ -8,8 +8,6 @@
 合规提示：RPA 违反平台用户协议，仅限自有账号、低频拟人化使用。
 """
 import logging
-import time
-import uuid
 from typing import Any
 
 from ..schemas import InboundMessage
@@ -75,10 +73,9 @@ class RpaAdapter(PlatformAdapter):
             logger.warning("[RPA 通道] 会话 %s 缺少 account 前缀，outbox 消息将无 Worker 拉取（死信）",
                            platform_conversation_id)
             monitor.record("rpa_outbox_no_account", f"conv={platform_conversation_id}")
-        placeholder = f"rpa_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
         db = SessionLocal()
         try:
-            db.add(RpaOutbox(
+            row = RpaOutbox(
                 account=account,
                 platform=self.platform if self.platform != "rpa" else "",
                 platform_conversation_id=conv_id,
@@ -87,9 +84,12 @@ class RpaAdapter(PlatformAdapter):
                 msg_type=msg_type,
                 media_id=media_id,
                 status="pending",
-            ))
+            )
+            db.add(row)
             db.commit()
+            db.refresh(row)
+            outbox_id = row.id
         finally:
             db.close()
-        logger.info("[RPA 通道] 消息入 outbox account=%s conv=%s type=%s", account, conv_id, msg_type)
-        return placeholder
+        logger.info("[RPA 通道] 消息入 outbox account=%s conv=%s type=%s id=%s", account, conv_id, msg_type, outbox_id)
+        return f"rpa_{outbox_id}"

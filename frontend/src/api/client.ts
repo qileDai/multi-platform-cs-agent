@@ -32,7 +32,14 @@ export interface Message {
     extra: {
     intent?: string
     confidence?: number
-    citations?: string[]
+    citations?: Array<string | { title?: string; doc_id?: number | null; chunk_id?: string | null }>
+    gaps?: string[]
+    dropped?: string[]
+    send_failed?: boolean
+    send_error?: string
+    reflection?: { action?: string; issues?: string[] } | null
+    handoff_reason?: string
+    reply_ms?: number
     filtered_words?: string[]
     media_id?: string
     asr?: boolean
@@ -43,6 +50,25 @@ export interface Message {
     from_agent_id?: number
     outbox_status?: 'pending' | 'leased' | 'acked' | 'failed' | 'discarded'
     badcase_note?: string
+    grounding?: string
+    answer_confidence?: {
+      faithfulness?: number
+      context_precision?: number
+      score?: number
+      cause?: string
+      retried?: boolean
+      raw_context_precision?: number | null
+    }
+    retrieval?: {
+      queries?: string[]
+      dense_count?: number
+      bm25_count?: number
+      rerank_top_score?: number | null
+      reason?: string
+      rerank_status?: string
+      gaps?: string[]
+      selected?: Array<{ source?: string; score?: number | null; doc_id?: number | null; chunk_id?: string | null }>
+    }
   }
   is_internal: boolean
   bad_case: boolean
@@ -98,6 +124,8 @@ export interface MissedQuestion {
   platform: string
   count: number
   status: string
+  suggested_answer?: string
+  conversation_id?: number | null
   created_at: string
 }
 
@@ -140,6 +168,10 @@ export interface StatsOverview {
   today_comments: number
   today_leads: number
   today_wecom_adds: number
+  handoff_reasons_7d?: Record<string, number>
+  retrieval_miss_rate_7d?: number
+  bad_case_count_7d?: number
+  send_failed_count_7d?: number
 }
 
 export interface Ticket {
@@ -483,7 +515,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   }
   const resp = await fetch(path, { ...options, headers: { ...headers, ...(options.headers as any) } })
+  // #region agent log
+  if (path === '/api/auth/login') {
+    fetch('http://127.0.0.1:7468/ingest/3569a161-5930-4d96-8a6f-489725b55d4c',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'aaecc8'},body:JSON.stringify({sessionId:'aaecc8',hypothesisId:'C',location:'client.ts:request',message:'login response',data:{status:resp.status,ok:resp.ok,path},timestamp:Date.now()})}).catch(()=>{});
+  }
+  // #endregion
   if (resp.status === 401) {
+    if (path === '/api/auth/login') {
+      const text = await resp.text()
+      let detail = '账号或密码错误'
+      try {
+        detail = JSON.parse(text).detail || detail
+      } catch { /* 保留默认文案 */ }
+      throw new Error(detail)
+    }
     setToken(null)
     window.location.href = '/login'
     throw new Error('未登录')
@@ -560,6 +605,7 @@ export const api = {
 
   // evals（badcase 导出为 cases.json 草稿，admin）
   exportBadCases: () => request<any[]>('/api/evals/export'),
+  draftEvalCases: () => request<any[]>('/api/evals/drafts', { method: 'POST' }),
 
   // messages
   listMessages: (conversationId: number) =>

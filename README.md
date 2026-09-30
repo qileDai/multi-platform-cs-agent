@@ -52,12 +52,14 @@ API 文档（Swagger UI）：http://localhost:8000/docs
 
 ### 方式二：Docker Compose
 
+子域名解析到服务器后，由宝塔做 HTTPS 和反向代理：
+
 ```bash
-cp backend/.env.example backend/.env   # 编辑填入密钥
+cp backend/.env.example backend/.env   # 填 LLM_API_KEY、ZHINI_REPLY_API_KEY、SECRET_KEY
 docker compose up -d --build
 ```
 
-前端 http://localhost:5173 ，后端 http://localhost:8000 。
+前端只监听本机 `127.0.0.1:8080`。宝塔把 `cs.cndistribution.com` 反代到这个地址。插件地址和等待时间见 [部署文档](docs/deployment.md)。这套编排不启动 RPA，也不占用 80 和 443。
 
 ## 目录结构
 

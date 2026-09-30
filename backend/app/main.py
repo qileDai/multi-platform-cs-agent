@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws
+from .api import accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
 from .api.deps import require_admin
 from .wecom import callback as wecom_callback
@@ -52,23 +52,38 @@ async def _sweep_once() -> list[int]:
     closed = []
     for cid in ids:
         try:
+            if not _still_ai_open(cid):
+                continue
+            # 知你快回会话的结束语由 send_outbound 只写入本系统，不打开放平台。
             await send_outbound(cid, settings.session_close_message, sender_type="ai")
             db = SessionLocal()
             try:
                 conv = db.get(Conversation, cid)
-                if conv is not None and conv.status == "open":
+                # 发送期间可能已被接管或关掉，再确认一次才写入 closed
+                if conv is not None and conv.mode == "ai" and conv.status == "open":
                     conv.status = "closed"
                     conv.closed_at = datetime.utcnow()
                     db.commit()
                     closed.append(cid)
             finally:
                 db.close()
-            await manager.broadcast("conversation_closed", {"conversation_id": cid})
+            if cid in closed:
+                await manager.broadcast("conversation_closed", {"conversation_id": cid})
         except Exception:  # noqa: BLE001
             logger.exception("会话超时关闭失败 conversation_id=%s", cid)
     if closed:
         logger.info("会话超时自动关闭: %s", closed)
     return closed
+
+
+def _still_ai_open(conversation_id: int) -> bool:
+    """发结束语前再读一次：已经进人工队列或已关闭的会话不再动。"""
+    db = SessionLocal()
+    try:
+        conv = db.get(Conversation, conversation_id)
+        return conv is not None and conv.mode == "ai" and conv.status == "open"
+    finally:
+        db.close()
 
 
 async def session_sweeper():
@@ -173,6 +188,41 @@ def _rpa_housekeep_once():
         db.close()
 
 
+def _ensure_admin(db) -> None:
+    """保证有 admin。非生产环境密码不是 admin123 时重置；生产环境只补建缺失账号。"""
+    admin = db.query(Agent).filter(Agent.username == "admin").first()
+    # #region agent log
+    try:
+        import json, time
+        _hash = admin.password_hash if admin is not None else ""
+        _ok = bool(admin is not None and verify_password("admin123", _hash))
+        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "startup admin check", "data": {"app_env": settings.app_env, "admin_exists": admin is not None, "hash_len": len(_hash or ""), "hash_prefix": (_hash or "")[:4], "password_ok": _ok, "db": settings.database_url}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    if admin is None:
+        db.add(Agent(username="admin", password_hash=hash_password("admin123"),
+                     display_name="管理员", role="admin", status="active"))
+        logger.info("已创建默认管理员 admin / admin123，请尽快修改密码")
+        return
+    if settings.app_env == "production":
+        return
+    if verify_password("admin123", admin.password_hash):
+        return
+    admin.password_hash = hash_password("admin123")
+    admin.role = "admin"
+    logger.warning("非生产环境已将管理员 admin 的密码重置为 admin123")
+    # #region agent log
+    try:
+        import json, time
+        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "password reset written", "data": {"verify_after": verify_password("admin123", admin.password_hash)}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
 def _warn_insecure_defaults(db) -> None:
     """启动安全自检：弱配置显著告警（不阻断启动，处置见 docs/deployment-checklist.md）。"""
     if settings.secret_key == "change-me-to-a-random-string":
@@ -192,20 +242,24 @@ async def lifespan(app: FastAPI):
     init_db()
     db = SessionLocal()
     try:
-        # 默认管理员
-        if db.query(Agent).count() == 0:
-            db.add(Agent(username="admin", password_hash=hash_password("admin123"),
-                         display_name="管理员", role="admin", status="active"))
-            logger.info("已创建默认管理员 admin / admin123，请尽快修改密码")
+        _ensure_admin(db)
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
             db.add_all([
-                QuickReply(title="打招呼", content="来啦，想问啥呀"),
+                QuickReply(title="打招呼", content="在的，我是小赢。香港公司注册、开户都可以问我"),
                 QuickReply(title="稍等", content="稍等哈，我帮您查一下"),
                 QuickReply(title="转人工", content="这个我让同事来帮您处理哈，马上来"),
                 QuickReply(title="感谢", content="客气啦，有问题随时喊我"),
                 QuickReply(title="留资引导", content="您留个手机号，稍后同事联系您，给您安排优惠"),
             ])
+        else:
+            stale = (
+                db.query(QuickReply)
+                .filter(QuickReply.title == "打招呼", QuickReply.content == "来啦，想问啥呀")
+                .all()
+            )
+            for item in stale:
+                item.content = "在的，我是小赢。香港公司注册、开户都可以问我"
         db.commit()
         # 违禁词库加载（含入口/出口方向）
         contentfilter.load_db_words(
@@ -215,9 +269,24 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    # BM25 索引重建
+    # BM25 先用现有切片可用；切块版本变化时后台重嵌入，避免旧切片继续被搜到
     from .rag import ingest
     ingest.rebuild_bm25_from_db()
+    reindex_task = None
+    if ingest.index_version_stale():
+        logger.info("知识库索引版本不一致，后台重建")
+        reindex_task = asyncio.create_task(ingest.reindex_all())
+
+    async def _replay_stuck_phrase():
+        if reindex_task is not None:
+            try:
+                await reindex_task
+            except Exception:
+                logger.exception("索引重建失败，仍尝试补跑未回复消息")
+        from .services import replay_unanswered_phrase
+        await replay_unanswered_phrase("面签资料清单")
+
+    replay_task = asyncio.create_task(_replay_stuck_phrase())
 
     # 启动任务队列 worker / 会话超时清扫 / 小红书 token 刷新 / 发布调度 / 自动备份
     start_worker()
@@ -248,6 +317,9 @@ async def lifespan(app: FastAPI):
     comment_poll_task.cancel()
     stats_task.cancel()
     health_task.cancel()
+    if reindex_task is not None:
+        reindex_task.cancel()
+    replay_task.cancel()
     await stop_backup()
     await stop_worker()
 
@@ -270,7 +342,7 @@ for r in [auth.router, webhooks.router, conversations.router, messages.router,
           rpa.router, settings_api.router, evals.router, media_router, ws.router,
           accounts.router, contents.router, publish.router, comments.router,
           funnel.router, wecom_callback.router, analytics.router, inspiration.router,
-          queue_ops.router]:
+          queue_ops.router, zhinikuaihui.router]:
     app.include_router(r)
 
 
@@ -285,6 +357,7 @@ def health():
         "xiaohongshu": settings.xhs_configured,
         "wecom": settings.wecom_configured,
         "wecom_callback": settings.wecom_callback_configured,
+        "zhini": settings.zhini_configured,
     }
 
 
@@ -310,6 +383,7 @@ def health_detail(_: Agent = Depends(require_admin)):
             "rerank": settings.rerank_configured,
             "douyin": settings.douyin_configured,
             "xiaohongshu": settings.xhs_configured,
+            "zhini": settings.zhini_configured,
             "alert_webhook": bool(settings.alert_webhook_url),
         },
         "errors_last_hour": monitor.snapshot(),

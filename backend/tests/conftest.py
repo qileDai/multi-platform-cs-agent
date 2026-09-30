@@ -19,7 +19,24 @@ from app.models import Customer, Conversation
 @pytest.fixture(scope="session", autouse=True)
 def _setup_db():
     init_db()
+    # 测试库没有旧切片，跳过启动时的全量重嵌入
+    from pathlib import Path
+
+    from app.rag.ingest import INDEX_VERSION
+    chroma = Path(os.environ["CHROMA_DIR"])
+    chroma.mkdir(parents=True, exist_ok=True)
+    (chroma / "index_version.txt").write_text(INDEX_VERSION, encoding="utf-8")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _default_relevance_judge(monkeypatch):
+    """测试默认每段都相关。需要指定判定时再覆盖 judge_relevance。"""
+
+    async def all_relevant(_user_text, contexts, *, timeout=4.0):
+        return [1] * len(contexts or [])
+
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", all_relevant)
 
 
 @pytest.fixture()

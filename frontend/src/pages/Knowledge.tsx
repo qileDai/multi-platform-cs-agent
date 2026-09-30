@@ -272,6 +272,10 @@ export default function Knowledge() {
               onClick={() => {
                 setNav(item.key)
                 if (item.key === 'file') setCategory('')
+                if (item.key === 'missed') {
+                  setSelectedId(null)
+                  setCreating(false)
+                }
               }}
               className={clsx(
                 'w-full text-left px-4 py-2 text-sm flex items-center',
@@ -312,10 +316,18 @@ export default function Knowledge() {
                 <div key={m.id} className="bg-white dark:bg-gray-900 border dark:border-gray-800 rounded-lg px-3 py-2.5 flex items-center gap-3">
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-gray-800 dark:text-gray-100 truncate">{m.question}</div>
-                    <div className="text-[11px] text-orange-500 mt-0.5">被问 {m.count} 次</div>
+                    <div className="text-[11px] text-orange-500 mt-0.5">被问 {m.count} 次{m.suggested_answer ? " · 有待确认答案" : ""}</div>
                   </div>
+                  {m.conversation_id != null && (
+                    <button
+                      onClick={() => navigate('/', { state: { conversationId: m.conversation_id } })}
+                      className="text-xs text-gray-500 shrink-0"
+                    >
+                      打开会话
+                    </button>
+                  )}
                   <button
-                    onClick={() => startCreate({ title: m.question.slice(0, 30), question: m.question }, m.id)}
+                    onClick={() => startCreate({ title: m.question.slice(0, 30), question: m.question, answer: m.suggested_answer || "" }, m.id)}
                     className="text-xs text-primary-600 shrink-0"
                   >
                     补答案

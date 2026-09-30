@@ -131,6 +131,7 @@ export default function Settings() {
     { key: 'xiaohongshu', label: '小红书开放平台' },
     { key: 'wecom', label: '企业微信 API' },
     { key: 'wecom_callback', label: '企微回调（加粉归因）' },
+    { key: 'zhini', label: '知你快回回复接口' },
   ]
 
   const toggleAi = async () => {
@@ -296,6 +297,11 @@ export default function Settings() {
               </div>
             ))}
           </div>
+          <p className="mt-4 text-xs leading-5 text-gray-500 dark:text-gray-400">
+            知你快回插件的接口地址填
+            <code className="mx-1">https://你的域名/api/integrations/zhinikuaihui/reply</code>
+            ，身份验证填 ZHINI_REPLY_API_KEY，等待时间选 60 秒。密钥只写在后端 .env，这里不显示明文。
+          </p>
         </div>
 
         {/* 客服账号管理 */}
@@ -604,6 +610,21 @@ export default function Settings() {
                 className="text-xs text-blue-500 hover:underline"
               >
                 导出 badcase（evals 格式，{`人工审阅后合入 backend/evals/cases.json`}）
+              </button>
+              <button
+                onClick={async () => {
+                  const cases = await api.draftEvalCases()
+                  const blob = new Blob([JSON.stringify(cases, null, 2)], { type: 'application/json' })
+                  const a = document.createElement('a')
+                  a.href = URL.createObjectURL(blob)
+                  a.download = 'eval-drafts.json'
+                  a.click()
+                  URL.revokeObjectURL(a.href)
+                  toast.success(`已生成 ${cases.length} 条评测草稿`)
+                }}
+                className="text-xs text-blue-500 hover:underline"
+              >
+                生成评测草稿
               </button>
             </div>
             {auditLogs.length === 0 ? (

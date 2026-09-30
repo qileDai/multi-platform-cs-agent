@@ -1,16 +1,48 @@
 # 部署文档
 
-## 方式一：Docker Compose（推荐）
+## 方式一：Docker Compose（推荐，知你快回）
+
+证书和反向代理由宝塔做。这套编排只起后端和前端，不启动 Caddy，也不启动 RPA Worker。前端只监听本机 `127.0.0.1:8080`，不要把 8080 对公网开放。数据库、向量库、上传文件和自动备份都在卷 `cs-data` 里。
+
+已有网站不要改。给客服系统单独用一个子域名，例如 `cs.cndistribution.com`，A 记录指向这台服务器。
 
 ```bash
 cp backend/.env.example backend/.env
-# 编辑 backend/.env，至少填入 LLM_API_KEY
+```
+
+编辑 `backend/.env`，至少填这三项：
+
+- `LLM_API_KEY`
+- `ZHINI_REPLY_API_KEY`：随机串，`python -c "import secrets;print(secrets.token_hex(16))"`
+- `SECRET_KEY`：换成另一把随机串
+
+`SITE_DOMAIN` 只作备查，填子域名，不要带 `https://`。然后启动：
+
+```bash
 docker compose up -d --build
 ```
 
-- 前端：http://localhost:5173
-- 后端 API：http://localhost:8000（Swagger 文档 /docs）
-- 数据持久化在 docker volume `cs-data`（SQLite + Chroma + 上传文档）
+宝塔里添加站点 `cs.cndistribution.com`，PHP 选纯静态。申请 SSL 并开启强制 HTTPS。反向代理目标填 `http://127.0.0.1:8080`，发送域名填 `$host`，关闭缓存，并在代理配置里加上：
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_read_timeout 90s;
+```
+
+工作台：`https://cs.cndistribution.com`。首次登录 `admin` / `admin123`，登录后立刻改掉。
+
+知你快回插件：
+
+1. 回复来源选「使用自己的回复接口」。
+2. 接口地址填 `https://cs.cndistribution.com/api/integrations/zhinikuaihui/reply`。
+3. 身份验证填同一把 `ZHINI_REPLY_API_KEY`。
+4. 等待时间选 60 秒。
+5. 点测试并保存。浏览器弹出该域名的访问授权时点允许。
+
+Compose 会强制 `MOCK_ENABLED=false`、`DOUYIN_CHANNEL=api`、`XHS_CHANNEL=api`，并把 `RPA_API_KEY` 置空。`.env` 里即使写了 RPA 密钥，这套部署也不会走 RPA。
 
 ## 方式二：本地开发
 

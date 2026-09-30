@@ -1,5 +1,7 @@
 """evals 回流：把在线标注的 badcase 导出为 evals/cases.json 格式。
 
+另有 /drafts：从未命中和不佳起草评测 JSON，不写入 cases.json。
+
 工作流：客服在工作台标记 badcase（可附备注）→ 管理员从此接口导出 →
 人工审阅补全 expect（期望行为）→ 合入 backend/evals/cases.json → 跑 run_evals.py 验证修复。
 """
@@ -58,3 +60,13 @@ def export_badcases(_: Agent = Depends(require_admin), db: Session = Depends(get
         })
     logger.info("导出 badcase %s 条", len(cases))
     return JSONResponse(cases)
+
+
+@router.post("/drafts")
+async def draft_cases(_: Agent = Depends(require_admin), db: Session = Depends(get_db)):
+    """起草评测案例。调用方自行下载，服务端不改 cases.json。"""
+    from ..evals_draft import build_eval_drafts
+
+    drafts = await build_eval_drafts(db)
+    logger.info("生成评测草稿 %s 条", len(drafts))
+    return JSONResponse(drafts)

@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 
 from ..core.security import decode_access_token
 from ..database import get_db
-from ..models import Agent, Message, RpaMedia, RpaOutbox
+from ..models import Agent, Conversation, Message, RpaMedia, RpaOutbox
 from ..schemas import BadCaseMark, MessageOut
+from ..services import record_missed_question
 from .deps import get_current_agent
 from .rpa import _save_media
 
@@ -66,8 +67,32 @@ def mark_bad_case(message_id: int, req: BadCaseMark,
     else:
         extra.pop("badcase_note", None)
     msg.extra = extra
+    if req.bad_case:
+        _record_bad_case_question(db, msg)
     db.commit()
     return {"ok": True}
+
+
+def _record_bad_case_question(db: Session, msg: Message) -> None:
+    """答得差时，把这条回复之前的用户原话放进待补问题。已有 pending 只加次数。"""
+    previous = (
+        db.query(Message)
+        .filter(
+            Message.conversation_id == msg.conversation_id,
+            Message.sender_type == "user",
+            Message.id < msg.id,
+        )
+        .order_by(Message.id.desc())
+        .first()
+    )
+    if previous is None or not (previous.content or "").strip():
+        return
+    conversation = db.get(Conversation, msg.conversation_id)
+    record_missed_question(
+        previous.content.strip(),
+        conversation.platform if conversation else "",
+        msg.conversation_id,
+    )
 
 
 @media_router.post("/api/media")

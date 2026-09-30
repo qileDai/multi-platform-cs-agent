@@ -64,6 +64,11 @@ function formatTick(iso: string): string {
 
 const TICK_GAP_MS = 5 * 60 * 1000
 
+function withMessage(prev: Message[], msg: Message): Message[] {
+  if (prev.some((m) => m.id === msg.id)) return prev
+  return [...prev, msg]
+}
+
 interface Props {
   conversation: Conversation
   onRefresh: () => void
@@ -89,6 +94,8 @@ export default function ChatWindow({
   const [summaryOpen, setSummaryOpen] = useState(false)
   const [noteMode, setNoteMode] = useState(false)
   const [aiTyping, setAiTyping] = useState(false)
+  const [aiStuck, setAiStuck] = useState(false)
+  const [stuckReason, setStuckReason] = useState('')
   const [agents, setAgents] = useState<Agent[]>([])
   const [showTransfer, setShowTransfer] = useState(false)
   const [transferId, setTransferId] = useState(0)
@@ -97,10 +104,13 @@ export default function ChatWindow({
   const bottomRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const typingTimer = useRef<ReturnType<typeof setTimeout>>()
+  const sendingRef = useRef(false)
 
   useEffect(() => {
     setSummaryOpen(false)
     setAiTyping(false)
+    setAiStuck(false)
+    setStuckReason('')
     setNoteMode(false)
     setShowEmoji(false)
     api.listMessages(conversation.id).then(setMessages)
@@ -113,37 +123,53 @@ export default function ChatWindow({
   }, [messages, aiTyping])
 
   useEffect(() => {
-    return subscribeWs((event, data) => {
+    const unsubscribe = subscribeWs((event, data) => {
       if (data.conversation_id !== conversation.id) return
       if (event === 'new_message') {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === data.message.id)) return prev
-          return [...prev, data.message]
-        })
-        if (data.message.sender_type === 'ai') {
+        setMessages((prev) => withMessage(prev, data.message))
+        if (data.message.sender_type === 'ai' || data.message.sender_type === 'system') {
           setAiTyping(false)
+          setAiStuck(false)
+          setStuckReason('')
           clearTimeout(typingTimer.current)
         }
       }
       if (event === 'ai_typing') {
         setAiTyping(true)
+        setAiStuck(false)
+        setStuckReason('')
         clearTimeout(typingTimer.current)
-        typingTimer.current = setTimeout(() => setAiTyping(false), 30000)
+        typingTimer.current = setTimeout(() => {
+          setAiTyping(false)
+          setAiStuck(true)
+          api.listMessages(conversation.id).then((rows) => {
+            setMessages(rows)
+            const user = [...rows].reverse().find((m) => m.sender_type === 'user' && !m.is_internal)
+            const reason = user?.extra?.retrieval?.reason
+            setStuckReason(reason && reason !== 'passed' ? reason : '')
+          }).catch(() => setStuckReason(''))
+        }, 30000)
       }
     })
+    return () => {
+      unsubscribe()
+      clearTimeout(typingTimer.current)
+    }
   }, [conversation.id])
 
   const send = async (override?: string) => {
     const text = (override ?? draft).trim()
-    if (!text || sending) return
+    if (!text || sendingRef.current) return
+    sendingRef.current = true
     setSending(true)
     try {
       const msg = await api.reply(conversation.id, text, noteMode)
-      if (msg) setMessages((prev) => [...prev, msg])
+      if (msg) setMessages((prev) => withMessage(prev, msg))
       onDraftChange('')
     } catch (e: any) {
       toast.error(e?.message || '发送失败，请稍后重试')
     } finally {
+      sendingRef.current = false
       setSending(false)
     }
   }
@@ -152,7 +178,7 @@ export default function ChatWindow({
     try {
       const { media_id } = await api.uploadMedia(file, 'image')
       const msg = await api.reply(conversation.id, '[图片]', false, 'image', media_id)
-      if (msg) setMessages((prev) => [...prev, msg])
+      if (msg) setMessages((prev) => withMessage(prev, msg))
     } catch (e: any) {
       toast.error(e?.message || '图片发送失败')
     }
@@ -343,6 +369,7 @@ export default function ChatWindow({
               )}
               <MessageBubble
                 msg={msg}
+                priorUser={priorUser}
                 onMarkBadCase={markBadCase}
                 onCapture={
                   canCapture
@@ -366,6 +393,11 @@ export default function ChatWindow({
           )
         })}
         {aiTyping && <TypingBubble />}
+        {aiStuck && !aiTyping && (
+          <div className="text-center text-xs text-amber-600 dark:text-amber-400 py-1">
+            AI 未响应{stuckReason ? `（${stuckReason}）` : ''}
+          </div>
+        )}
         <div ref={bottomRef} />
       </div>
 
@@ -450,8 +482,10 @@ export default function ChatWindow({
               onChange={(e) => onDraftChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return
                   e.preventDefault()
-                  if (hashHits.length > 0) {
+                  // 只输入了 #、后面没有关键词时，列表是全部模板，Enter 仍应发送
+                  if (hashHits.length > 0 && hashQuery?.[1]) {
                     onDraftChange(hashHits[0].content)
                     return
                   }
@@ -507,12 +541,18 @@ function TypingBubble() {
   )
 }
 
+function citationLabel(item: string | { title?: string; doc_id?: number | null; chunk_id?: string | null }) {
+  if (typeof item === 'string') return item
+  const title = item.title || '资料'
+  return item.doc_id != null ? `${title} #${item.doc_id}` : title
+}
+
 function CitationBlock({
   citations,
   intent,
   confidence,
 }: {
-  citations: string[]
+  citations: Array<string | { title?: string; doc_id?: number | null; chunk_id?: string | null }>
   intent?: string
   confidence?: number
 }) {
@@ -536,7 +576,7 @@ function CitationBlock({
         <ul className="mt-1 text-left bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg px-2 py-1 space-y-0.5">
           {citations.map((c, i) => (
             <li key={i} className="text-gray-600 dark:text-gray-300">
-              {i + 1}. {c}
+              {i + 1}. {citationLabel(c)}
             </li>
           ))}
         </ul>
@@ -547,10 +587,12 @@ function CitationBlock({
 
 function MessageBubble({
   msg,
+  priorUser,
   onMarkBadCase,
   onCapture,
 }: {
   msg: Message
+  priorUser?: Message
   onMarkBadCase: (id: number) => void
   onCapture?: () => void
 }) {
@@ -612,7 +654,7 @@ function MessageBubble({
           <div
             title={fullTime}
             className={clsx(
-              'rounded-2xl px-3.5 py-2 text-sm leading-relaxed break-words shadow-sm',
+              'rounded-2xl px-3.5 py-2 text-sm leading-relaxed break-words whitespace-pre-wrap shadow-sm',
               isUser
                 ? 'bg-white dark:bg-gray-800 dark:text-gray-50 border border-gray-200 dark:border-gray-600 rounded-tl-sm'
                 : isAi
@@ -650,8 +692,40 @@ function MessageBubble({
                 {outbox.label}
               </span>
             )}
+            {msg.extra?.send_failed && (
+              <span className="text-red-500">未送达</span>
+            )}
             {msg.extra?.citations && msg.extra.citations.length > 0 && (
               <CitationBlock citations={msg.extra.citations} intent={msg.extra.intent} confidence={msg.extra.confidence} />
+            )}
+            {isAi && (priorUser?.extra?.retrieval || msg.extra?.dropped?.length || msg.extra?.gaps?.length || msg.extra?.handoff_reason) && (
+              <details className="text-left">
+                <summary className="cursor-pointer">检索</summary>
+                <div className="mt-1 max-w-xs text-gray-500">
+                  {priorUser?.extra?.retrieval?.reason && <div>原因 {priorUser.extra.retrieval.reason}</div>}
+                  {priorUser?.extra?.retrieval?.rerank_top_score != null && (
+                    <div>精排 {priorUser.extra.retrieval.rerank_top_score}</div>
+                  )}
+                  {msg.extra?.answer_confidence && (
+                    <div>
+                      忠实度 {msg.extra.answer_confidence.faithfulness ?? '—'} · 上下文精度{' '}
+                      {msg.extra.answer_confidence.context_precision ?? '—'} · 综合{' '}
+                      {msg.extra.answer_confidence.score ?? '—'}
+                    </div>
+                  )}
+                  {!!priorUser?.extra?.retrieval?.selected?.length && (
+                    <div>
+                      入选{' '}
+                      {priorUser.extra.retrieval.selected
+                        .map((item) => `${item.source || '资料'}${item.score != null ? ` ${item.score}` : ''}`)
+                        .join('、')}
+                    </div>
+                  )}
+                  {!!msg.extra?.gaps?.length && <div>缺口 {msg.extra.gaps.join('、')}</div>}
+                  {!!msg.extra?.dropped?.length && <div>删掉 {msg.extra.dropped.join('、')}</div>}
+                  {!!msg.extra?.handoff_reason && <div>转人工 {msg.extra.handoff_reason}</div>}
+                </div>
+              </details>
             )}
             {isAi && !msg.bad_case && (
               <button

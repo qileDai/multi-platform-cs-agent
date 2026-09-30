@@ -16,7 +16,7 @@ def _ctx(conversation) -> ToolContext:
 
 def _isolate_rag(monkeypatch):
     """隔离 RAG 检索（避免测试触发真实 LLM/Embedding 网络调用）。"""
-    async def fake_retrieve(query, history=None, top_k=3):
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
         return rag_pipeline.RetrievalResult(
             passed=True,
             contexts=[{"content": "测试资料", "source": "test"}],
@@ -46,10 +46,14 @@ async def test_execute_unknown_tool(conversation):
     assert "不存在" in result["error"]
 
 
-async def test_query_order_ok(conversation):
+async def test_query_order_unconfigured(conversation):
     result = await tools.execute_tool("query_order", {"phone": "13812345678"}, _ctx(conversation))
-    assert result["ok"] is True
-    assert result["data"]["orders"]
+    assert result["ok"] is False
+    assert "未接入" in result["error"]
+    blob = str(result)
+    assert "DD20240901001" not in blob
+    assert "中通" not in blob
+    assert "杭州转运中心" not in blob
 
 
 async def test_query_order_bad_phone(conversation):
@@ -126,19 +130,18 @@ async def test_two_phase_tool_flow(db, conversation, monkeypatch):
 
     await engine.process_ai_reply(conversation.id)
 
-    # 两轮调用，第二轮提示词包含工具结果
     assert len(prompts) == 2
     assert "工具调用结果" in prompts[1]
     assert "query_logistics" in prompts[1]
-
-    # 最终回复已发送，且 extra 记录了工具调用链
     ai_msgs = (
         db.query(Message)
         .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
         .all()
     )
-    assert any("查到啦" in m.content for m in ai_msgs)
-    assert any((m.extra or {}).get("tool_calls") == ["query_logistics"] for m in ai_msgs)
+    blob = " ".join(m.content for m in ai_msgs)
+    assert "杭州转运中心" not in blob
+    assert "中通" not in blob
+    assert "DD20240901001" not in blob
 
 
 async def test_tool_failure_degrades_to_handoff(db, conversation, monkeypatch):
@@ -171,3 +174,31 @@ async def test_tool_failure_degrades_to_handoff(db, conversation, monkeypatch):
     # 无在线客服时留 pending；有 active 客服时 auto_assign 会改成 human
     assert conversation.mode in ("pending", "human")
     assert "ok" in prompts[1]  # 工具错误结果已回填
+
+
+async def test_tool_rounds_exhausted_handoff(db, conversation, monkeypatch):
+    """工具轮次用尽且没有回复时，短句加转人工，不让客人消息空着。"""
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="帮我查一下"))
+    db.commit()
+
+    async def always_tool(prompt: str, **_kwargs):
+        return AgentReply(
+            reply_messages=[], intent="after_sale", confidence=0.4,
+            tool_call=ToolCall(name="query_logistics", args={"order_id": "DD1"}),
+        )
+
+    monkeypatch.setattr(engine, "_call_llm_with_retry", always_tool)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    _isolate_rag(monkeypatch)
+
+    await engine.process_ai_reply(conversation.id)
+    db.rollback()
+    db.refresh(conversation)
+    assert conversation.mode in ("pending", "human")
+    ai = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
+        .all()
+    )
+    assert any("卡了一下" in m.content for m in ai)

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     # 基础
     app_name: str = "multi-platform-cs-agent"
+    app_env: str = "development"  # production 时不重置已有管理员密码
     database_url: str = "sqlite:///./data/app.db"
     # AI 全局熔断开关：关闭时所有入站会话直接转人工（运行时也可经 /api/settings/ai-switch 切换）
     ai_globally_enabled: bool = True
@@ -36,6 +37,14 @@ class Settings(BaseSettings):
     rerank_api_key: str = ""
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     rag_rerank_threshold: float = 0.35
+    rag_dense_min_score: float = 0.3
+    rag_dense_absolute_min: float = 0.45
+    rag_relative_score_ratio: float = 0.65
+    rag_degraded_score_gap: float = 1.5
+    rag_dense_score_gap: float = 0.08
+    # 订单 / 物流真实接口。留空则工具返回未接入，不把演示数据说给用户。
+    order_api_url: str = ""
+    logistics_api_url: str = ""
 
     # 抖音开放平台
     douyin_client_key: str = ""
@@ -73,6 +82,7 @@ class Settings(BaseSettings):
 
     # RPA 通道（无官方 API 资质时的降级方案，见 docs/rpa-workers.md）
     rpa_api_key: str = ""              # Worker 鉴权密钥（留空则 RPA 接口不可用）
+    zhini_reply_api_key: str = ""      # 知你快回「自己的回复接口」密钥（留空则该接口不可用）
     douyin_channel: str = "api"        # api | rpa
     xhs_channel: str = "api"           # api | rpa
     douyin_account_type: str = "feige"  # feige（抖店商家）| enterprise（蓝V 企业号，影响 RPA 频控规则）
@@ -143,6 +153,10 @@ class Settings(BaseSettings):
     @property
     def rpa_configured(self) -> bool:
         return bool(self.rpa_api_key)
+
+    @property
+    def zhini_configured(self) -> bool:
+        return bool(self.zhini_reply_api_key)
 
     @property
     def asr_configured(self) -> bool:

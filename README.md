@@ -95,3 +95,6 @@ docker compose up -d --build
 ## 最小配置
 
 只有 LLM 是必填项（`LLM_API_KEY`）。不配置 Embedding/Rerank 时 RAG 自动降级为纯 BM25；不配置平台凭证时发送动作降级为日志输出，可用内置 Mock 通道完整体验全流程。
+
+## 知你快回得接口
+https://www.cndistribution.com/cs/api/integrations/zhinikuaihui/reply

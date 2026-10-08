@@ -85,6 +85,8 @@ class AgentCreate(BaseModel):
 class AgentUpdate(BaseModel):
     max_concurrent: Optional[int] = None
     display_name: Optional[str] = None
+    role: Optional[Literal["admin", "agent"]] = None
+    password: Optional[str] = None
 
 
 class AgentStatusUpdate(BaseModel):

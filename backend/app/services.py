@@ -511,11 +511,29 @@ async def record_local_ai_message(conversation_id: int, content: str,
     db = SessionLocal()
     try:
         conversation = db.get(Conversation, conversation_id)
-        if conversation is None or not _ai_may_send(conversation, allow_owned=allow_owned):
+        if conversation is None:
+            logger.info("知你快回本地回复未入库 conversation=%s reason=会话不存在", conversation_id)
+            return None
+        if not _ai_may_send(conversation, allow_owned=allow_owned):
+            if conversation.status != "open":
+                reason = f"会话已结束 status={conversation.status}"
+            elif not settings.ai_globally_enabled:
+                reason = "AI 总开关已关"
+            else:
+                reason = "模式不允许代发"
+            logger.info(
+                "知你快回本地回复未入库 conversation=%s mode=%s reason=%s",
+                conversation_id, conversation.mode, reason,
+            )
             return None
         filtered, hits = contentfilter.sanitize(content)
         filtered = (filtered or "").strip()[:4000]
         if not filtered:
+            reason = "违禁词删空" if hits else "正文为空"
+            logger.info(
+                "知你快回本地回复未入库 conversation=%s mode=%s reason=%s hits=%s",
+                conversation_id, conversation.mode, reason, hits,
+            )
             return None
         payload = {**(extra or {}), "channel": "zhinikuaihui"}
         if hits:

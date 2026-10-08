@@ -685,6 +685,11 @@ export const api = {
       body: JSON.stringify({ word, category, direction }),
     }),
   deleteBannedWord: (id: number) => request(`/api/knowledge/banned-words/${id}`, { method: 'DELETE' }),
+  updateBannedWord: (id: number, word: string, category: string, direction: 'out' | 'in') =>
+    request<BannedWord>(`/api/knowledge/banned-words/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ word, category, direction }),
+    }),
 
   // quick replies
   listQuickReplies: () => request<QuickReply[]>('/api/quick-replies'),
@@ -694,6 +699,11 @@ export const api = {
       body: JSON.stringify({ title, content, personal }),
     }),
   deleteQuickReply: (id: number) => request(`/api/quick-replies/${id}`, { method: 'DELETE' }),
+  updateQuickReply: (id: number, title: string, content: string, personal = false) =>
+    request<QuickReply>(`/api/quick-replies/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ title, content, personal }),
+    }),
 
   // agents
   listAgents: () => request<Agent[]>('/api/agents'),
@@ -702,8 +712,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ username, password, display_name: displayName, role, max_concurrent: maxConcurrent }),
     }),
-  updateAgent: (id: number, data: { max_concurrent?: number; display_name?: string }) =>
-    request<Agent>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  updateAgent: (
+    id: number,
+    data: { max_concurrent?: number; display_name?: string; role?: string; password?: string },
+  ) => request<Agent>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAgent: (id: number) => request(`/api/agents/${id}`, { method: 'DELETE' }),
   setMyStatus: (status: string) =>
     request<Agent>('/api/agents/me/status', { method: 'POST', body: JSON.stringify({ status }) }),

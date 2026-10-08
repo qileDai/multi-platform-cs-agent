@@ -52,8 +52,20 @@ def update_agent(agent_id: int, req: AgentUpdate, admin: Agent = Depends(require
         if req.max_concurrent < 0:
             raise HTTPException(400, "接待上限不能为负数")
         target.max_concurrent = req.max_concurrent
-    if req.display_name:
-        target.display_name = req.display_name
+    if req.display_name is not None:
+        name = req.display_name.strip()
+        if not name:
+            raise HTTPException(400, "姓名不能为空")
+        target.display_name = name
+    if req.role is not None:
+        if target.id == admin.id and req.role != admin.role:
+            raise HTTPException(400, "不能修改自己的角色")
+        target.role = req.role
+    if req.password is not None:
+        password = req.password.strip()
+        if not password:
+            raise HTTPException(400, "密码不能为空")
+        target.password_hash = hash_password(password)
     db.commit()
     db.refresh(target)
     return target

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import time
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -97,67 +98,73 @@ def is_connection_test(body: dict) -> bool:
 
 async def handle_reply(body: dict) -> dict:
     """返回插件要求的 reply / skip 对象。生成失败也是 HTTP 200 的 skip，避免插件暂停自动回复。"""
+    started = time.monotonic()
     try:
-        return await _handle_reply(body)
+        return await _handle_reply(body, started)
     except Exception:
         logger.exception("知你快回回复失败")
-        return _skip("回复生成失败，请稍后在工作台处理")
+        return _log_outcome(started, _skip("回复生成失败，请稍后在工作台处理"))
 
 
-async def _handle_reply(body: dict) -> dict:
+async def _handle_reply(body: dict, started: float) -> dict:
     if is_connection_test(body):
-        return {"action": "reply", "reply": CONNECTION_REPLY}
+        return _log_outcome(started, {"action": "reply", "reply": CONNECTION_REPLY})
 
     raw_platform = str(body.get("platform") or "").strip()
     platform = PLATFORM_MAP.get(raw_platform)
     if platform is None:
-        return _skip("该平台暂不支持")
+        return _log_outcome(started, _skip("该平台暂不支持"))
 
     message = body.get("message") if isinstance(body.get("message"), dict) else {}
     text = str(message.get("text") or "").strip()
     direction = message.get("direction") or "incoming"
     if direction != "incoming" or not text:
-        return _skip("没有需要回复的客户消息")
+        return _log_outcome(started, _skip("没有需要回复的客户消息"))
 
     request_id = str(body.get("request_id") or message.get("id") or "").strip()
     if not request_id:
-        return _skip("缺少 request_id")
+        return _log_outcome(started, _skip("缺少 request_id"))
     request_key = short_key(raw_platform, "request", request_id)
 
     cached = _cached_reply(request_key)
     if cached:
-        return {"action": "reply", "reply": cached[:4000]}
+        return _log_outcome(started, {"action": "reply", "reply": cached[:4000]})
 
     conversation_id, mode, status, trigger_id = _persist(body, platform, raw_platform, request_key, text)
     if trigger_id is None:
         cached = _cached_reply(request_key)
         if cached:
-            return {"action": "reply", "reply": cached[:4000]}
-        return _skip("消息入库冲突，请稍后重试")
+            return _log_outcome(started, {"action": "reply", "reply": cached[:4000]},
+                                conversation_id=conversation_id, mode=mode)
+        return _log_outcome(started, _skip("消息入库冲突，请稍后重试"),
+                            conversation_id=conversation_id, mode=mode)
 
     await _broadcast_saved(conversation_id, trigger_id)
 
     if status != "open":
         await _note_skip(conversation_id, "会话已结束，这条没有自动回复")
-        return _skip("会话已结束")
+        return _log_outcome(started, _skip("会话已结束"), conversation_id=conversation_id, mode=mode)
 
     risk = contentfilter.check_inbound(text)
     if risk["level"] == "block":
         _mark_risk(trigger_id, risk)
         if mode == "ai":
             await handoff(conversation_id, reason="risk_content")
-        return _skip("消息触发风险拦截，请人工处理")
+        return _log_outcome(started, _skip("消息触发风险拦截，请人工处理"),
+                            conversation_id=conversation_id, mode=mode)
     if risk["level"] == "warn":
         _mark_risk(trigger_id, risk)
 
     if not settings.ai_globally_enabled:
         if mode == "ai":
             await handoff(conversation_id, reason="ai_globally_disabled")
-        return _skip("AI 已关闭，请人工回复")
+        return _log_outcome(started, _skip("AI 已关闭，请人工回复"),
+                            conversation_id=conversation_id, mode=mode)
 
     if mode not in ("ai", "pending", "human"):
         await _note_skip(conversation_id, "会话已由人工接待，这条没有自动回复")
-        return _skip("会话已由人工接待")
+        return _log_outcome(started, _skip("会话已由人工接待"),
+                            conversation_id=conversation_id, mode=mode)
 
     lock = await _conversation_lock(conversation_id)
     async with lock:
@@ -165,8 +172,30 @@ async def _handle_reply(body: dict) -> dict:
     reply_text = (reply_text or "").strip()[:4000]
     if not reply_text:
         await _note_skip(conversation_id, "没有可发送的回复")
-        return _skip("没有可发送的回复")
-    return {"action": "reply", "reply": reply_text}
+        return _log_outcome(started, _skip("没有可发送的回复"),
+                            conversation_id=conversation_id, mode=mode)
+    return _log_outcome(started, {"action": "reply", "reply": reply_text},
+                        conversation_id=conversation_id, mode=mode)
+
+
+def _log_outcome(started: float, result: dict, *, conversation_id: int | None = None,
+                 mode: str = "") -> dict:
+    """每个返回都留下 action。HTTP 200 分不出回复和跳过。"""
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    conv = conversation_id if conversation_id is not None else "-"
+    mode_label = mode or "-"
+    if result.get("action") == "reply":
+        preview = (result.get("reply") or "").replace("\n", " ")[:80]
+        logger.info(
+            "知你快回回复 action=reply conversation=%s mode=%s elapsed_ms=%s reply=%s",
+            conv, mode_label, elapsed_ms, preview,
+        )
+    else:
+        logger.info(
+            "知你快回回复 action=skip conversation=%s mode=%s elapsed_ms=%s reason=%s",
+            conv, mode_label, elapsed_ms, (result.get("reason") or "")[:200],
+        )
+    return result
 
 
 def _skip(reason: str) -> dict:

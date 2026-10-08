@@ -382,3 +382,102 @@ async def test_replay_skips_zhini_conversation(db, monkeypatch):
     count = await replay_unanswered_phrase(phrase)
     assert count == 0
     assert conversation.id not in called
+
+
+_MIANQIAN_ITEMS = [
+    "1、香港开户请勿与开户经理提及被制裁国家，您的所有生意和转账地区仅限kyc内填写的地区国家。",
+    "2、去银行开户仅需要面签人员进场，其他人员不要进入银行。",
+    "3、去银行不要左顾右盼，不要戴耳机。对工作人员礼貌一些。",
+    "4、对自己的生意模式、合作伙伴、公司基本信息需要了如指掌，不能一问三不知。",
+    "5、在银行内部不要拍照、拍视频等。",
+    "6、开户请勿提及付钱开户，一律回复自己预约的银行开户。",
+    "7、如果经理推理财保险，不需要的话请委婉拒绝说要先了解一下",
+    "8、董事手机提前开通好漫游，用来接受银行短信",
+]
+
+
+def _glued_mianqian() -> str:
+    """开头两个导语粘在一起，第 8 条末尾再粘上一份同样的清单。"""
+    one = "清单我按资料发你\n\n" + "\n".join(_MIANQIAN_ITEMS)
+    return "清单我按资料发你" + one.rstrip("\n") + one
+
+
+def test_glued_notice_is_returned_once(zhini_key):
+    """两份面签提示粘在一起时，插件只收到一份，1 到 8 条都还在。"""
+    from app.services import record_local_ai_message
+
+    written = _glued_mianqian()
+
+    async def generate(conversation_id, local=True, allow_owned=False):
+        await record_local_ai_message(conversation_id, written, allow_owned=allow_owned)
+        return written
+
+    with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=generate), \
+            patch("app.integrations.zhinikuaihui._shorten_written_reply", new_callable=AsyncMock) as shorten:
+        resp = client.post(
+            "/api/integrations/zhinikuaihui/reply",
+            json=_body(),
+            headers=_auth(zhini_key),
+        )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert reply.count("清单我按资料发你") == 1
+    for item in _MIANQIAN_ITEMS:
+        assert reply.count(item) == 1
+    assert len(reply) <= 500
+    shorten.assert_not_called()
+    db = SessionLocal()
+    try:
+        stored = db.query(Message).filter(Message.sender_type == "ai", Message.content == written).one()
+        assert stored.content == written
+    finally:
+        db.close()
+
+
+def test_over_limit_shortens_the_written_reply(zhini_key):
+    """去重后仍超过 500 字时，缩短的是这条已写好的长回复。"""
+    written = "面签时要带齐证件并说清生意。" * 40
+    assert len(written) > 500
+    brief = "面签时带齐证件，说清生意，不要提敏感国家。"
+    seen = {}
+
+    async def generate(conversation_id, local=True, allow_owned=False):
+        return written
+
+    async def shorten(text):
+        seen["text"] = text
+        return brief
+
+    with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=generate), \
+            patch("app.integrations.zhinikuaihui._shorten_written_reply", side_effect=shorten):
+        resp = client.post(
+            "/api/integrations/zhinikuaihui/reply",
+            json=_body(),
+            headers=_auth(zhini_key),
+        )
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == brief
+    assert seen["text"] == written
+    assert len(resp.json()["reply"]) <= 500
+
+
+@pytest.mark.asyncio
+async def test_shorten_failure_cuts_at_a_complete_line():
+    """模型没有给出可用结果时，从最后一个完整条目处收到 500 字以内。"""
+    from app.integrations.zhinikuaihui import prepare_plugin_reply
+
+    lines = [f"{i}、这是一条足够长的面签注意事项，用来把全文撑过五百字。" for i in range(1, 21)]
+    written = "\n".join(lines)
+    assert len(written) > 500
+
+    async def fail(_text):
+        return ""
+
+    with patch("app.integrations.zhinikuaihui._shorten_written_reply", side_effect=fail):
+        reply = await prepare_plugin_reply(written)
+    assert len(reply) <= 500
+    kept = reply.splitlines()
+    assert kept
+    assert kept[0] == lines[0]
+    assert kept[-1] in lines
+    assert lines[lines.index(kept[-1]) + 1] not in kept

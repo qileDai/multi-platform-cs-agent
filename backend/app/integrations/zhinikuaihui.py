@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import re
 import time
 from typing import Any
 
@@ -59,6 +60,9 @@ async def _note_skip(conversation_id: int, content: str) -> None:
 
 REPLY_PATH = "/api/integrations/zhinikuaihui/reply"
 CONNECTION_REPLY = "连接成功，可以开始回复。"
+REPLY_CHAR_LIMIT = 500
+_LIST_LEAD = "清单我按资料发你"
+_SHORTEN_TIMEOUT = 8.0
 PLATFORM_MAP = {
     "douyin": "douyin",
     "xiaohongshu": "xiaohongshu",
@@ -128,13 +132,15 @@ async def _handle_reply(body: dict, started: float) -> dict:
 
     cached = _cached_reply(request_key)
     if cached:
-        return _log_outcome(started, {"action": "reply", "reply": cached[:4000]})
+        reply = await prepare_plugin_reply(cached[:4000])
+        return _log_outcome(started, {"action": "reply", "reply": reply})
 
     conversation_id, mode, status, trigger_id = _persist(body, platform, raw_platform, request_key, text)
     if trigger_id is None:
         cached = _cached_reply(request_key)
         if cached:
-            return _log_outcome(started, {"action": "reply", "reply": cached[:4000]},
+            reply = await prepare_plugin_reply(cached[:4000])
+            return _log_outcome(started, {"action": "reply", "reply": reply},
                                 conversation_id=conversation_id, mode=mode)
         return _log_outcome(started, _skip("消息入库冲突，请稍后重试"),
                             conversation_id=conversation_id, mode=mode)
@@ -169,7 +175,7 @@ async def _handle_reply(body: dict, started: float) -> dict:
     lock = await _conversation_lock(conversation_id)
     async with lock:
         reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
-    reply_text = (reply_text or "").strip()[:4000]
+    reply_text = await prepare_plugin_reply((reply_text or "").strip()[:4000])
     if not reply_text:
         await _note_skip(conversation_id, "没有可发送的回复")
         return _log_outcome(started, _skip("没有可发送的回复"),
@@ -200,6 +206,118 @@ def _log_outcome(started: float, result: dict, *, conversation_id: int | None = 
 
 def _skip(reason: str) -> dict:
     return {"action": "skip", "reason": (reason or "不回复")[:500]}
+
+
+def _collapse_leading_leads(text: str) -> str:
+    """开头连续的「清单我按资料发你」只留一句，中间可以没有换行。"""
+    body = (text or "").lstrip()
+    lead = _LIST_LEAD
+    while body.startswith(lead):
+        rest = body[len(lead):].lstrip("\n")
+        if rest.startswith(lead):
+            body = rest
+            continue
+        break
+    return body
+
+
+def _same_notice(head: str, tail: str) -> bool:
+    left = re.sub(r"\s+", "", head or "")
+    right = re.sub(r"\s+", "", tail or "")
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    return len(shorter) >= 20 and longer.startswith(shorter)
+
+
+def _drop_repeated_notice(text: str) -> str:
+    """同一段清单再出现一次时，从第二句导语处截掉。不同清单保留。"""
+    lead = _LIST_LEAD
+    first = text.find(lead)
+    if first < 0:
+        return text
+    second = text.find(lead, first + len(lead))
+    if second < 0:
+        return text
+    head = text[first + len(lead):second]
+    tail = text[second + len(lead):]
+    if not _same_notice(head, tail):
+        return text
+    return text[:second].rstrip()
+
+
+def dedupe_plugin_reply(text: str) -> str:
+    return _drop_repeated_notice(_collapse_leading_leads(text)).strip()
+
+
+def _cut_complete(text: str, limit: int = REPLY_CHAR_LIMIT) -> str:
+    """收到最后一个还能放进上限的完整条目，不把半条编号切进去。"""
+    if len(text) <= limit:
+        return text.strip()
+    lines = text.splitlines()
+    kept: list[str] = []
+    total = 0
+    for line in lines:
+        extra = len(line) + (1 if kept else 0)
+        if total + extra > limit:
+            break
+        kept.append(line)
+        total += extra
+    if kept:
+        return "\n".join(kept).rstrip()
+    return text[:limit].rstrip()
+
+
+async def _shorten_written_reply(text: str) -> str:
+    """只缩短已经写好的这段，不检索，不补充原文没有的事实。"""
+    if not settings.llm_configured:
+        return ""
+    from openai import AsyncOpenAI
+
+    prompt = (
+        "把下面这段已经写好的客服回复缩成不超过500字。"
+        "只保留原文里已有的事实，不要补充原文没有的内容，不要把同一段再说一遍。"
+        "编号条目能留下就留下，放不下就整条省去。"
+        "只输出缩短后的正文，不要解释。\n\n"
+        + text
+    )
+    client = AsyncOpenAI(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        timeout=_SHORTEN_TIMEOUT,
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=settings.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        logger.warning("知你快回长回复缩短失败", exc_info=True)
+        return ""
+
+
+async def prepare_plugin_reply(text: str) -> str:
+    """交给插件前去掉重复份。去重后仍超过 500 字，再把这段长回复缩短。"""
+    cleaned = dedupe_plugin_reply(text)
+    if len(cleaned) <= REPLY_CHAR_LIMIT:
+        return cleaned
+    brief = await _shorten_written_reply(cleaned)
+    brief = dedupe_plugin_reply(brief)
+    if brief and len(brief) <= REPLY_CHAR_LIMIT:
+        logger.info("知你快回长回复已缩短 before=%s after=%s", len(cleaned), len(brief))
+        return brief
+    if brief and len(brief) > REPLY_CHAR_LIMIT:
+        cut = _cut_complete(brief)
+        if cut:
+            logger.info("知你快回缩短结果仍超长，改按条目截断 after=%s", len(cut))
+            return cut
+    cut = _cut_complete(cleaned)
+    logger.info("知你快回长回复缩短失败，改按条目截断 after=%s", len(cut))
+    return cut
 
 
 def _cached_reply(request_key: str) -> str:

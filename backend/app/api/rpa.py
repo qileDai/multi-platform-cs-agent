@@ -17,9 +17,10 @@ from ..config import settings
 from ..core import audit, monitor
 from ..core.queue import enqueue
 from ..database import get_db
-from ..models import Agent, RpaIdentityMap, RpaMedia, RpaOutbox, RpaWorker
+from ..bindings import driver_spec, is_enabled
+from ..models import AccountBinding, Agent, MatrixAccount, RpaIdentityMap, RpaMedia, RpaOutbox, RpaWorker
 from ..schemas import (RpaAck, RpaHeartbeat, RpaIncoming, RpaIncomingComment,
-                       RpaIdentityResolve, RpaWorkerOut)
+                       RpaIdentityResolve, RpaRelease, RpaSelfIdentity, RpaWorkerOut)
 from .deps import get_current_agent
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ def rpa_incoming_comment(req: RpaIncomingComment, _: None = Depends(rpa_key_dep)
     if not req.comment_id.strip():
         raise HTTPException(400, "comment_id 不能为空（幂等键）")
     enqueue("inbound_comment", {
+        "account": req.account,
         "platform": req.platform,
         "platform_post_id": req.platform_post_id,
         "post_url": req.post_url,
@@ -193,16 +195,52 @@ def _reap_expired_leases(db: Session):
         db.commit()
 
 
+@router.get("/assignment")
+def assignment(worker_id: str, db: Session = Depends(get_db), _: None = Depends(rpa_key_dep)):
+    """Worker 领取自己的一条绑定。没有启用绑定时 bound=false，由本机旧配置决定是否继续跑。"""
+    rows = (
+        db.query(AccountBinding)
+        .filter(AccountBinding.worker_id == worker_id)
+        .all()
+    )
+    enabled = [row for row in rows if is_enabled(row.auth_status)]
+    if len(enabled) > 1:
+        raise HTTPException(409, f"Worker {worker_id} 有多条启用绑定，请先在授权页停用多余的")
+    if not enabled:
+        return {"bound": False}
+    row = enabled[0]
+    spec = driver_spec(row.driver) or {}
+    account = db.get(MatrixAccount, row.account_id)
+    return {
+        "bound": True,
+        "binding_id": row.id,
+        "driver": row.driver,
+        "duty": row.duty,
+        "provider": row.provider,
+        "adspower_profile_id": row.adspower_profile_id or "",
+        "platform_url": row.platform_url or "",
+        "account": (account.rpa_account if account else "") or "",
+        "platform": spec.get("platform", ""),
+        "msg_types": spec.get("msg_types", []),
+        "auth_status": row.auth_status,
+    }
+
+
 @router.get("/outbox")
 def pull_outbox(worker_id: str, account: str, limit: int = 5, db: Session = Depends(get_db),
-                _: None = Depends(rpa_key_dep)):
-    """Worker 拉取待发消息：按 account 隔离，按创建时间排序（同会话消息按序）。"""
+                _: None = Depends(rpa_key_dep), msg_types: str = ""):
+    """Worker 拉取待发消息：按 account 隔离，可按 msg_types 只租本职责的消息。"""
     _reap_expired_leases(db)
     limit = max(1, min(limit, 20))
-    rows = (
+    query = (
         db.query(RpaOutbox)
         .filter(RpaOutbox.status == "pending", RpaOutbox.account == account)
-        .order_by(RpaOutbox.created_at, RpaOutbox.id)
+    )
+    types = [item.strip() for item in (msg_types or "").split(",") if item.strip()]
+    if types:
+        query = query.filter(RpaOutbox.msg_type.in_(types))
+    rows = (
+        query.order_by(RpaOutbox.created_at, RpaOutbox.id)
         .limit(limit)
         .all()
     )
@@ -245,6 +283,25 @@ def ack_outbox(req: RpaAck, db: Session = Depends(get_db), _: None = Depends(rpa
             logger.error("RPA 发送最终失败 outbox_id=%s error=%s", row.id, row.error)
         else:
             row.status = "pending"  # 回滚重试
+    db.commit()
+    return {"ok": True, "status": row.status}
+
+
+@router.post("/release")
+def release_outbox(req: RpaRelease, db: Session = Depends(get_db), _: None = Depends(rpa_key_dep)):
+    """把不属于本职责的租约放回 pending，并撤销本次拉取计入的失败次数。"""
+    row = db.get(RpaOutbox, req.outbox_id)
+    if row is None:
+        raise HTTPException(404, "outbox 记录不存在")
+    if row.status != "leased":
+        return {"ok": True, "status": row.status}
+    if row.worker_id and row.worker_id != req.worker_id:
+        raise HTTPException(409, "租约不属于该 Worker")
+    if row.attempts > 0:
+        row.attempts -= 1
+    row.status = "pending"
+    row.worker_id = ""
+    row.leased_at = None
     db.commit()
     return {"ok": True, "status": row.status}
 
@@ -312,6 +369,31 @@ def discard_outbox(outbox_id: int, db: Session = Depends(get_db),
     return {"ok": True, "status": row.status}
 
 
+def _sync_binding_status(db: Session, worker_id: str, status: str, meta: dict):
+    """心跳写回绑定：在线视为已授权，登录过期单独标记。选择器失效仍看 Worker 状态。"""
+    binding = None
+    raw_id = (meta or {}).get("binding_id")
+    if raw_id:
+        try:
+            binding = db.get(AccountBinding, int(raw_id))
+        except (TypeError, ValueError):
+            binding = None
+        if binding is not None and binding.worker_id != worker_id:
+            binding = None
+    if binding is None:
+        enabled = [
+            row for row in db.query(AccountBinding).filter(AccountBinding.worker_id == worker_id).all()
+            if is_enabled(row.auth_status)
+        ]
+        binding = enabled[0] if len(enabled) == 1 else None
+    if binding is None or not is_enabled(binding.auth_status):
+        return
+    if status == "online":
+        binding.auth_status = "authorized"
+    elif status == "login_expired":
+        binding.auth_status = "login_expired"
+
+
 # ============ 心跳 ============
 
 @router.post("/heartbeat")
@@ -329,16 +411,57 @@ def heartbeat(req: RpaHeartbeat, db: Session = Depends(get_db), _: None = Depend
         db.add(worker)
     worker.account = req.account
     worker.platform = req.platform
-    worker.status = req.status if req.status in ("online", "login_expired", "selector_mismatch") else "online"
-    worker.meta = req.meta or {}
+    allowed = ("online", "idle", "login_expired", "selector_mismatch", "browser_unavailable")
+    worker.status = req.status if req.status in allowed else "online"
+    meta = dict(req.meta or {})
+    profiles = meta.get("browser_profiles")
+    if isinstance(profiles, list):
+        meta["browser_profiles"] = profiles[:100]
+    worker.meta = meta
     worker.last_heartbeat_at = datetime.utcnow()
+    _sync_binding_status(db, req.worker_id, worker.status, meta)
     db.commit()
-    if worker.status != "online":
+    if worker.status not in ("online", "idle"):
         monitor.record(f"rpa_worker_{worker.status}", f"worker={req.worker_id} account={req.account}")
     return {"ok": True}
 
 
 # ============ 身份解析（Worker 本地缓存用） ============
+
+@router.post("/identity/self")
+def report_self_identity(req: RpaSelfIdentity, db: Session = Depends(get_db),
+                         _: None = Depends(rpa_key_dep)):
+    """Worker 读到登录账号名后写回矩阵账号。"""
+    name = (req.account_name or "").strip()[:64]
+    if not name:
+        raise HTTPException(400, "账号名不能为空")
+    binding = None
+    enabled = [
+        row for row in db.query(AccountBinding).filter(AccountBinding.worker_id == req.worker_id).all()
+        if is_enabled(row.auth_status)
+    ]
+    if len(enabled) == 1:
+        binding = enabled[0]
+    if binding is None and req.profile_id:
+        matched = [
+            row for row in db.query(AccountBinding).filter(
+                AccountBinding.adspower_profile_id == req.profile_id).all()
+            if is_enabled(row.auth_status)
+        ]
+        if len(matched) == 1:
+            binding = matched[0]
+    if binding is None:
+        raise HTTPException(404, "找不到对应绑定")
+    account = db.get(MatrixAccount, binding.account_id)
+    if account is None:
+        raise HTTPException(404, "账号不存在")
+    account.account_name = name
+    profile = dict(account.profile_json or {})
+    profile["confirmed"] = True
+    account.profile_json = profile
+    db.commit()
+    return {"ok": True, "account_name": name}
+
 
 @router.post("/identity/resolve")
 def identity_resolve(req: RpaIdentityResolve, db: Session = Depends(get_db),

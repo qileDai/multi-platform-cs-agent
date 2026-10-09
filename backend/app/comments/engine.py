@@ -15,7 +15,8 @@ from ..core.queue import register_handler
 from ..creator.contracts import CommentIntent
 from ..creator.llm import call_llm_json
 from ..database import SessionLocal
-from ..models import (FunnelEvent, MatrixAccount, Post, PostComment)
+from ..models import (ContentItem, ContentVersion, FunnelEvent, MatrixAccount, Post,
+                      PostComment, PublishTask)
 from .rules import match_rule, render_reply
 from .sender import send_comment_reply
 
@@ -41,19 +42,42 @@ async def _classify_intent(content: str) -> CommentIntent:
     return result or CommentIntent(intent="irrelevant", confidence=0.0)
 
 
+async def _knowledge_snippets(content: str) -> str:
+    """检索失败或未命中时返回空串，调用方继续用短回复。"""
+    try:
+        from ..rag.pipeline import retrieve
+        result = await retrieve(content, top_k=2)
+    except Exception:  # noqa: BLE001
+        logger.exception("评论回复检索知识库失败，改用短回复")
+        return ""
+    if not result.passed:
+        return ""
+    lines = []
+    for item in (result.contexts or [])[:2]:
+        text = (item.get("content") or "").strip()
+        if text:
+            lines.append(text[:300])
+    return "\n".join(lines)
+
+
 async def _generate_reply(content: str, intent: str) -> str:
     """无规则命中时的 LLM 兜底生成（仅开关开启时调用）。
 
     硬约束写进提示词：只引导私信，禁止任何联系方式（评论区零联系方式铁律）。
+    知识库只提供事实，检索失败时不中断，仍按短回复生成。
     """
+    snippets = await _knowledge_snippets(content)
+    knowledge = f"\n【可参考资料】\n{snippets}\n" if snippets else ""
     prompt = (
         "你是品牌账号的运营小编，请回复以下用户评论。\n\n"
-        f"【评论】\n{content}\n【意图】{INTENT_LABELS.get(intent, intent)}\n\n"
+        f"【评论】\n{content}\n【意图】{INTENT_LABELS.get(intent, intent)}\n"
+        f"{knowledge}\n"
         "要求：\n"
         "1. 口语化、友好，不超过 30 字\n"
         "2. 有咨询/购买意向的，引导用户「私信」进一步沟通\n"
         "3. 严禁出现任何联系方式或站外引导词：微信/加V/薇/vx/二维码/手机号/QQ 等及其变体\n"
-        "4. 不夸大、不承诺功效、不用极限词\n\n"
+        "4. 资料里的联系方式不要抄进评论\n"
+        "5. 不夸大、不承诺功效、不用极限词\n\n"
         "只输出 JSON：{\"reply\": \"回复文本\"}"
     )
     from pydantic import BaseModel
@@ -83,6 +107,70 @@ def _rate_rule_platform(account: MatrixAccount) -> str:
     if account.platform == "xiaohongshu":
         return "xiaohongshu_rpa_comment"
     return "mock_comment"
+
+
+def _ensure_external_post(db, platform: str, rpa_account: str,
+                          platform_post_id: str, post_url: str) -> Post | None:
+    """不是本系统发布的作品：按账号登记一条，好让评论能继续回复。
+
+    posts.publish_task_id 不能为空，所以每个账号复用一条 external 任务和一条归档内容。
+    """
+    account_key = (rpa_account or "").strip()
+    if not account_key or not platform:
+        return None
+    account = (
+        db.query(MatrixAccount)
+        .filter(MatrixAccount.rpa_account == account_key,
+                MatrixAccount.platform == platform,
+                MatrixAccount.status == "active")
+        .first()
+    )
+    if account is None:
+        logger.warning("外部评论找不到矩阵账号 account=%s platform=%s", account_key, platform)
+        return None
+    item = (
+        db.query(ContentItem)
+        .filter(ContentItem.topic == "外部登记", ContentItem.title == f"外部作品@{account.id}")
+        .first()
+    )
+    if item is None:
+        item = ContentItem(
+            title=f"外部作品@{account.id}", topic="外部登记", status="archived",
+            selling_points=[],
+        )
+        db.add(item)
+        db.flush()
+    version = (
+        db.query(ContentVersion)
+        .filter(ContentVersion.content_item_id == item.id)
+        .first()
+    )
+    if version is None:
+        version = ContentVersion(
+            content_item_id=item.id, platform=platform, title="外部作品", body="",
+        )
+        db.add(version)
+        db.flush()
+    task = (
+        db.query(PublishTask)
+        .filter(PublishTask.account_id == account.id, PublishTask.status == "external")
+        .first()
+    )
+    if task is None:
+        task = PublishTask(
+            content_version_id=version.id, account_id=account.id,
+            scheduled_at=datetime.utcnow(), status="external",
+        )
+        db.add(task)
+        db.flush()
+    post = Post(
+        publish_task_id=task.id, account_id=account.id, platform=platform,
+        platform_post_id=platform_post_id or "", url=post_url or "", title="外部作品",
+    )
+    db.add(post)
+    db.flush()
+    logger.info("已登记外部作品 account=%s post_id=%s", account_key, platform_post_id or post_url)
+    return post
 
 
 def _today_reply_count(db, account_id: int) -> int:
@@ -117,6 +205,11 @@ async def handle_inbound_comment(payload: dict):
                 Post.platform_post_id == payload["platform_post_id"]).first()
         if post is None and payload.get("post_url"):
             post = db.query(Post).filter(Post.url == payload["post_url"]).first()
+        if post is None:
+            post = _ensure_external_post(
+                db, platform, payload.get("account", ""),
+                payload.get("platform_post_id", ""), payload.get("post_url", ""),
+            )
         if post is None:
             logger.warning("评论关联不到已发布作品（post_id=%s url=%s），丢弃",
                            payload.get("platform_post_id"), payload.get("post_url"))

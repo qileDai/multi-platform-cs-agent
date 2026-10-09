@@ -37,6 +37,7 @@ SELECTORS = {
     "send_button": ".send-button",
     "file_input": "input[type='file']",
     "bot_enabled_flag": ".platform-bot-enabled",
+    "self_name": ".self-account-name",              # 当前登录的专业号名称
 }
 
 # 每轮额外扫描会话列表顶部 N 个会话（不依赖未读红点），用于捕捉人工客服在平台后台

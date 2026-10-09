@@ -27,6 +27,7 @@ CREATOR_PUBLISH_URL = "https://creator.xiaohongshu.com/publish/publish"
 # TODO: 确认实际接口地址（以下选择器为创作服务平台常见结构占位，联调时按实际 DOM 校准）
 SELECTORS = {
     "login_form": ".login-form",                    # 登录表单（可见 = 登录过期）
+    "self_name": ".self-account-name",
     "publish_entry": ".publish-entry",              # 发布页容器（不存在 = 选择器漂移）
     "tab_image_text": ".tab-image-text",            # 「图文」Tab
     "title_input": ".title-input",                  # 标题输入框
@@ -219,7 +220,8 @@ class PublishWorker(BaseWorker):
             await self._collect_account_one(page, item)
             return
         if msg_type != "publish_note":
-            return  # 非发布任务不处理（私信由 ark worker 负责；本账号应只收发布任务）
+            await self._release_foreign(item)
+            return
         outbox_id = item["outbox_id"]
 
         limited = self._rate_limited()

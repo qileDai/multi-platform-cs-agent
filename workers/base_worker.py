@@ -27,6 +27,91 @@ from playwright.async_api import Page, async_playwright
 
 logger = logging.getLogger("rpa_worker")
 
+# 上报后端只用 douyin / xiaohongshu。评论和发布脚本的 PLATFORM 名要先映射。
+_BACKEND_PLATFORMS = {
+    "douyin": "douyin",
+    "douyin_enterprise": "douyin",
+    "douyin_feige": "douyin",
+    "douyin_comment": "douyin",
+    "douyin_enterprise_comment": "douyin",
+    "xiaohongshu": "xiaohongshu",
+    "xiaohongshu_comment": "xiaohongshu",
+    "xiaohongshu_publish": "xiaohongshu",
+    "xhs_ark": "xiaohongshu",
+    "xhs_comment": "xiaohongshu",
+    "xhs_publish": "xiaohongshu",
+}
+
+
+class AssignmentChanged(Exception):
+    """授权页改了绑定或停用了，进程应退出并由外部脚本重新拉起。"""
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _lock_busy(lock_path: Path) -> bool:
+    if not lock_path.exists():
+        return False
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+    except ValueError:
+        return False
+    if pid == os.getpid() or not _pid_alive(pid):
+        return False
+    return True
+
+
+def allocate_worker_id(directory: Path | None = None) -> str:
+    """本机稳定标识。环境变量留空时写入 .worker_id，重启沿用；同目录多进程用 .worker_id.2 起。"""
+    explicit = os.environ.get("WORKER_ID", "").strip()
+    if explicit:
+        return explicit
+    folder = directory or Path.cwd()
+    folder.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 21):
+        name = ".worker_id" if index == 1 else f".worker_id.{index}"
+        id_path = folder / name
+        lock_path = folder / f"{name}.lock"
+        if _lock_busy(lock_path):
+            continue
+        if id_path.exists():
+            worker_id = id_path.read_text(encoding="utf-8").strip()
+        else:
+            worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+            id_path.write_text(worker_id, encoding="utf-8")
+        if not worker_id:
+            worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+            id_path.write_text(worker_id, encoding="utf-8")
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+        def _release(path: Path = lock_path) -> None:
+            try:
+                if path.exists() and path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    path.unlink()
+            except OSError:
+                return
+
+        import atexit
+        atexit.register(_release)
+        logger.info("本机 Worker 标识 %s", worker_id)
+        return worker_id
+    raise SystemExit("同一目录已有太多 Worker 进程")
+
 
 # ============ 配置 ============
 
@@ -44,15 +129,26 @@ class WorkerConfig:
     state_db: str = "./worker_state.db"
     download_dir: str = "./downloads"
     platform_url: str = ""     # 覆盖平台后台入口地址（留空用 driver 默认；平台改地址时无需改代码）
+    browser_provider: str = "local"  # local | adspower
+    adspower_api_base: str = "http://127.0.0.1:50325"
+    adspower_api_key: str = ""
+    adspower_profile_id: str = ""
+    binding_id: int = 0
+    driver_name: str = ""
+    msg_types: str = ""        # 逗号分隔；空 = 拉取该账号全部 outbox（旧进程）
 
     @property
     def backend_platform(self) -> str:
-        """上报后端的平台标识：企业号 driver 归 douyin 渠道（会话/统计/通道路由一致，
-        仅页面目标与频控规则不同）。"""
-        return {"douyin_enterprise": "douyin"}.get(self.platform, self.platform)
+        """上报后端的平台标识。评论/发布脚本名也归到 douyin 或 xiaohongshu。"""
+        mapped = _BACKEND_PLATFORMS.get(self.platform)
+        if mapped:
+            return mapped
+        if "xiaohongshu" in self.platform or self.platform.startswith("xhs"):
+            return "xiaohongshu"
+        return "douyin"
 
     @classmethod
-    def from_env(cls, env_file: str = ".env.local") -> "WorkerConfig":
+    def from_env(cls, env_file: str = ".env.local", *, require_account: bool = True) -> "WorkerConfig":
         """从 .env.local 读取（简单 KEY=VALUE 解析，不依赖 python-dotenv）。
 
         编码容错：Windows PowerShell 5.1 的 Set-Content 在中文系统会生成 GBK/ANSI
@@ -78,7 +174,7 @@ class WorkerConfig:
         cfg = cls(
             backend_url=os.environ.get("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/"),
             rpa_key=os.environ.get("RPA_API_KEY", ""),
-            worker_id=os.environ.get("WORKER_ID", f"worker-{uuid.uuid4().hex[:6]}"),
+            worker_id=allocate_worker_id(Path(env_file).resolve().parent if env_file else Path.cwd()),
             account=os.environ.get("ACCOUNT", ""),
             platform=os.environ.get("PLATFORM", "douyin"),
             headless=os.environ.get("HEADLESS", "true").lower() != "false",
@@ -88,10 +184,15 @@ class WorkerConfig:
             state_db=os.environ.get("STATE_DB", "./worker_state.db"),
             download_dir=os.environ.get("DOWNLOAD_DIR", "./downloads"),
             platform_url=os.environ.get("PLATFORM_URL", "").strip(),
+            browser_provider=os.environ.get("BROWSER_PROVIDER", "local").strip() or "local",
+            adspower_api_base=os.environ.get("ADSPOWER_API_BASE", "http://127.0.0.1:50325").strip(),
+            adspower_api_key=os.environ.get("ADSPOWER_API_KEY", "").strip(),
+            adspower_profile_id=os.environ.get("ADSPOWER_PROFILE_ID", "").strip(),
+            msg_types=os.environ.get("MSG_TYPES", "").strip(),
         )
         if not cfg.rpa_key:
             raise SystemExit("未配置 RPA_API_KEY（.env.local），请先运行 setup 并填写")
-        if not cfg.account:
+        if require_account and not cfg.account:
             raise SystemExit("未配置 ACCOUNT（店铺账号标识，需与后端会话 account 一致）")
         return cfg
 
@@ -121,10 +222,34 @@ class BackendClient:
         })
 
     async def pull_outbox(self, limit: int = 5) -> list[dict]:
-        resp = await self._client.get("/api/rpa/outbox", params={
-            "worker_id": self.cfg.worker_id, "account": self.cfg.account, "limit": limit})
+        params = {
+            "worker_id": self.cfg.worker_id, "account": self.cfg.account, "limit": limit,
+        }
+        if self.cfg.msg_types:
+            params["msg_types"] = self.cfg.msg_types
+        resp = await self._client.get("/api/rpa/outbox", params=params)
         resp.raise_for_status()
         return resp.json().get("messages", [])
+
+    async def release(self, outbox_id: int):
+        """把不属于本职责的租约放回队列。"""
+        resp = await self._client.post("/api/rpa/release", json={
+            "outbox_id": outbox_id, "worker_id": self.cfg.worker_id,
+        })
+        resp.raise_for_status()
+
+    async def report_self_name(self, account_name: str):
+        resp = await self._client.post("/api/rpa/identity/self", json={
+            "worker_id": self.cfg.worker_id,
+            "profile_id": self.cfg.adspower_profile_id,
+            "account_name": account_name,
+        })
+        resp.raise_for_status()
+
+    async def fetch_assignment(self) -> dict:
+        resp = await self._client.get("/api/rpa/assignment", params={"worker_id": self.cfg.worker_id})
+        resp.raise_for_status()
+        return resp.json()
 
     async def ack(self, outbox_id: int, ok: bool, error: str = "", result: str = ""):
         """回执。result：发布类任务回传平台侧结果（如笔记 URL），存 outbox.result。"""
@@ -151,7 +276,7 @@ class BackendClient:
         """上报作品评论（评论采集通道，入队评论引擎）。"""
         resp = await self._client.post("/api/rpa/incoming_comment", json={
             "account": self.cfg.account,
-            "platform": {"douyin_enterprise": "douyin"}.get(self.cfg.platform, self.cfg.platform),
+            "platform": self.cfg.backend_platform,
             **item})
         resp.raise_for_status()
 
@@ -266,6 +391,23 @@ class PlatformDriver(abc.ABC):
         """检查平台自带机器人/自动回复已关闭（防抢答）。默认跳过。"""
         return True
 
+    async def read_self_name(self, page: Page) -> str:
+        """读取当前登录的平台账号名。选择器未出现时返回空串。"""
+        import sys
+        selectors = getattr(sys.modules.get(self.__class__.__module__), "SELECTORS", None)
+        selector = ""
+        if isinstance(selectors, dict):
+            selector = str(selectors.get("self_name") or "")
+        if not selector:
+            return ""
+        try:
+            node = page.locator(selector).first
+            if await node.count() == 0:
+                return ""
+            return (await node.inner_text()).strip()[:64]
+        except Exception:  # noqa: BLE001
+            return ""
+
 
 # ============ Worker 主体 ============
 
@@ -278,6 +420,9 @@ class BaseWorker:
         self.state = LocalState(cfg.state_db)
         self.status = "offline"
         self._paused = False
+        self._debug_file = ""
+        self._profiles: list[dict] = []
+        self._hb_ticks = 0
 
     @property
     def target_url(self) -> str:
@@ -323,6 +468,8 @@ class BaseWorker:
             status = "selector_mismatch"
             logger.error("自检异常详情: %s", exc)
         await self._set_status(status)
+        if status == "selector_mismatch":
+            await self._dump_page(page)
         # 运行时在检：平台自带机器人/自动回复开启会与本系统双份回复（只告警不暂停，避免误伤）
         if status == "online":
             try:
@@ -330,42 +477,123 @@ class BaseWorker:
                     logger.warning("检测到平台自带机器人/自动回复已开启，可能双份回复，请在平台后台关闭")
             except Exception:  # noqa: BLE001
                 logger.exception("平台机器人状态检查失败")
+            try:
+                name = await self.driver.read_self_name(page)
+                if name:
+                    await self.backend.report_self_name(name)
+            except Exception:  # noqa: BLE001
+                logger.exception("上报登录账号名失败")
+
+    async def _dump_page(self, page: Page):
+        import time
+        debug_dir = Path(self.cfg.download_dir) / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{self.cfg.worker_id}-{int(time.time())}.html"
+        path = debug_dir / name
+        try:
+            path.write_text(await page.content(), encoding="utf-8")
+            self._debug_file = name
+            logger.warning("选择器失效，页面已保存 %s", path)
+        except Exception:  # noqa: BLE001
+            logger.exception("保存页面快照失败")
+
+    def _owns_message(self, item: dict) -> bool:
+        allowed = [part.strip() for part in (self.cfg.msg_types or "").split(",") if part.strip()]
+        if not allowed:
+            return True
+        return item.get("msg_type", "text") in allowed
+
+    async def _release_foreign(self, item: dict):
+        release = getattr(self.backend, "release", None)
+        if release is None:
+            return
+        try:
+            await release(item["outbox_id"])
+        except Exception:  # noqa: BLE001
+            logger.exception("释放非本职消息失败 outbox_id=%s", item.get("outbox_id"))
 
     # ---- 主循环 ----
     async def run(self):
+        from browser_session import open_session
+
         Path(self.cfg.download_dir).mkdir(parents=True, exist_ok=True)
         async with async_playwright() as pw:
-            # Playwright ≥1.49 的 Chromium headless 默认即新版无头模式（规避 Windows 锁屏问题）
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=os.path.join(self.cfg.profile_dir, self.cfg.account),
-                headless=self.cfg.headless,
-                viewport={"width": 1440, "height": 900},
-            )
-            page = context.pages[0] if context.pages else await context.new_page()
-            await self._goto_with_retry(page, self.target_url)
-            await self._self_check(page)
-            logger.info("Worker %s 启动（account=%s platform=%s status=%s）",
-                        self.cfg.worker_id, self.cfg.account, self.cfg.platform, self.status)
             try:
+                session = await open_session(pw, self.cfg)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("浏览器启动失败")
+                self.status = "browser_unavailable"
+                try:
+                    await self.backend.heartbeat("browser_unavailable", meta=await self._heartbeat_meta())
+                except Exception:  # noqa: BLE001
+                    logger.exception("上报浏览器不可用失败")
+                await self.backend.close()
+                raise SystemExit(f"浏览器启动失败：{exc}") from exc
+            page = session.page
+            try:
+                await self._goto_with_retry(page, self.target_url)
+                await self._self_check(page)
+                logger.info("Worker %s 启动（account=%s platform=%s status=%s）",
+                            self.cfg.worker_id, self.cfg.account, self.cfg.platform, self.status)
                 await asyncio.gather(
                     self._heartbeat_loop(),
                     self._outbound_loop(page),
                     self._inbound_loop(page),
+                    self._binding_watch_loop(),
                 )
             finally:
-                await context.close()
+                await session.close()
                 await self.backend.close()
+
+    async def _heartbeat_meta(self) -> dict:
+        self._hb_ticks += 1
+        if self.cfg.browser_provider == "adspower" and (self._hb_ticks == 1 or self._hb_ticks % 6 == 0):
+            try:
+                from browser_session import AdsPowerClient
+                client = AdsPowerClient(self.cfg.adspower_api_base, self.cfg.adspower_api_key)
+                self._profiles = await client.list_profiles()
+            except Exception:  # noqa: BLE001
+                logger.exception("读取 AdsPower 环境列表失败")
+        meta = {
+            "driver": self.driver.name,
+            "paused": self._paused,
+            "binding_id": self.cfg.binding_id,
+            "driver_name": self.cfg.driver_name or self.cfg.platform,
+        }
+        if self._debug_file:
+            meta["debug_file"] = self._debug_file
+        if self._profiles:
+            meta["browser_profiles"] = self._profiles[:100]
+        return meta
 
     async def _heartbeat_loop(self):
         while True:
             try:
-                await self.backend.heartbeat(self.status, meta={
-                    "driver": self.driver.name,
-                    "paused": self._paused,
-                })
+                await self.backend.heartbeat(self.status, meta=await self._heartbeat_meta())
             except Exception:  # noqa: BLE001
                 logger.exception("心跳失败")
             await asyncio.sleep(self.cfg.heartbeat_interval)
+
+    async def _binding_watch_loop(self):
+        if not self.cfg.binding_id:
+            return
+        while True:
+            await asyncio.sleep(60)
+            try:
+                current = await self.backend.fetch_assignment()
+            except Exception:  # noqa: BLE001
+                logger.exception("重新领取绑定失败")
+                continue
+            if not current.get("bound"):
+                raise AssignmentChanged("绑定已停用")
+            if int(current.get("binding_id") or 0) != int(self.cfg.binding_id):
+                raise AssignmentChanged("绑定已更换")
+            if (current.get("driver") or "") != (self.cfg.driver_name or ""):
+                raise AssignmentChanged("driver 已变更")
+            if (current.get("adspower_profile_id") or "") != (self.cfg.adspower_profile_id or ""):
+                raise AssignmentChanged("浏览器环境已变更")
+            if (current.get("provider") or "local") != (self.cfg.browser_provider or "local"):
+                raise AssignmentChanged("浏览器接入方式已变更")
 
     async def _outbound_loop(self, page: Page):
         while True:
@@ -381,6 +609,9 @@ class BaseWorker:
                 await self._send_one(page, item)
 
     async def _send_one(self, page: Page, item: dict):
+        if not self._owns_message(item):
+            await self._release_foreign(item)
+            return
         outbox_id = item["outbox_id"]
         media_path = ""
         try:
@@ -547,7 +778,8 @@ class CommentWorker(BaseWorker):
     async def _send_one(self, page: Page, item: dict):
         msg_type = item.get("msg_type")
         if msg_type not in ("comment_reply", "first_comment"):
-            return  # 非评论任务不处理
+            await self._release_foreign(item)
+            return
         outbox_id = item["outbox_id"]
         try:
             payload = json.loads(item.get("content") or "{}")
@@ -574,22 +806,22 @@ class CommentWorker(BaseWorker):
 
 # ============ 入口 ============
 
-def run_worker(cfg: WorkerConfig, driver: PlatformDriver):
+def _run_until_stop(worker: BaseWorker):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    worker = BaseWorker(cfg, driver)
     try:
         asyncio.run(worker.run())
+    except AssignmentChanged as exc:
+        logger.info("%s", exc)
+        raise SystemExit(0)
     except KeyboardInterrupt:
         logger.info("Worker 已停止")
+
+
+def run_worker(cfg: WorkerConfig, driver: PlatformDriver):
+    _run_until_stop(BaseWorker(cfg, driver))
 
 
 def run_comment_worker(cfg: WorkerConfig, driver: CommentDriver):
     """评论 Worker 入口。"""
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    worker = CommentWorker(cfg, driver)
-    try:
-        asyncio.run(worker.run())
-    except KeyboardInterrupt:
-        logger.info("Worker 已停止")
+    _run_until_stop(CommentWorker(cfg, driver))

@@ -23,6 +23,7 @@ COMMENT_MANAGE_URL = "https://creator.xiaohongshu.com/comment/manage"
 # TODO: 确认实际接口地址（以下选择器为占位结构，联调时按实际 DOM 校准）
 SELECTORS = {
     "login_form": ".login-form",                  # 登录表单（可见 = 登录过期）
+    "self_name": ".self-account-name",
     "comment_list": ".comment-list",              # 评论列表容器（不存在 = 选择器漂移）
     "comment_item": ".comment-item",              # 单条评论（data-cid / data-post-url 属性）
     "comment_author": ".comment-author",          # 评论作者昵称

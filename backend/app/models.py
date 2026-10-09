@@ -307,6 +307,36 @@ class LlmUsage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AppSetting(Base):
+    """运行时开关落库。重启后从这里读回，避免只活在进程内存里。"""
+    __tablename__ = "app_settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, default="")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AccountBinding(Base):
+    """账号职责绑定：一个矩阵账号的私信、评论或发布，对应一个 Worker 和一个浏览器环境。"""
+    __tablename__ = "account_bindings"
+    __table_args__ = (
+        Index("ix_account_bindings_account_duty", "account_id", "duty", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("matrix_accounts.id"), nullable=False, index=True)
+    duty = Column(String(16), nullable=False)  # dm | comment | publish
+    driver = Column(String(32), nullable=False)
+    provider = Column(String(16), default="adspower")  # adspower | local
+    adspower_profile_id = Column(String(64), default="")
+    worker_id = Column(String(64), default="", index=True)
+    platform_url = Column(String(256), default="")
+    auth_status = Column(String(24), default="pending_login")
+    # unbound | pending_login | authorized | login_expired | disabled
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AuditLog(Base):
     """操作审计日志：接管/释放会话、知识库变更、设置变更等敏感操作留痕。"""
     __tablename__ = "audit_logs"

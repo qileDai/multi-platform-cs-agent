@@ -250,6 +250,55 @@ export interface MatrixAccount {
   created_at: string
 }
 
+export interface AccountBinding {
+  id: number
+  account_id: number
+  duty: string
+  driver: string
+  provider: string
+  adspower_profile_id: string
+  worker_id: string
+  platform_url: string
+  auth_status: string
+  rpa_account: string
+  account_type_mismatch: boolean
+  worker_status: string
+  debug_file: string
+}
+
+export interface AccountBindingInput {
+  account_id: number
+  duty: string
+  driver: string
+  provider: string
+  adspower_profile_id: string
+  worker_id: string
+  platform_url?: string
+}
+
+export interface AccountBindingOverview {
+  douyin_account_type: string
+  drivers: { id: string; platform: string; duty: string; label: string; msg_types: string[] }[]
+  accounts: {
+    id: number
+    platform: string
+    account_name: string
+    group_name: string
+    rpa_account: string
+    status: string
+    confirmed?: boolean
+    profile_name?: string
+    bindings: Record<string, AccountBinding | null>
+  }[]
+  workers: {
+    worker_id: string
+    status: string
+    account: string
+    platform: string
+    browser_profiles: { id: string; name: string }[]
+  }[]
+}
+
 export interface AccountHealth {
   score: number
   level: 'good' | 'warn' | 'bad'
@@ -768,6 +817,17 @@ export const api = {
   refreshAccountToken: (id: number) =>
     request<MatrixAccount>(`/api/accounts/${id}/refresh`, { method: 'POST' }),
   accountsHealth: () => request<Record<string, AccountHealth>>('/api/accounts/health'),
+  accountBindingOverview: () => request<AccountBindingOverview>('/api/account-bindings/overview'),
+  createAccountFromProfile: (data: {
+    platform: string; duty: string; adspower_profile_id: string
+    profile_name?: string; worker_id?: string
+  }) => request('/api/account-bindings/from-profile', { method: 'POST', body: JSON.stringify(data) }),
+  createAccountBinding: (data: AccountBindingInput) =>
+    request<AccountBinding>('/api/account-bindings', { method: 'POST', body: JSON.stringify(data) }),
+  updateAccountBinding: (id: number, data: Partial<AccountBindingInput> & { auth_status?: string }) =>
+    request<AccountBinding>(`/api/account-bindings/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteAccountBinding: (id: number) =>
+    request(`/api/account-bindings/${id}`, { method: 'DELETE' }),
   importAccounts: (lines: string[]) =>
     request<{ imported: number; failed: { line: number; content: string; error: string }[] }>(
       '/api/accounts/import', { method: 'POST', body: JSON.stringify({ lines }) }),

@@ -97,6 +97,8 @@ def list_publish_tasks(status: str = "", _: Agent = Depends(get_current_agent),
     q = db.query(PublishTask)
     if status:
         q = q.filter(PublishTask.status == status)
+    else:
+        q = q.filter(PublishTask.status != "external")
     return [_task_out(db, t) for t in q.order_by(PublishTask.id.desc()).limit(200).all()]
 
 

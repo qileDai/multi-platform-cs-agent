@@ -431,7 +431,7 @@ async def test_long_doc_parent_and_heading(db):
 
 @pytest.mark.asyncio
 async def test_degraded_query_drops_other_doc(db):
-    """纯 BM25 下，另一篇弱相关资料不会和第一名一起通过。"""
+    """原句对上 FAQ 时只用这一条，不把另一篇资料带进来。"""
     price = KnowledgeDoc(
         title="产品价格", doc_type="faq",
         content="问：X200 Pro 多少钱\n答：3999 元。", status="active",
@@ -449,9 +449,10 @@ async def test_degraded_query_drops_other_doc(db):
         await ingest.ingest_faq(ship.id)
         result = await pipeline.retrieve("X200 Pro 多少钱", history=[])
         assert result.passed is True
-        assert result.degraded is True
+        assert result.exact_faq is True
         assert len(result.contexts) == 1
         assert "3999" in result.contexts[0]["content"]
+        assert "48" not in result.contexts[0]["content"]
     finally:
         price.status = "archived"
         ship.status = "archived"
@@ -1168,6 +1169,85 @@ async def test_exact_faq_beats_stale_cache_and_other_doc(db, conversation, monke
     other.status = "archived"
     db.commit()
     ingest.rebuild_bm25_from_db()
+
+
+@pytest.mark.asyncio
+async def test_exact_faq_keeps_rewrite_and_skips_retrieval_network(db, monkeypatch):
+    doc = KnowledgeDoc(
+        title="香港开户资料", doc_type="faq", status="active",
+        content="问：香港开户资料\n答：准备护照。",
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    await ingest.ingest_faq(doc.id)
+    calls = {"rewrite": 0, "embed": 0, "rerank": 0}
+
+    async def fake_rewrite(query, history, summary=""):
+        calls["rewrite"] += 1
+        return ["用户要办香港开户需要什么资料", query]
+
+    async def fake_embed(texts):
+        calls["embed"] += 1
+        return [[0.1, 0.2] for _ in texts]
+
+    async def fake_rerank(*_a, **_k):
+        calls["rerank"] += 1
+        return [{"index": 0, "score": 0.9}]
+
+    monkeypatch.setattr(pipeline.rewrite, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(pipeline.embeddings, "embed_texts", fake_embed)
+    monkeypatch.setattr(pipeline.rerank, "rerank", fake_rerank)
+    monkeypatch.setattr(pipeline.settings, "rerank_api_key", "test-key")
+    try:
+        result = await pipeline.retrieve(
+            "香港开户资料",
+            history=[{"sender_type": "user", "content": "我想开户"}, {"sender_type": "ai", "content": "好的"}],
+        )
+    finally:
+        doc.status = "archived"
+        db.commit()
+        ingest.rebuild_bm25_from_db()
+    assert calls == {"rewrite": 1, "embed": 0, "rerank": 0}
+    assert result.exact_faq is True
+    assert result.passed is True
+    assert result.rewritten_queries[0] == "用户要办香港开户需要什么资料"
+    assert "护照" in result.contexts[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_rerank_weight_matches_formula(monkeypatch):
+    async def fake_rerank(query, documents, top_n=3):
+        if query == "原句":
+            return [{"index": 0, "score": 0.8}, {"index": 1, "score": 0.2}]
+        return [{"index": 0, "score": 0.4}, {"index": 1, "score": 0.6}]
+
+    monkeypatch.setattr(pipeline.rerank, "rerank", fake_rerank)
+    result = await pipeline._rerank_weighted(["改写", "原句"], ["a", "b"], top_n=2)
+    assert result[0]["index"] == 0
+    assert abs(result[0]["score"] - (1.0 / 1.5)) < 1e-9
+    assert result[1]["index"] == 1
+    assert abs(result[1]["score"] - (0.5 / 1.5)) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_parallel_rerank_uses_the_side_that_returns(monkeypatch):
+    async def fake_rerank(query, documents, top_n=3):
+        if query == "原句":
+            return None
+        return [{"index": 1, "score": 0.7}, {"index": 0, "score": 0.1}]
+
+    monkeypatch.setattr(pipeline.rerank, "rerank", fake_rerank)
+    result = await pipeline._rerank_weighted(["改写", "原句"], ["a", "b"], top_n=2)
+    assert result[0] == {"index": 1, "score": 0.7}
+    assert result[1]["index"] == 0
+    assert abs(result[1]["score"] - 0.1) < 1e-9
+
+    async def both_empty(query, documents, top_n=3):
+        return None
+
+    monkeypatch.setattr(pipeline.rerank, "rerank", both_empty)
+    assert await pipeline._rerank_weighted(["改写", "原句"], ["a", "b"], top_n=2) is None
 
 
 def test_agent_correction_stays_pending(db, conversation):

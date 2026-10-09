@@ -87,7 +87,7 @@ export default function AutomationSettings() {
           <div>
             <div className="text-sm font-medium text-gray-700 dark:text-gray-200">AI 总开关（全局熔断）</div>
             <div className="text-xs text-gray-400 mt-1">
-              AI 失控时一键关闭，所有会话立即转人工止血。重启后回退到 backend/.env 的 AI_GLOBALLY_ENABLED。
+              AI 失控时一键关闭，所有会话立即转人工止血。开关会写入数据库，重启后仍然保持。
             </div>
           </div>
           <button
@@ -105,7 +105,7 @@ export default function AutomationSettings() {
       <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
         <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-1">自动化开关（内容矩阵）</div>
         <div className="text-xs text-gray-400 mb-4">
-          关闭后评论自动回复 / 定时发布全部停止，仅人工可操作。重启后回退到 backend/.env 的对应配置。
+          关闭后评论自动回复 / 定时发布全部停止，仅人工可操作。开关会写入数据库，重启后仍然保持。
         </div>
         <div className="flex gap-4">
           {([

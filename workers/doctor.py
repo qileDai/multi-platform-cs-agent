@@ -22,14 +22,29 @@ import sys
 from playwright.async_api import async_playwright
 
 from base_worker import BackendClient, WorkerConfig
+from browser_session import open_session
+from douyin_comment_worker import DouyinCommentDriver
 from douyin_enterprise_worker import EnterpriseDriver
 from douyin_feige_worker import FeigeDriver
 from xhs_ark_worker import XhsArkDriver
+from xhs_comment_worker import XhsCommentDriver
+from xhs_publish_worker import XhsPublishDriver
 
 logging.basicConfig(level=logging.WARNING)  # 自检输出保持干净
 
-DRIVERS = {"douyin": FeigeDriver, "douyin_enterprise": EnterpriseDriver,
-           "xiaohongshu": XhsArkDriver}
+DRIVERS = {
+    "douyin": FeigeDriver,
+    "douyin_feige": FeigeDriver,
+    "douyin_enterprise": EnterpriseDriver,
+    "xiaohongshu": XhsArkDriver,
+    "xhs_ark": XhsArkDriver,
+    "douyin_comment": DouyinCommentDriver,
+    "douyin_enterprise_comment": DouyinCommentDriver,
+    "xhs_comment": XhsCommentDriver,
+    "xiaohongshu_comment": XhsCommentDriver,
+    "xhs_publish": XhsPublishDriver,
+    "xiaohongshu_publish": XhsPublishDriver,
+}
 
 # 1x1 透明 PNG
 TINY_PNG = base64.b64decode(
@@ -82,10 +97,10 @@ async def run_checks(cfg: WorkerConfig) -> list[tuple[str, bool, str]]:
     url = cfg.platform_url or driver.url
     try:
         async with async_playwright() as pw:
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=f"{cfg.profile_dir}/{cfg.account}", headless=cfg.headless)
-            results.append(("浏览器可启动", True, ""))
-            page = context.pages[0] if context.pages else await context.new_page()
+            session = await open_session(pw, cfg)
+            browser_detail = "AdsPower CDP" if cfg.browser_provider == "adspower" else "本地 Chromium"
+            results.append(("浏览器可启动", True, browser_detail))
+            page = session.page
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as exc:  # noqa: BLE001
@@ -94,7 +109,7 @@ async def run_checks(cfg: WorkerConfig) -> list[tuple[str, bool, str]]:
                 results.append(("登录态有效", False, "页面不可达，跳过"))
                 results.append(("关键选择器在位", False, "页面不可达，跳过"))
                 results.append(("平台自带机器人已关闭", False, "页面不可达，跳过"))
-                await context.close()
+                await session.close()
             else:
                 results.append(("平台后台可访问", True, url))
 
@@ -113,7 +128,7 @@ async def run_checks(cfg: WorkerConfig) -> list[tuple[str, bool, str]]:
                 bot_disabled = await driver.check_platform_bot_disabled(page)
                 results.append(("平台自带机器人已关闭", bot_disabled,
                                 "" if bot_disabled else "请在平台后台关闭自带机器人/自动回复，否则会双份回复"))
-                await context.close()
+                await session.close()
     except Exception as exc:  # noqa: BLE001
         results.append(("浏览器可启动", False, f"{exc}（先运行 playwright install chromium）"[:100]))
 
@@ -136,13 +151,18 @@ async def run_checks(cfg: WorkerConfig) -> list[tuple[str, bool, str]]:
 
 def main():
     parser = argparse.ArgumentParser(description="RPA Worker 自检")
-    parser.add_argument("--platform",
-                        choices=["douyin", "douyin_enterprise", "xiaohongshu"], default=None)
+    parser.add_argument("--platform", choices=sorted(DRIVERS), default=None)
     args = parser.parse_args()
 
-    cfg = WorkerConfig.from_env()
+    cfg = WorkerConfig.from_env(require_account=False)
     if args.platform:
         cfg.platform = args.platform
+    if cfg.platform not in DRIVERS:
+        raise SystemExit(f"无法识别的平台或 driver：{cfg.platform}")
+    if cfg.browser_provider == "adspower" and not cfg.adspower_profile_id:
+        raise SystemExit("AdsPower 自检需要 ADSPOWER_PROFILE_ID")
+    if cfg.browser_provider != "adspower" and not cfg.account:
+        raise SystemExit("未配置 ACCOUNT")
     results = asyncio.run(run_checks(cfg))
     raise SystemExit(_report(results))
 

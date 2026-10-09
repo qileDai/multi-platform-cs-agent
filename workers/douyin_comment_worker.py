@@ -22,6 +22,7 @@ ENTERPRISE_COMMENT_URL = "https://e.douyin.com/site/comment/manage"
 # TODO: 确认实际接口地址（以下选择器为占位结构，联调时按实际 DOM 校准）
 SELECTORS = {
     "login_form": ".login-form",
+    "self_name": ".self-account-name",
     "comment_list": ".comment-list",
     "comment_item": ".comment-item",
     "comment_author": ".comment-author",

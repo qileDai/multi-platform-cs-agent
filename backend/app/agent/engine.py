@@ -6,6 +6,7 @@ LLM 未配置时降级：固定话术 + 直接转人工，保证全流程可跑�
 主模型硬失败（网络/服务异常）时自动切换备用模型（LLM_FALLBACK_*）。
 """
 import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -25,6 +26,9 @@ from ..services import handoff, note_unmatched, record_missed_question, send_out
 from . import confidence, context, evidence, humanize, prompt as prompt_mod, tools
 
 logger = logging.getLogger(__name__)
+
+_STAGE_KEYS = ("rewrite_ms", "embed_ms", "rerank_ms", "judge_ms", "draft_ms", "fallback_ms")
+_reply_trace: contextvars.ContextVar[dict | None] = contextvars.ContextVar("reply_trace", default=None)
 
 MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
 REPLY_BUDGET_SECONDS = 45
@@ -70,8 +74,108 @@ def greeting_reply(text: str) -> str:
     return _GREETING_REPLIES.get(_greeting_key(text) or "", _HELLO_REPLY)
 
 
+def _activate_trace() -> contextvars.Token:
+    stages = {key: 0 for key in _STAGE_KEYS}
+    return _reply_trace.set({"started": time.monotonic(), "stages": stages, "logged": False})
+
+
+def _trace_started() -> float:
+    state = _reply_trace.get()
+    if state is None:
+        return time.monotonic()
+    return state["started"]
+
+
+def _add_stage_ms(key: str, elapsed_ms: int) -> None:
+    state = _reply_trace.get()
+    if state is None:
+        return
+    state["stages"][key] = int(state["stages"].get(key, 0)) + int(elapsed_ms)
+
+
+def _stamp_extra(extra: dict | None) -> dict:
+    """把这一轮各段耗时写进即将发出的消息。没有计时上下文时原样返回。"""
+    merged = dict(extra or {})
+    state = _reply_trace.get()
+    if state is None:
+        return merged
+    total_ms = int((time.monotonic() - state["started"]) * 1000)
+    timing = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
+    timing["total_ms"] = total_ms
+    merged["timing"] = timing
+    if not state["logged"]:
+        state["logged"] = True
+        logger.info(
+            "客服回复耗时 total_ms=%s rewrite_ms=%s embed_ms=%s rerank_ms=%s "
+            "judge_ms=%s draft_ms=%s fallback_ms=%s",
+            timing["total_ms"], timing["rewrite_ms"], timing["embed_ms"], timing["rerank_ms"],
+            timing["judge_ms"], timing["draft_ms"], timing["fallback_ms"],
+        )
+    return merged
+
+
+def _abandon_draft(task: asyncio.Task | None) -> None:
+    """不等作废草稿。回调取走异常，避免未等待的任务报警。"""
+    if task is None:
+        return
+
+    def _done(done: asyncio.Task) -> None:
+        if done.cancelled():
+            return
+        try:
+            exc = done.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.debug("丢弃的草稿结束", exc_info=exc)
+
+    if task.done():
+        _done(task)
+    else:
+        task.add_done_callback(_done)
+
+
+def _same_contexts(left: list[dict], right: list[dict]) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(_context_key(a) == _context_key(b) for a, b in zip(left, right))
+
+
+async def _timed_llm(rendered: str, conversation_id: int, timeout: float):
+    started = time.monotonic()
+    reply = await _call_llm_with_retry(rendered, conversation_id=conversation_id, timeout=timeout)
+    return reply, int((time.monotonic() - started) * 1000)
+
+
+def _remember_draft(task: asyncio.Task) -> None:
+    state = _reply_trace.get()
+    if state is not None:
+        state["draft"] = task
+
+
+def _take_draft() -> asyncio.Task | None:
+    state = _reply_trace.get()
+    if state is None:
+        return None
+    task = state.get("draft")
+    state["draft"] = None
+    return task
+
+
 async def process_ai_reply(conversation_id: int, *, local: bool = False,
                            allow_owned: bool = False) -> str:
+    token = _activate_trace()
+    try:
+        return await _process_ai_reply_impl(conversation_id, local=local, allow_owned=allow_owned)
+    finally:
+        state = _reply_trace.get()
+        if state is not None:
+            _abandon_draft(state.get("draft"))
+        _reply_trace.reset(token)
+
+
+async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
+                                 allow_owned: bool = False) -> str:
     """对一条用户消息执行完整 AI 接待流程。
 
     local=True 时只在本系统入库并返回拼成一段的正文，不走平台发送，也不做打字延迟。
@@ -126,18 +230,38 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
         await handoff(conversation_id_, reason="llm_not_configured")
         return text
 
-    started = time.monotonic()
+    started = _trace_started()
     history_text, recent, summary = context.get_history_for_prompt(conversation_id_)
-    cached = await answer_cache.lookup(user_text)
+    retrieval = await _retrieve_covering(user_text, recent, summary)
+    for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
+        _add_stage_ms(key, int(retrieval.stage_ms.get(key, 0)))
+    if retrieval.query_vector:
+        cached = await answer_cache.lookup(user_text, retrieval.query_vector)
+    else:
+        embed_started = time.monotonic()
+        cached = await answer_cache.lookup(user_text)
+        _add_stage_ms("embed_ms", int((time.monotonic() - embed_started) * 1000))
     if _over_budget(started):
         return await _confirm_and_handoff(conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned)
 
-    retrieval = await _retrieve_covering(user_text, recent, summary)
     _save_retrieval_trace(user_message_id, retrieval)
     agent_lines = _agent_fact_lines(recent)
     confidence_meta = None
+    draft_contexts: list[dict] | None = None
+    draft_prompt = ""
+    draft_timeout = _llm_timeout(started) if retrieval.passed and not retrieval.exact_faq else None
+    if draft_timeout is not None:
+        draft_contexts = list(retrieval.contexts)
+        draft_prompt = _render_knowledge_prompt(
+            conversation_id_, platform, user_text, history_text, retrieval,
+        )
+        _remember_draft(asyncio.create_task(
+            _timed_llm(draft_prompt, conversation_id_, draft_timeout),
+        ))
     if retrieval.passed:
+        judge_started = time.monotonic()
         confidence_meta = await _select_for_answer(user_text, retrieval, recent, summary, started)
+        _add_stage_ms("judge_ms", int((time.monotonic() - judge_started) * 1000))
         if confidence_meta["action"] == "clarify":
             payload = confidence.answer_confidence_payload(
                 faithfulness_score=1.0, precision=confidence_meta["raw_precision"],
@@ -185,16 +309,36 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
 
     tool_results: list[dict] = []
     tool_names_used: list[str] = []
+    draft_task = _take_draft()
+    use_draft = (
+        draft_task is not None
+        and draft_contexts is not None
+        and _same_contexts(draft_contexts, retrieval.contexts)
+        and retrieval.passed
+    )
     if retrieval.passed:
-        if _llm_timeout(started) is None:
-            return await _confirm_and_handoff(
-                conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned,
+        if use_draft:
+            reply, draft_ms = await draft_task
+            tool_started = time.monotonic()
+            reply = await _consume_tools(
+                conversation_id_, customer_id, platform, draft_prompt, reply,
+                tool_results, tool_names_used, started,
             )
-        reply = await _answer_from_knowledge(
-            conversation_id_, customer_id, platform, user_text, history_text, retrieval, started,
-            tool_results, tool_names_used,
-        )
+            _add_stage_ms("draft_ms", draft_ms + int((time.monotonic() - tool_started) * 1000))
+        else:
+            _abandon_draft(draft_task)
+            if _llm_timeout(started) is None:
+                return await _confirm_and_handoff(
+                    conversation_id_, user_text, platform, local=local, allow_owned=owned, owned=owned,
+                )
+            draft_started = time.monotonic()
+            reply = await _answer_from_knowledge(
+                conversation_id_, customer_id, platform, user_text, history_text, retrieval, started,
+                tool_results, tool_names_used,
+            )
+            _add_stage_ms("draft_ms", int((time.monotonic() - draft_started) * 1000))
     else:
+        _abandon_draft(draft_task)
         reply = await _answer_without_knowledge(
             conversation_id_, customer_id, platform, user_text, recent, started,
             tool_results, tool_names_used, local=local, allow_owned=owned, owned=owned,
@@ -230,9 +374,11 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
     need_fallback = (not forced_human) and (bool(gaps) or not kept) and not tool_ok
     used_fallback = False
     if need_fallback and _llm_timeout(started) is not None:
+        fallback_started = time.monotonic()
         fallback = await _llm_fallback(
             conversation_id_, user_text, kept, gaps, recent, started,
         )
+        _add_stage_ms("fallback_ms", int((time.monotonic() - fallback_started) * 1000))
         used_fallback = True
         if fallback is not None:
             fb_kept, fb_dropped = evidence.partition_messages(fallback.reply_messages, blob, retrieval.contexts)
@@ -430,6 +576,8 @@ async def _retrieve_covering(user_text: str, recent: list[dict], summary: str) -
         if pipeline.facet_covered(facet, merged):
             continue
         extra = await pipeline.retrieve(facet, history=recent, summary=summary)
+        for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
+            primary.stage_ms[key] = int(primary.stage_ms.get(key, 0)) + int(extra.stage_ms.get(key, 0))
         for item in extra.contexts:
             key = _context_key(item)
             if key in seen:
@@ -659,14 +807,10 @@ async def _risk_stop(conversation_id: int, user_text: str, platform: str, meta: 
     )
 
 
-async def _answer_from_knowledge(conversation_id: int, customer_id: int, platform: str, user_text: str,
-                                 history_text: str, retrieval, started: float,
-                                 tool_results: list[dict], tool_names: list[str]) -> AgentReply | None:
-    timeout = _llm_timeout(started)
-    if timeout is None:
-        return None
+def _render_knowledge_prompt(conversation_id: int, platform: str, user_text: str,
+                             history_text: str, retrieval) -> str:
     rewritten = retrieval.rewritten_queries[0] if retrieval.rewritten_queries else user_text
-    rendered = prompt_mod.render_prompt(
+    return prompt_mod.render_prompt(
         platform=platform,
         knowledge_context=_format_knowledge_context(
             retrieval.contexts, retrieval.gaps, user_text,
@@ -676,6 +820,15 @@ async def _answer_from_knowledge(conversation_id: int, customer_id: int, platfor
         customer_profile=context.customer_profile_text(conversation_id),
         rewritten_question=rewritten,
     )
+
+
+async def _answer_from_knowledge(conversation_id: int, customer_id: int, platform: str, user_text: str,
+                                 history_text: str, retrieval, started: float,
+                                 tool_results: list[dict], tool_names: list[str]) -> AgentReply | None:
+    timeout = _llm_timeout(started)
+    if timeout is None:
+        return None
+    rendered = _render_knowledge_prompt(conversation_id, platform, user_text, history_text, retrieval)
     reply = await _call_llm_with_retry(
         rendered, conversation_id=conversation_id, timeout=timeout,
     )
@@ -798,9 +951,11 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
     dialogue_timeout = _llm_timeout(started)
     if dialogue_timeout is None:
         return None
+    dialogue_started = time.monotonic()
     reply = await _call_llm_with_retry(
         rendered, conversation_id=conversation_id, timeout=dialogue_timeout,
     )
+    _add_stage_ms("draft_ms", int((time.monotonic() - dialogue_started) * 1000))
     if reply is None or reply.handoff or not reply.reply_messages:
         return None
     if evidence.claims_unsupported(reply.reply_messages[:1], _confirmed_dialogue_text(earlier)):
@@ -1087,6 +1242,7 @@ async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
                       extra: dict | None = None, allow_owned: bool = False,
                       anchor_user_message_id: int | None = None) -> tuple[str, bool]:
     """发出 AI 正文。返回 (给调用方的文本, 是否至少有一条真正发出或入库)。"""
+    extra = _stamp_extra(extra)
     parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
     if not parts:
         return "", False

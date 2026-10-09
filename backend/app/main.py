@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
+from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
 from .api.deps import require_admin
 from .wecom import callback as wecom_callback
@@ -242,6 +242,8 @@ async def lifespan(app: FastAPI):
     init_db()
     db = SessionLocal()
     try:
+        from .core.runtime_settings import load_persisted
+        load_persisted(db)
         _ensure_admin(db)
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
@@ -338,6 +340,7 @@ app.add_middleware(
 )
 
 for r in [auth.router, webhooks.router, conversations.router, messages.router,
+          account_bindings.router,
           knowledge.router, agents.router, stats.router, quick.router, tickets.router,
           rpa.router, settings_api.router, evals.router, media_router, ws.router,
           accounts.router, contents.router, publish.router, comments.router,

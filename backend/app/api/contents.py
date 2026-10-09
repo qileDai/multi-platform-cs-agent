@@ -32,7 +32,7 @@ MATERIAL_MIME_PREFIXES = ("image/", "video/", "audio/")
 @router.get("/contents", response_model=list[ContentItemOut])
 def list_contents(status: str = "", _: Agent = Depends(get_current_agent),
                   db: Session = Depends(get_db)):
-    q = db.query(ContentItem)
+    q = db.query(ContentItem).filter(ContentItem.topic != "外部登记")
     if status:
         q = q.filter(ContentItem.status == status)
     return q.order_by(ContentItem.updated_at.desc()).limit(200).all()

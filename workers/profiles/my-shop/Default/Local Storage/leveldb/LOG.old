@@ -1,8 +1,7 @@
-2026/09/20-14:14:22.731 ac28 Reusing MANIFEST D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/MANIFEST-000001
-2026/09/20-14:14:22.734 ac28 Recovering log #3
-2026/09/20-14:14:22.734 ac28 Reusing old log D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/000003.log 
-2026/09/20-14:15:22.737 ac28 Level-0 table #5: started
-2026/09/20-14:15:22.744 ac28 Level-0 table #5: 113303 bytes OK
-2026/09/20-14:15:22.747 ac28 Delete type=0 #3
-2026/09/20-14:15:52.242 ac28 Level-0 table #7: started
-2026/09/20-14:15:52.247 ac28 Level-0 table #7: 82797 bytes OK
+2026/09/20-14:16:20.342 5c90 Reusing MANIFEST D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/MANIFEST-000001
+2026/09/20-14:16:20.344 5c90 Recovering log #4
+2026/09/20-14:16:20.345 5c90 Level-0 table #7: started
+2026/09/20-14:16:20.347 5c90 Level-0 table #7: 82797 bytes OK
+2026/09/20-14:16:20.348 5c90 Recovering log #6
+2026/09/20-14:16:20.348 5c90 Reusing old log D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Local Storage\leveldb/000006.log 
+2026/09/20-14:16:20.348 5c90 Delete type=0 #4

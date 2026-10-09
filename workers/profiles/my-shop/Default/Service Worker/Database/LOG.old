@@ -1,2 +1,3 @@
-2026/09/20-14:14:24.668 553c Creating DB D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Service Worker\Database since it was missing.
-2026/09/20-14:14:24.670 553c Reusing MANIFEST D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Service Worker\Database/MANIFEST-000001
+2026/09/20-14:16:20.341 7290 Reusing MANIFEST D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Service Worker\Database/MANIFEST-000001
+2026/09/20-14:16:20.344 7290 Recovering log #3
+2026/09/20-14:16:20.344 7290 Reusing old log D:\projects\multi-platform-cs-agent\workers\profiles\my-shop\Default\Service Worker\Database/000003.log 

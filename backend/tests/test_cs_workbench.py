@@ -1,4 +1,5 @@
 """客服工作台：分配上限、回头客、RAG 未命中硬转人工。"""
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 
@@ -358,6 +359,8 @@ async def test_pure_greeting_stays_with_ai(db, conversation, monkeypatch):
         assert "没查到靠谱资料" not in ai.content
         assert "小赢" in ai.content
         assert "开户" in ai.content
+        assert ai.extra["timing"]["total_ms"] >= 0
+        assert ai.extra["timing"]["draft_ms"] == 0
     assert called == []
     assert db.query(MissedQuestion).filter(MissedQuestion.conversation_id == conversation.id).count() == 0
     assert db.query(Message).filter(
@@ -1048,12 +1051,24 @@ async def test_unscored_materials_question_hands_off(db, conversation, monkeypat
     async def no_verdict(*_a, **_k):
         return None
 
+    from app.schemas import ToolCall
+
+    tools_called = []
+
     async def fake_llm(*_a, **_k):
-        return AgentReply(reply_messages=["1、开户调查问卷"], intent="consult_feature", confidence=0.99)
+        return AgentReply(
+            reply_messages=["1、开户调查问卷"], intent="consult_feature", confidence=0.99,
+            tool_call=ToolCall(name="query_order", args={"phone": "13800138000"}),
+        )
+
+    async def fake_tool(*_a, **_k):
+        tools_called.append(True)
+        return {"ok": False, "data": None, "error": "不应执行"}
 
     monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
     monkeypatch.setattr("app.agent.confidence.judge_relevance", no_verdict)
     monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.tools, "execute_tool", fake_tool)
     monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
 
     await engine.process_ai_reply(conversation.id)
@@ -1068,6 +1083,7 @@ async def test_unscored_materials_question_hands_off(db, conversation, monkeypat
     assert "确认" in sent
     assert "开户调查问卷" not in sent
     assert "免责" not in sent
+    assert tools_called == []
 
 
 @pytest.mark.asyncio
@@ -1283,8 +1299,10 @@ async def test_unscored_does_not_call_fallback_model(db, conversation, monkeypat
     monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
     monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
     await engine.process_ai_reply(conversation.id)
+    await asyncio.sleep(0)
     db.expire_all()
-    assert called == []
+    # 判定失败前可能已经发出一次草稿，但不再补答，句子也不入库。
+    assert called == [1]
     sent = "\n".join(
         row.content for row in db.query(Message).filter(
             Message.conversation_id == conversation.id, Message.sender_type == "ai",
@@ -1292,3 +1310,130 @@ async def test_unscored_does_not_call_fallback_model(db, conversation, monkeypat
     )
     assert "确认" in sent
     assert "护照" not in sent
+
+
+@pytest.mark.asyncio
+async def test_filtered_context_discards_speculative_draft(db, conversation, monkeypatch):
+    """判定筛掉一段后，按留下的资料重写，不发按旧段落写的草稿。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="注册按什么走",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, rewritten_queries=[query],
+            contexts=[
+                {"content": "开户要准备护照原件", "source": "开户", "doc_id": 1, "chunk_id": "a"},
+                {"content": "注册按资料走，不另收费", "source": "注册", "doc_id": 2, "chunk_id": "b"},
+            ],
+        )
+
+    async def verdicts(_user, contexts, *, timeout=4.0):
+        return [0, 1][:len(contexts)]
+
+    async def fake_llm(prompt, **_k):
+        if "护照" in prompt:
+            return AgentReply(reply_messages=["开户要准备护照原件"], intent="consult_feature", confidence=0.9)
+        return AgentReply(reply_messages=["注册按资料走，不另收费"], intent="consult_feature", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", verdicts)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "不另收费" in sent
+    assert "护照" not in sent
+
+
+@pytest.mark.asyncio
+async def test_broadened_context_discards_speculative_draft(db, conversation, monkeypatch):
+    """放宽后换成另一批资料时，不发按第一批写的草稿。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="那笔账怎么记",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary="", broaden=True):
+        if query == "更宽的问法":
+            return rag_pipeline.RetrievalResult(
+                passed=True, rewritten_queries=[query],
+                contexts=[{"content": "记账按资料每月一次", "source": "记账", "doc_id": 9, "chunk_id": "n"}],
+            )
+        return rag_pipeline.RetrievalResult(
+            passed=True, rewritten_queries=[query],
+            contexts=[{"content": "这段毫不相关", "source": "旧", "doc_id": 3, "chunk_id": "o"}],
+        )
+
+    async def fake_judge(_user, contexts, *, timeout=4.0):
+        blob = " ".join((item.get("content") or "") for item in contexts)
+        if "每月一次" in blob:
+            return [1]
+        return [0]
+
+    async def fake_broaden(*_a, **_k):
+        return "更宽的问法"
+
+    async def fake_llm(prompt, **_k):
+        if "毫不相关" in prompt:
+            return AgentReply(reply_messages=["旧草稿不该出现"], intent="other", confidence=0.9)
+        return AgentReply(reply_messages=["记账按资料每月一次"], intent="other", confidence=0.9)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr("app.agent.confidence.judge_relevance", fake_judge)
+    monkeypatch.setattr(engine.rewrite, "broaden_query", fake_broaden)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert "每月一次" in sent
+    assert "旧草稿" not in sent
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_ignores_parallel_draft(db, conversation, monkeypatch):
+    from app.schemas import AgentReply
+
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="多少钱"))
+    db.commit()
+
+    async def fake_lookup(_query):
+        return ["标准款 99 元"]
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, rewritten_queries=[query],
+            contexts=[{"content": "标准款 99 元", "source": "价格", "doc_id": 1, "chunk_id": "c1"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=["并行草稿不该出现"], intent="consult_price", confidence=0.9)
+
+    monkeypatch.setattr(engine.answer_cache, "lookup", fake_lookup)
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one()
+    assert ai.content == "标准款 99 元"
+    assert "并行草稿" not in ai.content
+    assert ai.extra.get("cache_hit") is True

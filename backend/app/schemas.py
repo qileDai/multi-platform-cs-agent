@@ -325,6 +325,17 @@ class RpaAck(BaseModel):
     platform_msg_id: str = ""
 
 
+class RpaRelease(BaseModel):
+    outbox_id: int
+    worker_id: str
+
+
+class RpaSelfIdentity(BaseModel):
+    worker_id: str
+    profile_id: str = ""
+    account_name: str
+
+
 class RpaIncomingComment(BaseModel):
     """Worker 上报的作品评论（评论采集通道）。"""
     account: str

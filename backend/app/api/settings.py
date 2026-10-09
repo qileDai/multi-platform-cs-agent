@@ -1,6 +1,6 @@
 """运行时设置：AI 全局熔断开关。
 
-开关为进程内运行时状态（立即生效，无需重启）；重启后回退到 .env 的 AI_GLOBALLY_ENABLED。
+开关立即生效，并写入 app_settings。重启后从数据库读回，没有记录时才用 .env。
 用途：AI 失控（答非所问/违规输出）时一键全转人工止血。
 """
 import logging
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..core import audit
+from ..core.runtime_settings import persist
 from ..database import get_db
 from ..models import Agent, AuditLog
 from ..schemas import AutoSwitchesIn, AutoSwitchesOut
@@ -38,6 +39,7 @@ def get_ai_switch(_: Agent = Depends(get_current_agent)):
 def set_ai_switch(req: AiSwitchIn, agent: Agent = Depends(require_admin),
                   db: Session = Depends(get_db)):
     settings.ai_globally_enabled = req.enabled
+    persist(db, "ai_globally_enabled", req.enabled)
     logger.warning("AI 全局开关被 %s（@%s）切换为 %s",
                    agent.display_name, agent.username, "开启" if req.enabled else "关闭（全转人工）")
     audit.log(db, agent, "ai_switch", target="settings:ai_globally_enabled",
@@ -59,9 +61,11 @@ def set_auto_switches(req: AutoSwitchesIn, agent: Agent = Depends(require_admin)
     changes = []
     if req.comment_auto_reply_enabled is not None:
         settings.comment_auto_reply_enabled = req.comment_auto_reply_enabled
+        persist(db, "comment_auto_reply_enabled", req.comment_auto_reply_enabled)
         changes.append(f"评论自动回复={'开' if req.comment_auto_reply_enabled else '关'}")
     if req.publish_auto_enabled is not None:
         settings.publish_auto_enabled = req.publish_auto_enabled
+        persist(db, "publish_auto_enabled", req.publish_auto_enabled)
         changes.append(f"自动发布={'开' if req.publish_auto_enabled else '关'}")
     if changes:
         logger.warning("自动化开关被 %s（@%s）切换: %s",

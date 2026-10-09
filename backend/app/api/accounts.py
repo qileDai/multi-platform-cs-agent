@@ -17,7 +17,7 @@ from ..config import settings
 from ..core import audit, crypto
 from ..core.http import get_json
 from ..database import get_db
-from ..models import Agent, MatrixAccount, PublishTask
+from ..models import AccountBinding, Agent, MatrixAccount, PublishTask
 from ..schemas import (AccountImportIn, MatrixAccountIn, MatrixAccountOut,
                        MatrixAccountUpdate)
 from .deps import get_current_agent, require_admin
@@ -185,6 +185,7 @@ def delete_account(account_id: int, agent: Agent = Depends(require_admin),
         PublishTask.status.in_(["pending", "publishing"])).count()
     if running:
         raise HTTPException(400, f"该账号还有 {running} 个未完结发布任务，请先取消")
+    db.query(AccountBinding).filter(AccountBinding.account_id == account_id).delete()
     db.delete(acc)
     db.commit()
     audit.log(db, agent, "account_delete", target=f"account:{account_id}",

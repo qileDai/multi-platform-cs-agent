@@ -51,6 +51,7 @@ SELECTORS = {
     "send_button": ".send-button",                  # 发送按钮
     "file_input": "input[type='file']",             # 附件上传 input
     "bot_enabled_flag": ".platform-bot-enabled",    # 企业号自动回复/智能客服开启标记（存在即未关闭）
+    "self_name": ".self-account-name",              # 当前登录的企业号名称
 }
 
 # 每轮额外扫描会话列表顶部 N 个会话（不依赖未读红点），用于捕捉人工客服在平台后台

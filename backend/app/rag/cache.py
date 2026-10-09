@@ -49,8 +49,9 @@ def clear() -> None:
         _entries.clear()
 
 
-async def lookup(query: str) -> list[str] | None:
-    vector = await embeddings.embed_query(query)
+async def lookup(query: str, vector: list[float] | None = None) -> list[str] | None:
+    if vector is None:
+        vector = await embeddings.embed_query(query)
     if not vector:
         return None
     with _lock:

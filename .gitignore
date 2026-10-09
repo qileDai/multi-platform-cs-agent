@@ -8,12 +8,19 @@ venv/
 
 # Env
 .env
+.env.local
+workers/.worker_id
+workers/.worker_id.*
+workers/.env.local
 
 # Data
 data/
 *.db
 *.sqlite3
 chroma/
+backups/
+workers/downloads/
+workers/profiles/
 
 # Node
 node_modules/

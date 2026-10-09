@@ -2,8 +2,10 @@
 
 精排返回空结果或调用失败时，退回融合结果，按余弦或 BM25 分差决定是否生成。
 精排有分数但低于阈值时仍不生成。"""
+import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 
 from ..config import settings
@@ -37,6 +39,8 @@ class RetrievalResult:
     facets: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
     exact_faq: bool = False
+    query_vector: list[float] | None = None  # 原句向量，供回答缓存复用
+    stage_ms: dict = field(default_factory=dict)  # rewrite_ms / embed_ms / rerank_ms
 
 
 _ASK_HINT = re.compile(
@@ -50,12 +54,25 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
     """完整检索管线。返回带引用的知识片段；未过阈值时 passed=False（上层触发转人工）。"""
     result = RetrievalResult()
 
-    # 1. 查询改写（指代消解 + 同义多路）
+    # 1. 查询改写（指代消解 + 同义多路）。精确 FAQ 也要留下改写，提示词里的「实际在问」用它。
+    rewrite_started = time.monotonic()
     queries = await rewrite.rewrite_query(query, history or [], summary=summary)
     result.rewritten_queries = queries
+    result.stage_ms["rewrite_ms"] = _elapsed_ms(rewrite_started)
+    pinned = _exact_faq_context(query)
+    if pinned is not None:
+        result.contexts = [pinned]
+        result.passed = True
+        result.reason = "passed"
+        result.gaps = []
+        result.exact_faq = True
+        return result
 
     # 2. 每条改写单独成路：向量批量编码，BM25 各查各的
-    rankings, degraded = await _collect_rankings(queries)
+    embed_started = time.monotonic()
+    rankings, degraded, vectors = await _collect_rankings(queries)
+    result.stage_ms["embed_ms"] = _elapsed_ms(embed_started)
+    result.query_vector = _vector_for_original(query, queries, vectors)
     result.degraded = degraded
     result.dense_count, result.bm25_count = _path_counts(rankings)
     if not rankings:
@@ -72,7 +89,9 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
 
     # 4. Rerank 精排。原句权重大于改写句。空结果或调用失败退回融合分差。
     if settings.rerank_configured:
+        rerank_started = time.monotonic()
         reranked = await _rerank_weighted(queries, [c["content"] for c in candidates], top_n=top_k)
+        result.stage_ms["rerank_ms"] = _elapsed_ms(rerank_started)
         if reranked:
             scored = [
                 {**candidates[r["index"]], "score": r["score"]} for r in reranked
@@ -173,13 +192,19 @@ async def _maybe_broaden(result: RetrievalResult, query: str, history: list[dict
     """第一轮没过阈值时，用更宽的问法再检一次。"""
     if result.passed or not broaden:
         return result
+    broaden_started = time.monotonic()
     wider = await rewrite.broaden_query(query, result.rewritten_queries, result.reason, history, summary)
+    _add_stage_ms(result.stage_ms, {"rewrite_ms": _elapsed_ms(broaden_started)})
     if not wider:
         return result
     second = await retrieve(wider, history=history, summary=summary, top_k=top_k, broaden=False)
     if second.passed:
         second.rewritten_queries = list(result.rewritten_queries) + list(second.rewritten_queries)
+        _add_stage_ms(second.stage_ms, result.stage_ms)
+        # 缓存余弦用用户原句的向量，不用放宽后的问法。
+        second.query_vector = result.query_vector
         return second
+    _add_stage_ms(result.stage_ms, second.stage_ms)
     return result
 
 
@@ -225,6 +250,28 @@ def facet_covered(facet: str, contexts: list[dict]) -> bool:
 
 def _compact(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def _add_stage_ms(into: dict, extra: dict) -> None:
+    for key, value in extra.items():
+        into[key] = int(into.get(key, 0)) + int(value or 0)
+
+
+def _vector_for_original(query: str, queries: list[str], vectors: list | None) -> list[float] | None:
+    """批量编码里对应用户原句的那一条。改写句不拿来做缓存余弦。"""
+    if not vectors:
+        return None
+    index = None
+    for i, text in enumerate(queries):
+        if text == query:
+            index = i
+    if index is None or index >= len(vectors) or not vectors[index]:
+        return None
+    return vectors[index]
 
 
 def _exact_phrase_hits(query: str, candidates: list[dict]) -> list[dict]:
@@ -287,10 +334,11 @@ def _fused_preview(candidates: list[dict]) -> list[dict]:
     return preview
 
 
-async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool]:
+async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool, list | None]:
     """每条查询各产出一路向量、一路 BM25。向量不可用时 degraded=True。"""
     vectors = await embeddings.embed_texts(queries)
     degraded = not vectors or len(vectors) != len(queries)
+    usable = None if degraded else vectors
     if degraded:
         vectors = [None] * len(queries)
 
@@ -310,21 +358,30 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool]
         ]
         if sparse:
             rankings.append(sparse)
-    return rankings, degraded
+    return rankings, degraded, usable
+
+
+async def _rerank_one(text: str, documents: list[str], top_n: int) -> list[dict] | None:
+    try:
+        return await rerank.rerank(text, documents, top_n=top_n)
+    except Exception:  # noqa: BLE001
+        logger.warning("精排一路失败", exc_info=True)
+        return None
 
 
 async def _rerank_weighted(queries: list[str], documents: list[str], top_n: int) -> list[dict] | None:
-    """原句权重 1，改写句权重 0.5。只拿到其中一路时用那一路的分。"""
+    """原句权重 1，改写句权重 0.5。两路同时打。只拿到其中一路时用那一路的分。"""
     original = queries[-1] if queries else ""
     lead = queries[0] if queries else ""
     pairs = [(original, 1.0)]
     if lead and lead != original:
         pairs.append((lead, 0.5))
+    each = max(top_n, len(documents))
+    ranked_lists = await asyncio.gather(*[_rerank_one(text, documents, each) for text, _weight in pairs])
     combined: dict[int, float] = {}
     weights: dict[int, float] = {}
     any_ok = False
-    for text, weight in pairs:
-        ranked = await rerank.rerank(text, documents, top_n=max(top_n, len(documents)))
+    for (_text, weight), ranked in zip(pairs, ranked_lists):
         if not ranked:
             continue
         any_ok = True

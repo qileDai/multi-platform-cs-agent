@@ -200,6 +200,19 @@ export interface RpaWorker {
   failed: number
 }
 
+export interface RpaReply {
+  outbox_id: number
+  account: string
+  platform: string
+  msg_type: string
+  kind: 'dm' | 'comment'
+  content: string
+  status: string
+  error: string
+  created_at: string | null
+  acked_at: string | null
+}
+
 export interface RpaFailedMessage {
   outbox_id: number
   account: string
@@ -296,6 +309,7 @@ export interface AccountBindingOverview {
     account: string
     platform: string
     browser_profiles: { id: string; name: string }[]
+    ads_error?: string
   }[]
 }
 
@@ -642,6 +656,8 @@ export const api = {
 
   // rpa
   listRpaWorkers: () => request<RpaWorker[]>('/api/rpa/workers'),
+  listRpaReplies: (kind = '') =>
+    request<{ items: RpaReply[] }>(`/api/rpa/replies${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
   listRpaFailed: (account = '') =>
     request<{ items: RpaFailedMessage[] }>(`/api/rpa/outbox/failed?account=${encodeURIComponent(account)}`),
   retryRpaOutbox: (id: number) => request(`/api/rpa/outbox/${id}/retry`, { method: 'POST' }),
@@ -649,6 +665,13 @@ export const api = {
 
   // settings（AI 全局熔断开关 + 审计日志）
   getAiSwitch: () => request<{ enabled: boolean }>('/api/settings/ai-switch'),
+  getDouyinAccountType: () =>
+    request<{ account_type: string }>('/api/settings/douyin-account-type'),
+  setDouyinAccountType: (account_type: string) =>
+    request<{ account_type: string }>('/api/settings/douyin-account-type', {
+      method: 'PUT',
+      body: JSON.stringify({ account_type }),
+    }),
   setAiSwitch: (enabled: boolean) =>
     request<{ enabled: boolean }>('/api/settings/ai-switch', {
       method: 'PUT',
@@ -828,6 +851,8 @@ export const api = {
     request<AccountBinding>(`/api/account-bindings/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteAccountBinding: (id: number) =>
     request(`/api/account-bindings/${id}`, { method: 'DELETE' }),
+  reopenAccountBinding: (id: number) =>
+    request(`/api/account-bindings/${id}/reopen`, { method: 'POST' }),
   importAccounts: (lines: string[]) =>
     request<{ imported: number; failed: { line: number; content: string; error: string }[] }>(
       '/api/accounts/import', { method: 'POST', body: JSON.stringify({ lines }) }),

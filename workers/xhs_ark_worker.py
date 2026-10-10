@@ -16,6 +16,7 @@ from playwright.async_api import Page
 
 from base_worker import (BaseWorker, IncomingItem, PlatformDriver, WorkerConfig,
                          run_worker)
+from page_markers import is_login_wall, page_text
 
 logger = logging.getLogger("rpa_worker.xhs")
 
@@ -51,11 +52,15 @@ class XhsArkDriver(PlatformDriver):
 
     async def check_status(self, page: Page) -> str:
         # 登录表单常驻 DOM、通过显隐切换，必须按「可见性」判断（count 会把隐藏元素也算进去）
-        if await page.locator(SELECTORS["login_form"]).first.is_visible():
+        login = page.locator(SELECTORS["login_form"])
+        if await login.count() and await login.first.is_visible():
             return "login_expired"
-        if await page.locator(SELECTORS["conversation_list"]).count() == 0:
-            return "selector_mismatch"
-        return "online"
+        if await page.locator(SELECTORS["conversation_list"]).count() > 0:
+            return "online"
+        # 千帆已登录页还没有会话节点快照。先把登录墙认成登录过期，避免一直显示选择器失效。
+        if is_login_wall(await page_text(page)):
+            return "login_expired"
+        return "selector_mismatch"
 
     async def check_platform_bot_disabled(self, page: Page) -> bool:
         """千帆「自动回复」开启时页面有对应标记（fixture 契约）。"""

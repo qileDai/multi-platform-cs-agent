@@ -308,23 +308,23 @@ python hot_collect_worker.py --platform douyin --keyword 宠物烘干箱 --limit
 
 ### 12.1 机器上要准备的
 
-后端服务器不安装 AdsPower。Worker 电脑安装并登录 AdsPower，本地接口保持 `http://127.0.0.1:50325`。`.env.local` 只填 `BACKEND_URL`、`RPA_API_KEY`、`ADSPOWER_API_BASE`、`ADSPOWER_API_KEY`。`WORKER_ID` 不用填，进程会在本目录生成 `.worker_id` 并一直沿用。账号和职责在「账号」页绑定。
+后端服务器不安装 AdsPower。Worker 电脑安装并登录 AdsPower，本地接口保持 `http://127.0.0.1:50325`。`.env.local` 只填 `BACKEND_URL`、`RPA_API_KEY`、`ADSPOWER_API_BASE`、`ADSPOWER_API_KEY`。`WORKER_ID` 不用填。账号和职责在「账号」页绑定，后端会为每条绑定生成 Worker 标识。
 
-一个 `WORKER_ID` 只领一条绑定，一个 AdsPower 环境也不能同时被两条绑定占用。同一台电脑要同时回私信和评论时，建两个环境、两个进程：
+一个绑定仍对应一个 AdsPower 环境，同一个环境不能同时被两条绑定占用。私信和评论要各用一个环境。这些环境由一个调度进程拉起，不用为每条绑定单独敲命令：
 
 ```powershell
 cd workers
-.\run_assigned.ps1
+.\run_fleet.ps1
 ```
 
-脚本在进程退出后隔 5 秒再拉起。没有绑定时进程保持空闲并上报环境列表。账号页改了环境或停用后，约 60 秒进程会退出并按新绑定重新打开。
+先停掉已经在跑的 `run_assigned.py`，避免和调度器抢同一个环境。调度器上报本机环境列表；账号页保存绑定后，它按绑定拉起 `run_assigned.py`。停用或删除绑定后，对应子进程会退出并关闭那个环境。调度器本身退出时，子进程一起退出。机器内存不够时，在 `.env.local` 设置 `FLEET_MAX`，多出来的绑定排队。单账号调试仍可单独跑 `python run_assigned.py`，不要和调度器同时领同一条绑定。
 
 ### 12.2 上线顺序
 
 1. 部署后端。AI 总开关和评论自动回复先保持关闭。用原来的地址和密钥做一次知你快回连接测试。
-2. 启动 `python run_assigned.py`。还没有绑定时进程保持空闲并上报本机 AdsPower 环境，不会退出。
-3. 打开「账号」页。新建时选择平台、职责和已经出现的 AdsPower 环境。不用填写账号名、`WORKER_ID` 或 `rpa_account`。只有一个空闲进程时自动用它。
-4. 保存后进程打开该环境。页面上读到登录名后，表格里的「待确认」会改成这个抖音或小红书账号名。
+2. 启动 `python run_fleet.py`。还没有绑定时它只上报本机 AdsPower 环境，不会打开浏览器。
+3. 打开「账号」页。新建时选择平台、职责和已经出现的 AdsPower 环境。不用填写账号名、`WORKER_ID` 或 `rpa_account`。可以连续建多条绑定。
+4. 保存后调度器打开对应环境。页面上读到登录名后，表格里的「待确认」会改成这个抖音或小红书账号名。若打开时还是登录页，在窗口里登录即可，Worker 会重新自检并开始收发。
 5. 关掉飞鸽、企业号、千帆自带的自动回复。运行 `python doctor.py`。选择器未通过前不要打开自动回复。
 6. 用测试号发一条私信和一条评论。不是本系统发布的作品，评论也会按账号登记后再回复。确认平台侧能看到回复，且两个环境不串号。
 7. 再打开 AI 总开关和评论自动回复。知识库里先有价格、流程和资料清单。

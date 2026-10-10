@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, appBase, RpaFailedMessage, RpaWorker } from '../../api/client'
 import { toast } from '../../components/ui/toast'
+import { useAuth } from '../../store'
 
 const INTEGRATIONS = [
   { key: 'llm', label: 'LLM（对话模型）' },
@@ -14,9 +15,12 @@ const INTEGRATIONS = [
 ]
 
 export default function ChannelSettings() {
+  const { agent } = useAuth()
+  const isAdmin = agent?.role === 'admin'
   const [health, setHealth] = useState<Record<string, any>>({})
   const [rpaWorkers, setRpaWorkers] = useState<RpaWorker[]>([])
   const [rpaFailed, setRpaFailed] = useState<RpaFailedMessage[]>([])
+  const [accountType, setAccountType] = useState('feige')
 
   const load = async () => {
     setHealth(await api.health())
@@ -26,6 +30,19 @@ export default function ChannelSettings() {
     } catch {
       setRpaWorkers([])
       setRpaFailed([])
+    }
+    try {
+      setAccountType((await api.getDouyinAccountType()).account_type)
+    } catch { /* 忽略 */ }
+  }
+
+  const changeAccountType = async (next: string) => {
+    try {
+      const saved = await api.setDouyinAccountType(next)
+      setAccountType(saved.account_type)
+      toast.success(next === 'enterprise' ? '已改为企业号，私信将打开 e.douyin.com' : '已改为抖店飞鸽')
+    } catch (e: any) {
+      toast.error(e.message || '保存失败')
     }
   }
 
@@ -57,6 +74,21 @@ export default function ChannelSettings() {
       </div>
 
       <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
+        <div className="flex items-center justify-between gap-4 mb-4">
+          <div>
+            <div className="text-sm font-medium text-gray-700 dark:text-gray-200">抖音账号类型</div>
+            <p className="text-xs text-gray-400 mt-1">企业号私信打开 e.douyin.com。评论页不变。全站抖音私信共用这一项，已有私信绑定会改去对应后台。</p>
+          </div>
+          <select
+            value={accountType}
+            disabled={!isAdmin}
+            onChange={(e) => changeAccountType(e.target.value)}
+            className="text-sm border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2"
+          >
+            <option value="feige">抖店飞鸽</option>
+            <option value="enterprise">企业号</option>
+          </select>
+        </div>
         <div className="flex items-center justify-between mb-4">
           <div className="text-sm font-medium text-gray-700 dark:text-gray-200">RPA 通道（Worker 状态，按店铺账号分组）</div>
           <a href="https://github.com" className="text-xs text-blue-500 hover:underline" onClick={(e) => e.preventDefault()}>

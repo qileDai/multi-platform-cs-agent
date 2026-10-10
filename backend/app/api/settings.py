@@ -5,14 +5,14 @@
 """
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..config import settings
 from ..core import audit
-from ..core.runtime_settings import persist
+from ..core.runtime_settings import ACCOUNT_TYPES, persist, persist_text
 from ..database import get_db
-from ..models import Agent, AuditLog
+from ..models import AccountBinding, Agent, AuditLog
 from ..schemas import AutoSwitchesIn, AutoSwitchesOut
 from .deps import get_current_agent, require_admin
 from sqlalchemy.orm import Session
@@ -75,6 +75,46 @@ def set_auto_switches(req: AutoSwitchesIn, agent: Agent = Depends(require_admin)
     return AutoSwitchesOut(
         comment_auto_reply_enabled=settings.comment_auto_reply_enabled,
         publish_auto_enabled=settings.publish_auto_enabled)
+
+
+class DouyinAccountTypeOut(BaseModel):
+    account_type: str
+
+
+class DouyinAccountTypeIn(BaseModel):
+    account_type: str
+
+
+_DM_DRIVER = {"feige": "douyin_feige", "enterprise": "douyin_enterprise"}
+
+
+@router.get("/douyin-account-type", response_model=DouyinAccountTypeOut)
+def get_douyin_account_type(_: Agent = Depends(get_current_agent)):
+    return DouyinAccountTypeOut(account_type=settings.douyin_account_type)
+
+
+@router.put("/douyin-account-type", response_model=DouyinAccountTypeOut)
+def set_douyin_account_type(req: DouyinAccountTypeIn, agent: Agent = Depends(require_admin),
+                            db: Session = Depends(get_db)):
+    """全站抖音私信共用这一项：飞鸽或企业号，并改写已有私信绑定的 driver。"""
+    account_type = (req.account_type or "").strip()
+    if account_type not in ACCOUNT_TYPES:
+        raise HTTPException(400, "账号类型只能是 feige 或 enterprise")
+    settings.douyin_account_type = account_type
+    persist_text(db, "douyin_account_type", account_type)
+    driver = _DM_DRIVER[account_type]
+    rows = (
+        db.query(AccountBinding)
+        .filter(AccountBinding.duty == "dm",
+                AccountBinding.driver.in_(tuple(_DM_DRIVER.values())))
+        .all()
+    )
+    for row in rows:
+        row.driver = driver
+    db.commit()
+    audit.log(db, agent, "douyin_account_type", target="settings:douyin_account_type",
+              detail=f"{account_type}，已更新 {len(rows)} 条私信绑定")
+    return DouyinAccountTypeOut(account_type=account_type)
 
 
 # ============ 品牌语气（Phase 7：创作提示词注入品牌风格指南） ============

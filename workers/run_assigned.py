@@ -69,13 +69,17 @@ async def wait_for_assignment(cfg: WorkerConfig) -> WorkerConfig:
             if data.get("bound"):
                 return _apply_bound(cfg, data)
             profiles = []
+            ads_error = ""
             try:
                 profiles = await AdsPowerClient(
                     cfg.adspower_api_base, cfg.adspower_api_key,
                 ).list_profiles()
-            except Exception:  # noqa: BLE001
-                logger.debug("读取 AdsPower 环境列表失败", exc_info=True)
-            await client.heartbeat("idle", meta={"browser_profiles": profiles, "binding_id": 0})
+            except Exception as exc:  # noqa: BLE001
+                ads_error = str(exc)[:200]
+                logger.warning("读取 AdsPower 环境列表失败: %s", ads_error)
+            await client.heartbeat("idle", meta={
+                "browser_profiles": profiles, "binding_id": 0, "ads_error": ads_error,
+            })
             if not announced:
                 logger.info("Worker %s 空闲，等待账号页绑定", cfg.worker_id)
                 announced = True

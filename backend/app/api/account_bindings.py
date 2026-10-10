@@ -100,7 +100,11 @@ def _check_conflicts(db: Session, *, worker_id: str, profile_id: str, provider: 
     if provider == "adspower" and profile_id:
         taken = q.filter(AccountBinding.adspower_profile_id == profile_id).first()
         if taken:
-            raise HTTPException(409, f"AdsPower 环境 {profile_id} 已被绑定 #{taken.id} 占用")
+            raise HTTPException(
+                409,
+                f"AdsPower 环境 {profile_id} 已被绑定 #{taken.id} 占用。"
+                "同一个环境同一时间只能做一个职责，私信和评论要各用一个环境",
+            )
 
 
 def _validate(db: Session, *, account_id: int, duty: str, driver: str, provider: str,
@@ -172,7 +176,8 @@ def overview(_: Agent = Depends(get_current_agent), db: Session = Depends(get_db
                 "status": w.status,
                 "account": w.account,
                 "platform": w.platform,
-                "browser_profiles": ((w.meta or {}).get("browser_profiles") or [])[:100],
+                "browser_profiles": ((w.meta or {}).get("browser_profiles") or [])[:500],
+                "ads_error": (w.meta or {}).get("ads_error") or "",
             }
             for w in workers
         ],
@@ -226,15 +231,9 @@ def create_from_profile(req: FromProfileIn, agent: Agent = Depends(require_admin
     if not profile_id:
         raise HTTPException(400, "请选择 AdsPower 环境")
     worker_id = req.worker_id.strip()
-    idle = _idle_workers(db)
     if not worker_id:
-        if len(idle) == 1:
-            worker_id = idle[0].worker_id
-        elif not idle:
-            raise HTTPException(400, "请先启动 run_assigned.py")
-        else:
-            raise HTTPException(400, "有多个空闲进程，请选择其中一个")
-    elif worker_id not in {item.worker_id for item in idle}:
+        worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+    elif worker_id not in {item.worker_id for item in _idle_workers(db)}:
         raise HTTPException(400, "所选进程不在空闲状态")
     rpa_account = f"ads-{profile_id}"[:64]
     account = db.query(MatrixAccount).filter(MatrixAccount.rpa_account == rpa_account).first()
@@ -342,6 +341,24 @@ def update_binding(binding_id: int, req: BindingUpdate, agent: Agent = Depends(r
     audit.log(db, agent, "binding_update", target=f"binding:{row.id}",
               detail=f"{account.account_name} {row.duty} {row.driver} status={row.auth_status}")
     return _out(db, row, account)
+
+
+@router.post("/{binding_id}/reopen")
+def request_reopen(binding_id: int, agent: Agent = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """让正在跑的 Worker 关掉当前窗口并用有界面方式重新打开，方便再次登录。"""
+    row = db.get(AccountBinding, binding_id)
+    if row is None:
+        raise HTTPException(404, "绑定不存在")
+    if not is_enabled(row.auth_status) and row.auth_status != "login_expired":
+        raise HTTPException(400, "停用的绑定不能重新打开")
+    row.reopen_requested = 1
+    if row.auth_status == "authorized":
+        row.auth_status = "pending_login"
+    db.commit()
+    audit.log(db, agent, "binding_reopen", target=f"binding:{row.id}",
+              detail=row.worker_id or "")
+    return {"ok": True}
 
 
 @router.delete("/{binding_id}")

@@ -47,6 +47,10 @@ class AssignmentChanged(Exception):
     """授权页改了绑定或停用了，进程应退出并由外部脚本重新拉起。"""
 
 
+class ReopenBrowser(Exception):
+    """账号页要求重新打开浏览器，方便再次登录。"""
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -136,6 +140,7 @@ class WorkerConfig:
     binding_id: int = 0
     driver_name: str = ""
     msg_types: str = ""        # 逗号分隔；空 = 拉取该账号全部 outbox（旧进程）
+    report_profiles: bool = True
 
     @property
     def backend_platform(self) -> str:
@@ -189,6 +194,7 @@ class WorkerConfig:
             adspower_api_key=os.environ.get("ADSPOWER_API_KEY", "").strip(),
             adspower_profile_id=os.environ.get("ADSPOWER_PROFILE_ID", "").strip(),
             msg_types=os.environ.get("MSG_TYPES", "").strip(),
+            report_profiles=os.environ.get("REPORT_PROFILES", "1").strip().lower() not in ("0", "false", "no"),
         )
         if not cfg.rpa_key:
             raise SystemExit("未配置 RPA_API_KEY（.env.local），请先运行 setup 并填写")
@@ -208,18 +214,29 @@ class BackendClient:
             base_url=cfg.backend_url,
             headers={"X-Rpa-Key": cfg.rpa_key},
             timeout=30,
+            trust_env=False,
         )
 
     async def close(self):
         await self._client.aclose()
 
-    async def heartbeat(self, status: str, meta: dict | None = None, dry_run: bool = False):
-        await self._client.post("/api/rpa/heartbeat", json={
+    async def heartbeat(self, status: str, meta: dict | None = None, dry_run: bool = False) -> dict:
+        resp = await self._client.post("/api/rpa/heartbeat", json={
             "worker_id": self.cfg.worker_id, "account": self.cfg.account,
             "platform": self.cfg.backend_platform, "status": status,
             "meta": {**(meta or {}), "driver_platform": self.cfg.platform},
             "dry_run": dry_run,
         })
+        resp.raise_for_status()
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    async def ack_reopen(self):
+        resp = await self._client.post("/api/rpa/reopen-ack", params={"worker_id": self.cfg.worker_id})
+        resp.raise_for_status()
 
     async def pull_outbox(self, limit: int = 5) -> list[dict]:
         params = {
@@ -421,6 +438,7 @@ class BaseWorker:
         self.status = "offline"
         self._paused = False
         self._debug_file = ""
+        self._ads_error = ""
         self._profiles: list[dict] = []
         self._hb_ticks = 0
 
@@ -467,6 +485,11 @@ class BaseWorker:
             logger.exception("页面自检异常")
             status = "selector_mismatch"
             logger.error("自检异常详情: %s", exc)
+        if hasattr(self.driver, "dismiss_blockers"):
+            try:
+                await self.driver.dismiss_blockers(page)
+            except Exception:  # noqa: BLE001
+                logger.debug("关闭挡板失败", exc_info=True)
         await self._set_status(status)
         if status == "selector_mismatch":
             await self._dump_page(page)
@@ -514,9 +537,21 @@ class BaseWorker:
 
     # ---- 主循环 ----
     async def run(self):
+        Path(self.cfg.download_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            while True:
+                try:
+                    await self._run_session()
+                    return
+                except ReopenBrowser:
+                    self.cfg.headless = False
+                    logger.info("按账号页要求重新打开浏览器")
+        finally:
+            await self.backend.close()
+
+    async def _run_session(self):
         from browser_session import open_session
 
-        Path(self.cfg.download_dir).mkdir(parents=True, exist_ok=True)
         async with async_playwright() as pw:
             try:
                 session = await open_session(pw, self.cfg)
@@ -527,7 +562,6 @@ class BaseWorker:
                     await self.backend.heartbeat("browser_unavailable", meta=await self._heartbeat_meta())
                 except Exception:  # noqa: BLE001
                     logger.exception("上报浏览器不可用失败")
-                await self.backend.close()
                 raise SystemExit(f"浏览器启动失败：{exc}") from exc
             page = session.page
             try:
@@ -543,17 +577,20 @@ class BaseWorker:
                 )
             finally:
                 await session.close()
-                await self.backend.close()
 
     async def _heartbeat_meta(self) -> dict:
         self._hb_ticks += 1
-        if self.cfg.browser_provider == "adspower" and (self._hb_ticks == 1 or self._hb_ticks % 6 == 0):
+        if (self.cfg.report_profiles and self.cfg.browser_provider == "adspower"
+                and (self._hb_ticks == 1 or self._hb_ticks % 6 == 0)):
             try:
                 from browser_session import AdsPowerClient
                 client = AdsPowerClient(self.cfg.adspower_api_base, self.cfg.adspower_api_key)
                 self._profiles = await client.list_profiles()
-            except Exception:  # noqa: BLE001
-                logger.exception("读取 AdsPower 环境列表失败")
+            except Exception as exc:  # noqa: BLE001
+                self._ads_error = str(exc)[:200]
+                logger.warning("读取 AdsPower 环境列表失败: %s", self._ads_error)
+            else:
+                self._ads_error = ""
         meta = {
             "driver": self.driver.name,
             "paused": self._paused,
@@ -563,13 +600,22 @@ class BaseWorker:
         if self._debug_file:
             meta["debug_file"] = self._debug_file
         if self._profiles:
-            meta["browser_profiles"] = self._profiles[:100]
+            meta["browser_profiles"] = self._profiles[:500]
+        if getattr(self, "_ads_error", ""):
+            meta["ads_error"] = self._ads_error
         return meta
 
     async def _heartbeat_loop(self):
         while True:
             try:
-                await self.backend.heartbeat(self.status, meta=await self._heartbeat_meta())
+                body = await self.backend.heartbeat(self.status, meta=await self._heartbeat_meta())
+                if isinstance(body, dict) and body.get("reopen"):
+                    ack = getattr(self.backend, "ack_reopen", None)
+                    if ack is not None:
+                        await ack()
+                    raise ReopenBrowser()
+            except ReopenBrowser:
+                raise
             except Exception:  # noqa: BLE001
                 logger.exception("心跳失败")
             await asyncio.sleep(self.cfg.heartbeat_interval)
@@ -598,6 +644,8 @@ class BaseWorker:
     async def _outbound_loop(self, page: Page):
         while True:
             await asyncio.sleep(self.cfg.poll_interval)
+            if self._paused:
+                await self._self_check(page)
             if self._paused:
                 continue
             try:
@@ -634,6 +682,8 @@ class BaseWorker:
     async def _inbound_loop(self, page: Page):
         while True:
             await asyncio.sleep(self.cfg.poll_interval)
+            if self._paused:
+                await self._self_check(page)
             if self._paused:
                 continue
             try:
@@ -746,6 +796,8 @@ class CommentWorker(BaseWorker):
     async def _inbound_loop(self, page: Page):
         while True:
             await asyncio.sleep(self.cfg.poll_interval)
+            if self._paused:
+                await self._self_check(page)
             if self._paused:
                 continue
             try:

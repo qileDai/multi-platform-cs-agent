@@ -333,6 +333,7 @@ class AccountBinding(Base):
     platform_url = Column(String(256), default="")
     auth_status = Column(String(24), default="pending_login")
     # unbound | pending_login | authorized | login_expired | disabled
+    reopen_requested = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

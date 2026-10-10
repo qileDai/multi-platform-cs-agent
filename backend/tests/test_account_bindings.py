@@ -63,6 +63,7 @@ def test_binding_conflict_and_assignment(db, monkeypatch):
             "worker_id": "worker-2",
         })
         assert clash.status_code == 409
+        assert "各用一个环境" in clash.json()["detail"]
 
         headers = {"X-Rpa-Key": "bind-key"}
         assigned = client.get("/api/rpa/assignment", params={"worker_id": "worker-1"}, headers=headers)
@@ -91,6 +92,70 @@ def test_from_profile_names_the_logged_in_account(db, monkeypatch):
 
     monkeypatch.setattr(settings, "rpa_api_key", "bind-key")
     agent = _agent(db)
+    client = TestClient(app)
+    try:
+        created = client.post("/api/account-bindings/from-profile", json={
+            "platform": "xiaohongshu", "duty": "dm",
+            "adspower_profile_id": "p9", "profile_name": "环境甲",
+        })
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert body["worker_id"].startswith("worker-")
+        assert body["worker_id"] != "worker-auto"
+        assert len(body["worker_id"]) == len("worker-") + 8
+        assert body["rpa_account"] == "ads-p9"
+        named = client.post("/api/rpa/identity/self", headers={"X-Rpa-Key": "bind-key"}, json={
+            "worker_id": body["worker_id"], "profile_id": "p9", "account_name": "小红书主号",
+        })
+        assert named.status_code == 200, named.text
+        db.expire_all()
+        account = db.query(models.MatrixAccount).filter_by(rpa_account="ads-p9").one()
+        assert account.account_name == "小红书主号"
+    finally:
+        _clear(db, agent)
+
+
+def test_fleet_lists_only_enabled_bindings(db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr(settings, "rpa_api_key", "bind-key")
+    agent = _agent(db)
+    first = _account(db, name="店1", rpa="shop-fleet-1")
+    second = _account(db, name="店2", rpa="shop-fleet-2")
+    third = _account(db, name="店3", rpa="shop-fleet-3")
+    client = TestClient(app)
+    headers = {"X-Rpa-Key": "bind-key"}
+    try:
+        created = []
+        for account, profile in ((first, "pf-1"), (second, "pf-2"), (third, "pf-3")):
+            resp = client.post("/api/account-bindings", json={
+                "account_id": account.id, "duty": "dm", "driver": "xhs_ark",
+                "provider": "adspower", "adspower_profile_id": profile,
+                "worker_id": f"worker-{profile}",
+            })
+            assert resp.status_code == 200, resp.text
+            created.append(resp.json())
+        stopped = client.put(
+            f"/api/account-bindings/{created[2]['id']}",
+            json={"auth_status": "disabled"},
+        )
+        assert stopped.status_code == 200, stopped.text
+        listed = client.get("/api/rpa/fleet", headers=headers)
+        assert listed.status_code == 200, listed.text
+        bindings = listed.json()["bindings"]
+        assert {item["worker_id"] for item in bindings} >= {"worker-pf-1", "worker-pf-2"}
+        assert "worker-pf-3" not in {item["worker_id"] for item in bindings}
+        assert {item["adspower_profile_id"] for item in bindings} >= {"pf-1", "pf-2"}
+    finally:
+        _clear(db, agent)
+
+
+def test_from_profile_keeps_explicit_idle_worker(db):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    agent = _agent(db)
     db.add(models.RpaWorker(
         worker_id="worker-auto", account="", platform="idle", status="idle",
         last_heartbeat_at=datetime.utcnow(),
@@ -100,18 +165,47 @@ def test_from_profile_names_the_logged_in_account(db, monkeypatch):
     try:
         created = client.post("/api/account-bindings/from-profile", json={
             "platform": "xiaohongshu", "duty": "dm",
-            "adspower_profile_id": "p9", "profile_name": "环境甲",
+            "adspower_profile_id": "p-explicit", "profile_name": "环境乙",
+            "worker_id": "worker-auto",
         })
         assert created.status_code == 200, created.text
         assert created.json()["worker_id"] == "worker-auto"
-        assert created.json()["rpa_account"] == "ads-p9"
-        named = client.post("/api/rpa/identity/self", headers={"X-Rpa-Key": "bind-key"}, json={
-            "worker_id": "worker-auto", "profile_id": "p9", "account_name": "小红书主号",
+    finally:
+        _clear(db, agent)
+
+
+def test_reopen_binding_sets_flag(db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setattr(settings, "rpa_api_key", "bind-key")
+    agent = _agent(db)
+    account = _account(db)
+    client = TestClient(app)
+    headers = {"X-Rpa-Key": "bind-key"}
+    try:
+        created = client.post("/api/account-bindings", json={
+            "account_id": account.id, "duty": "dm", "driver": "xhs_ark",
+            "provider": "adspower", "adspower_profile_id": "profile-9",
+            "worker_id": "worker-reopen",
         })
-        assert named.status_code == 200, named.text
+        assert created.status_code == 200, created.text
+        binding_id = created.json()["id"]
+        resp = client.post(f"/api/account-bindings/{binding_id}/reopen")
+        assert resp.status_code == 200, resp.text
         db.expire_all()
-        account = db.query(models.MatrixAccount).filter_by(rpa_account="ads-p9").one()
-        assert account.account_name == "小红书主号"
+        row = db.get(models.AccountBinding, binding_id)
+        assert row.reopen_requested == 1
+        heart = client.post("/api/rpa/heartbeat", headers=headers, json={
+            "worker_id": "worker-reopen", "account": "shop-a", "platform": "xiaohongshu",
+            "status": "login_expired",
+            "meta": {"binding_id": binding_id, "ads_error": "paid subscriptions"},
+        })
+        assert heart.status_code == 200, heart.text
+        assert heart.json()["reopen"] is True
+        db.expire_all()
+        worker = db.query(models.RpaWorker).filter_by(worker_id="worker-reopen").one()
+        assert worker.meta["ads_error"] == "paid subscriptions"
     finally:
         _clear(db, agent)
 
@@ -145,6 +239,43 @@ def test_outbox_msg_types_and_release(db, monkeypatch):
     assert row.attempts == 0
     still = db.query(models.RpaOutbox).filter_by(account="shop-a", msg_type="text").one()
     assert still.status == "pending"
+
+
+def test_douyin_account_type_persists_and_rewrites_dm_driver(db):
+    from fastapi.testclient import TestClient
+    from app.core.runtime_settings import load_persisted
+    from app.main import app
+
+    agent = _agent(db)
+    account = _account(db, name="抖店", rpa="dy-shop", platform="douyin")
+    client = TestClient(app)
+    original = settings.douyin_account_type
+    try:
+        created = client.post("/api/account-bindings", json={
+            "account_id": account.id, "duty": "dm", "driver": "douyin_feige",
+            "provider": "adspower", "adspower_profile_id": "pf-dy",
+            "worker_id": "worker-dy-type",
+        })
+        assert created.status_code == 200, created.text
+        comment = client.post("/api/account-bindings", json={
+            "account_id": account.id, "duty": "comment", "driver": "douyin_comment",
+            "provider": "adspower", "adspower_profile_id": "pf-dy-c",
+            "worker_id": "worker-dy-comment",
+        })
+        assert comment.status_code == 200, comment.text
+        saved = client.put("/api/settings/douyin-account-type", json={"account_type": "enterprise"})
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["account_type"] == "enterprise"
+        settings.douyin_account_type = "feige"
+        load_persisted(db)
+        assert settings.douyin_account_type == "enterprise"
+        db.expire_all()
+        assert db.get(models.AccountBinding, created.json()["id"]).driver == "douyin_enterprise"
+        assert db.get(models.AccountBinding, comment.json()["id"]).driver == "douyin_comment"
+    finally:
+        settings.douyin_account_type = original
+        client.put("/api/settings/douyin-account-type", json={"account_type": original})
+        _clear(db, agent)
 
 
 def test_switch_persists(db):

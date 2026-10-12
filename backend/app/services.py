@@ -346,6 +346,14 @@ def _save_message(db, conversation_id: int, *, sender_type: str, content: str,
 
 # ============ 出站（守卫 + 频控 + 发送 + 入库 + 广播） ============
 
+def _extra_at_ai_save(sender_type: str, extra: dict | None) -> dict:
+    """AI 气泡入库前复制 extra，并写下从本轮开始到此刻的总耗时。"""
+    if sender_type != "ai":
+        return dict(extra or {})
+    from .agent.engine import refresh_reply_timing
+    return refresh_reply_timing(extra)
+
+
 def is_zhini_conversation(conversation: Conversation | None) -> bool:
     """知你快回入库时把会话号收成 zn: 短键，不能拿去调开放平台或写 RPA。"""
     if conversation is None:
@@ -400,7 +408,8 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
         if is_zhini_conversation(conversation):
             return await _persist_zhini_local(
                 db, conversation, content=filtered, sender_type=sender_type,
-                sender_id=sender_id, msg_type=msg_type, media_id=media_id, extra=extra,
+                sender_id=sender_id, msg_type=msg_type, media_id=media_id,
+                extra=_extra_at_ai_save(sender_type, extra),
             )
 
         # 2. 平台频控（RPA 通道适用更严的专属规则，键为 <platform>_rpa；
@@ -449,19 +458,22 @@ async def send_outbound(conversation_id: int, content: str, *, sender_type: str,
                 except Exception as fallback_exc:  # noqa: BLE001
                     return await _persist_send_failure(
                         db, conversation, content=filtered, sender_type=sender_type,
-                        sender_id=sender_id, msg_type=msg_type, extra=extra,
+                        sender_id=sender_id, msg_type=msg_type,
+                        extra=_extra_at_ai_save(sender_type, extra),
                         error=str(fallback_exc),
                     )
                 extra = {**(extra or {}), "send_fallback": "rpa", "api_error": str(exc)[:200]}
             else:
                 return await _persist_send_failure(
                     db, conversation, content=filtered, sender_type=sender_type,
-                    sender_id=sender_id, msg_type=msg_type, extra=extra, error=str(exc),
+                    sender_id=sender_id, msg_type=msg_type,
+                    extra=_extra_at_ai_save(sender_type, extra), error=str(exc),
                 )
 
-        # 4. 入库 + 广播
+        # 4. 入库 + 广播。总耗时在平台发送返回后写入，每条气泡用一份新的 extra。
         if media_id:
             extra = {**(extra or {}), "media_id": media_id}
+        extra = _extra_at_ai_save(sender_type, extra)
         message = _save_message(
             db, conversation_id, sender_type=sender_type, content=filtered,
             msg_type=msg_type, sender_id=sender_id, platform_msg_id=platform_msg_id,
@@ -479,7 +491,9 @@ async def _persist_zhini_local(db, conversation: Conversation, *, content: str,
                                sender_type: str, sender_id: int | None, msg_type: str,
                                media_id: str, extra: dict | None) -> Message:
     """知你快回事后出站：入库并广播，标明这条没有发到网页。"""
-    payload = {**(extra or {}), "channel": "zhinikuaihui", "not_delivered_to_page": True}
+    payload = _extra_at_ai_save(sender_type, extra)
+    payload["channel"] = "zhinikuaihui"
+    payload["not_delivered_to_page"] = True
     if media_id:
         payload["media_id"] = media_id
     message = _save_message(
@@ -535,7 +549,8 @@ async def record_local_ai_message(conversation_id: int, content: str,
                 conversation_id, conversation.mode, reason, hits,
             )
             return None
-        payload = {**(extra or {}), "channel": "zhinikuaihui"}
+        payload = _extra_at_ai_save("ai", extra)
+        payload["channel"] = "zhinikuaihui"
         if hits:
             payload["filtered_words"] = hits
         message = Message(
@@ -768,7 +783,9 @@ async def _persist_send_failure(db, conversation: Conversation, *, content: str,
                                 sender_id: int | None, msg_type: str, extra: dict | None,
                                 error: str) -> Message:
     """平台没发出去：记下正文和 send_failed，稍后再发这一条，不重跑整段接待。"""
-    payload = {**(extra or {}), "send_failed": True, "send_error": (error or "")[:200]}
+    payload = _extra_at_ai_save(sender_type, extra)
+    payload["send_failed"] = True
+    payload["send_error"] = (error or "")[:200]
     message = _save_message(
         db, conversation.id, sender_type=sender_type, content=content,
         msg_type=msg_type, sender_id=sender_id, extra=payload,

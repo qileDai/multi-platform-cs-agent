@@ -94,24 +94,46 @@ def _add_stage_ms(key: str, elapsed_ms: int) -> None:
 
 
 def _stamp_extra(extra: dict | None) -> dict:
-    """把这一轮各段耗时写进即将发出的消息。没有计时上下文时原样返回。"""
+    """把这一轮各段耗时写进即将发出的消息。总耗时留到入库前再写。"""
     merged = dict(extra or {})
     state = _reply_trace.get()
     if state is None:
         return merged
+    merged["timing"] = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
+    return merged
+
+
+def refresh_reply_timing(extra: dict | None) -> dict:
+    """复制 extra，并在本轮计时里写下到此刻的总耗时。没有计时上下文时只复制。"""
+    merged = dict(extra or {})
+    state = _reply_trace.get()
+    if state is None:
+        return merged
+    timing = dict(merged.get("timing") or {})
+    for key in _STAGE_KEYS:
+        timing.setdefault(key, int(state["stages"].get(key, 0)))
     total_ms = int((time.monotonic() - state["started"]) * 1000)
-    timing = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
     timing["total_ms"] = total_ms
     merged["timing"] = timing
-    if not state["logged"]:
-        state["logged"] = True
-        logger.info(
-            "客服回复耗时 total_ms=%s rewrite_ms=%s embed_ms=%s rerank_ms=%s "
-            "judge_ms=%s draft_ms=%s fallback_ms=%s",
-            timing["total_ms"], timing["rewrite_ms"], timing["embed_ms"], timing["rerank_ms"],
-            timing["judge_ms"], timing["draft_ms"], timing["fallback_ms"],
-        )
+    merged["reply_ms"] = total_ms
     return merged
+
+
+def _log_reply_timing() -> None:
+    """一条回答结束时打一次总耗时。没入库的尝试也记这一行。"""
+    state = _reply_trace.get()
+    if state is None or state.get("logged"):
+        return
+    state["logged"] = True
+    total_ms = int((time.monotonic() - state["started"]) * 1000)
+    stages = state["stages"]
+    logger.info(
+        "客服回复耗时 total_ms=%s rewrite_ms=%s embed_ms=%s rerank_ms=%s "
+        "judge_ms=%s draft_ms=%s fallback_ms=%s",
+        total_ms, int(stages.get("rewrite_ms", 0)), int(stages.get("embed_ms", 0)),
+        int(stages.get("rerank_ms", 0)), int(stages.get("judge_ms", 0)),
+        int(stages.get("draft_ms", 0)), int(stages.get("fallback_ms", 0)),
+    )
 
 
 def _abandon_draft(task: asyncio.Task | None) -> None:
@@ -490,7 +512,6 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     }
     if tool_names_used:
         extra["tool_calls"] = tool_names_used
-    extra["reply_ms"] = int((time.monotonic() - started) * 1000)
     if messages:
         text, sent = await _deliver_ai(
             conversation_id_, messages, local=local, allow_owned=owned, extra=extra,
@@ -1243,6 +1264,18 @@ async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
                       anchor_user_message_id: int | None = None) -> tuple[str, bool]:
     """发出 AI 正文。返回 (给调用方的文本, 是否至少有一条真正发出或入库)。"""
     extra = _stamp_extra(extra)
+    try:
+        return await _deliver_ai_body(
+            conversation_id, messages, extra=extra, local=local, allow_owned=allow_owned,
+            anchor_user_message_id=anchor_user_message_id,
+        )
+    finally:
+        _log_reply_timing()
+
+
+async def _deliver_ai_body(conversation_id: int, messages: list[str], *, extra: dict,
+                           local: bool, allow_owned: bool,
+                           anchor_user_message_id: int | None) -> tuple[str, bool]:
     parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
     if not parts:
         return "", False
@@ -1262,7 +1295,7 @@ async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
         ok = sent is not None and not (sent.extra or {}).get("send_failed")
         shown = parts[0] if allow_owned or ok else ""
         return shown, ok
-    ok = await _send_replies(conversation_id, parts, extra or {}, allow_owned=allow_owned)
+    ok = await _send_replies(conversation_id, parts, extra, allow_owned=allow_owned)
     shown = "\n".join(parts) if allow_owned or ok else ""
     return shown, ok
 
@@ -1281,12 +1314,12 @@ async def _send_replies(conversation_id: int, messages: list[str], extra: dict,
         if i > 0:
             await asyncio.sleep(humanize.typing_delay_ms(chunks[i - 1]) / 1000)
         sent = await send_outbound(
-            conversation_id, chunk, sender_type="ai", extra=extra, allow_owned=allow_owned)
+            conversation_id, chunk, sender_type="ai", extra=dict(extra), allow_owned=allow_owned)
         if sent is None:
             return delivered
         if (sent.extra or {}).get("send_failed"):
             for rest in chunks[i + 1:]:
-                await save_unsent_outbound(conversation_id, rest, extra=extra)
+                await save_unsent_outbound(conversation_id, rest, extra=dict(extra))
             return delivered
         delivered = True
     return delivered

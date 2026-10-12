@@ -40,6 +40,15 @@ export interface Message {
     reflection?: { action?: string; issues?: string[] } | null
     handoff_reason?: string
     reply_ms?: number
+    timing?: {
+      total_ms?: number
+      rewrite_ms?: number
+      embed_ms?: number
+      rerank_ms?: number
+      judge_ms?: number
+      draft_ms?: number
+      fallback_ms?: number
+    }
     filtered_words?: string[]
     media_id?: string
     asr?: boolean

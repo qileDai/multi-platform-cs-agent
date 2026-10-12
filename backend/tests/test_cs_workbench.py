@@ -1,5 +1,6 @@
 """客服工作台：分配上限、回头客、RAG 未命中硬转人工。"""
 import asyncio
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -367,6 +368,36 @@ async def test_pure_greeting_stays_with_ai(db, conversation, monkeypatch):
         Message.conversation_id == conversation.id,
         Message.content == "这条没对上资料，需要人工回复",
     ).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_reply_total_includes_send_wait(db, conversation, monkeypatch):
+    """总耗时在平台发送返回之后才写入，所以不小于这次发送等待。"""
+    send_ms = 0
+
+    class SlowAdapter:
+        async def send(self, *_args, **_kwargs):
+            nonlocal send_ms
+            started = time.monotonic()
+            await asyncio.sleep(0.05)
+            send_ms = int((time.monotonic() - started) * 1000)
+            return "slow-out"
+
+    monkeypatch.setattr("app.services.get_send_adapter", lambda _platform: SlowAdapter())
+    db.add(Message(conversation_id=conversation.id, sender_type="user", msg_type="text", content="你好"))
+    db.commit()
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    ai = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
+        .one()
+    )
+    assert send_ms > 0
+    assert ai.extra["timing"]["total_ms"] >= send_ms
+    assert ai.extra["reply_ms"] == ai.extra["timing"]["total_ms"]
+    assert ai.extra["timing"]["draft_ms"] == 0
 
 
 @pytest.mark.asyncio

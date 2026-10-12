@@ -263,6 +263,80 @@ class TestZhiniContract:
         assert resp.status_code == 200
         assert resp.json()["action"] == "skip"
 
+    def test_skip_when_our_reply_is_later_than_the_customer_message(self, zhini_key):
+        """手动点开已回过的私信时，最后一条是自己发的，不入库也不生成。"""
+        body = _body()
+        trigger = body["message"]
+        body["messages"] = [
+            dict(trigger),
+            {
+                "id": "ours-later",
+                "text": "这条是我回的",
+                "direction": "outgoing",
+                "sender_id": "shop-account",
+                "sender_name": "客服",
+                "timestamp": int(trigger["timestamp"]) + 1000,
+                "type": "text",
+            },
+        ]
+        db = SessionLocal()
+        try:
+            before_messages = db.query(Message).count()
+            before_customers = db.query(Customer).count()
+        finally:
+            db.close()
+        with patch("app.integrations.zhinikuaihui.process_ai_reply", new_callable=AsyncMock) as generate:
+            resp = client.post(
+                "/api/integrations/zhinikuaihui/reply",
+                json=body,
+                headers=_auth(zhini_key),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "skip"
+        assert resp.json()["reason"] == "没有新的客户消息"
+        generate.assert_not_called()
+        db = SessionLocal()
+        try:
+            assert db.query(Message).count() == before_messages
+            assert db.query(Customer).count() == before_customers
+        finally:
+            db.close()
+
+    def test_reply_when_customer_message_is_later_than_our_reply(self, zhini_key):
+        """自己回过之后客户又发了新消息，最后一条是客户的，仍然回复。"""
+        body = _body()
+        trigger = body["message"]
+        trigger_ts = int(trigger["timestamp"])
+        body["messages"] = [
+            {
+                "id": "older-customer",
+                "text": "在吗",
+                "direction": "incoming",
+                "sender_id": body["customer_id"],
+                "timestamp": trigger_ts - 2000,
+                "type": "text",
+            },
+            {
+                "id": "ours-earlier",
+                "text": "在的",
+                "direction": "outgoing",
+                "sender_id": "shop-account",
+                "timestamp": trigger_ts - 1000,
+                "type": "text",
+            },
+        ]
+        with patch("app.integrations.zhinikuaihui.process_ai_reply", new_callable=AsyncMock) as generate:
+            generate.return_value = "继续回复"
+            resp = client.post(
+                "/api/integrations/zhinikuaihui/reply",
+                json=body,
+                headers=_auth(zhini_key),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "reply"
+        assert resp.json()["reply"] == "继续回复"
+        generate.assert_awaited()
+
 
 def _zhini_conversation(db, *, mode: str = "human"):
     uid = uuid.uuid4().hex[:8]

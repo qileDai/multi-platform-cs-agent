@@ -495,6 +495,27 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     messages = kept[:3]
     if len(retrieval.facets) < 2 and len(messages) > 1:
         messages = ["\n".join(messages)]
+    # #region agent log
+    try:
+        import json as _json
+        _lead = "清单我按资料发你"
+        _parts = [{
+            "length": len(part),
+            "leads": part.count(_lead),
+            "item1": part.count("1、"),
+        } for part in messages]
+        with open(r"D:\projects\multi-platform-cs-agent\debug-c4447d.log", "a", encoding="utf-8") as _handle:
+            _handle.write(_json.dumps({
+                "sessionId": "c4447d",
+                "hypothesisId": "C",
+                "location": "engine.py:_process_ai_reply_impl",
+                "message": "reply parts before deliver",
+                "data": {"parts": len(messages), "shapes": _parts},
+                "timestamp": int(time.time() * 1000),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
     citations = _citation_payload(retrieval.contexts)
     must_handoff = bool(reply.handoff) or shop_gap
     extra = {

@@ -124,6 +124,8 @@ async def _handle_reply(body: dict, started: float) -> dict:
     direction = message.get("direction") or "incoming"
     if direction != "incoming" or not text:
         return _log_outcome(started, _skip("没有需要回复的客户消息"))
+    if not _last_message_needs_reply(body, message):
+        return _log_outcome(started, _skip("没有新的客户消息"))
 
     request_id = str(body.get("request_id") or message.get("id") or "").strip()
     if not request_id:
@@ -176,6 +178,9 @@ async def _handle_reply(body: dict, started: float) -> dict:
     async with lock:
         reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
     reply_text = await prepare_plugin_reply((reply_text or "").strip()[:4000])
+    # #region agent log
+    _debug_log("B", "zhinikuaihui.py:_handle_reply", "reply returned to plugin", _debug_reply_shape(reply_text))
+    # #endregion
     if not reply_text:
         await _note_skip(conversation_id, "没有可发送的回复")
         return _log_outcome(started, _skip("没有可发送的回复"),
@@ -300,23 +305,77 @@ async def _shorten_written_reply(text: str) -> str:
         return ""
 
 
+def _debug_reply_shape(text: str) -> dict:
+    """只记长度和导语是否成对，不记正文。"""
+    raw = text or ""
+    collapsed = _collapse_leading_leads(raw)
+    lead = _LIST_LEAD
+    first = collapsed.find(lead)
+    second = collapsed.find(lead, first + len(lead)) if first >= 0 else -1
+    same = None
+    if second >= 0:
+        head = collapsed[first + len(lead):second]
+        tail = collapsed[second + len(lead):]
+        same = _same_notice(head, tail)
+    return {
+        "length": len(raw),
+        "leads": raw.count(lead),
+        "second_lead": second >= 0,
+        "halves_same": same,
+    }
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # #region agent log
+    try:
+        import json
+        payload = {
+            "sessionId": "c4447d",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(r"D:\projects\multi-platform-cs-agent\debug-c4447d.log", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
 async def prepare_plugin_reply(text: str) -> str:
     """交给插件前去掉重复份。去重后仍超过 500 字，再把这段长回复缩短。"""
+    # #region agent log
+    _debug_log("A", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply before dedupe", _debug_reply_shape(text))
+    # #endregion
     cleaned = dedupe_plugin_reply(text)
     if len(cleaned) <= REPLY_CHAR_LIMIT:
+        # #region agent log
+        _debug_log("A", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply after dedupe under limit", _debug_reply_shape(cleaned))
+        # #endregion
         return cleaned
     brief = await _shorten_written_reply(cleaned)
     brief = dedupe_plugin_reply(brief)
     if brief and len(brief) <= REPLY_CHAR_LIMIT:
         logger.info("知你快回长回复已缩短 before=%s after=%s", len(cleaned), len(brief))
+        # #region agent log
+        _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply after shorten", _debug_reply_shape(brief))
+        # #endregion
         return brief
     if brief and len(brief) > REPLY_CHAR_LIMIT:
         cut = _cut_complete(brief)
         if cut:
             logger.info("知你快回缩短结果仍超长，改按条目截断 after=%s", len(cut))
+            # #region agent log
+            _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply cut after shorten", _debug_reply_shape(cut))
+            # #endregion
             return cut
     cut = _cut_complete(cleaned)
     logger.info("知你快回长回复缩短失败，改按条目截断 after=%s", len(cut))
+    # #region agent log
+    _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply cut original", _debug_reply_shape(cut))
+    # #endregion
     return cut
 
 
@@ -459,6 +518,53 @@ def _persist(body: dict, platform: str, raw_platform: str, request_key: str, tex
     finally:
         db.close()
     return conversation_id, mode, status, trigger
+
+
+_OUR_DIRECTIONS = {"outgoing", "out", "sent"}
+
+
+def _message_timestamp(item: dict) -> int:
+    try:
+        return int(item.get("timestamp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_customer_message(item: dict, customer_id: str) -> bool:
+    """最后一条要有正文，并且是客户发的，才值得回复。"""
+    if not str(item.get("text") or "").strip():
+        return False
+    direction = str(item.get("direction") or "").strip().lower()
+    if direction in _OUR_DIRECTIONS:
+        return False
+    if direction == "incoming":
+        return True
+    if direction:
+        return False
+    sender = str(item.get("sender_id") or "").strip()
+    customer = (customer_id or "").strip()
+    if sender and customer and sender != customer:
+        return False
+    return True
+
+
+def _ordered_thread(body: dict, trigger: dict) -> list[dict]:
+    """历史加触发消息。有时间戳就按时间排，否则保持插件顺序。"""
+    history = body.get("messages") if isinstance(body.get("messages"), list) else []
+    items = [item for item in history if isinstance(item, dict)]
+    if trigger and not any(_same_trigger(item, trigger) for item in items):
+        items.append(trigger)
+    if any(_message_timestamp(item) for item in items):
+        items = sorted(items, key=_message_timestamp)
+    return items
+
+
+def _last_message_needs_reply(body: dict, trigger: dict) -> bool:
+    items = _ordered_thread(body, trigger)
+    if not items:
+        return False
+    customer_id = str(body.get("customer_id") or trigger.get("sender_id") or "")
+    return _is_customer_message(items[-1], customer_id)
 
 
 def _same_trigger(item: dict, trigger: dict) -> bool:

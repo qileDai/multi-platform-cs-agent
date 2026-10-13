@@ -11,6 +11,7 @@ import Dashboard from './pages/Dashboard'
 import Funnel from './pages/Funnel'
 import Inspiration from './pages/Inspiration'
 import Knowledge from './pages/Knowledge'
+import Leads from './pages/Leads'
 import Login from './pages/Login'
 import MockPanel from './pages/MockPanel'
 import PublishCalendar from './pages/PublishCalendar'
@@ -47,6 +48,7 @@ export default function App() {
           <Route path="/" element={<Workbench />} />
           <Route path="/knowledge" element={<Knowledge />} />
           <Route path="/tickets" element={<Tickets />} />
+          <Route path="/leads" element={<Leads />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts />} />
           <Route path="/studio" element={<ContentStudio />} />

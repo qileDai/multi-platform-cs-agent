@@ -207,6 +207,16 @@ class DocStatusUpdate(BaseModel):
     status: str  # active | disabled
 
 
+class DocBatchIn(BaseModel):
+    ids: list[int]
+    action: Literal["active", "disabled", "delete"]
+
+
+class DocBatchOut(BaseModel):
+    updated: int
+    failed_ids: list[int]
+
+
 class KnowledgeChunkOut(BaseModel):
     id: int
     chunk_index: int
@@ -230,6 +240,25 @@ class KnowledgeDocOut(BaseModel):
     updated_at: datetime
 
 
+class DialogImportOut(BaseModel):
+    imported: int
+    created: int
+    updated: int
+    skipped_invalid: int
+    skipped_missed: int
+    gap_count: int
+    gap_titles: list[str]
+
+
+class FaqPackOut(BaseModel):
+    applied: bool
+    created: int
+    content_updated: int
+    enabling: int
+    disabling_active: int
+    skipped_ambiguous: list[str]
+
+
 class RecallTestRequest(BaseModel):
     query: str
 
@@ -241,6 +270,21 @@ class RecallTestResult(BaseModel):
     threshold: float
     passed: bool
     degraded: bool = False  # 是否处于纯 BM25 降级模式
+
+
+class LeadCaptureOut(BaseModel):
+    id: int
+    customer_id: int
+    conversation_id: int
+    platform: str
+    contact: str
+    contact_type: str
+    nickname: str
+    business: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class MissedQuestionOut(BaseModel):

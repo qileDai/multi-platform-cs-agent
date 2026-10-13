@@ -45,6 +45,24 @@ class Customer(Base):
     conversations = relationship("Conversation", back_populates="customer")
 
 
+class LeadCapture(Base):
+    """一次留资。同一会话同一号码不重复。"""
+    __tablename__ = "lead_captures"
+    __table_args__ = (
+        Index("ix_lead_captures_conv_contact", "conversation_id", "contact", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    platform = Column(String(16), default="", index=True)
+    contact = Column(String(64), nullable=False)
+    contact_type = Column(String(16), default="phone")  # phone | wechat
+    nickname = Column(String(64), default="")
+    business = Column(String(64), default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Conversation(Base):
     """会话。mode: ai(AI接待) | human(人工接待) | pending(排队待人工)；status: open | closed。"""
     __tablename__ = "conversations"

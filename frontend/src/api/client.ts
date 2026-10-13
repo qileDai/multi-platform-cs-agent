@@ -9,6 +9,18 @@ export interface Agent {
   max_concurrent?: number
 }
 
+export interface LeadCapture {
+  id: number
+  customer_id: number
+  conversation_id: number
+  platform: string
+  contact: string
+  contact_type: string
+  nickname: string
+  business: string
+  created_at: string
+}
+
 export interface Customer {
   id: number
   platform: string
@@ -125,6 +137,30 @@ export interface KnowledgeDoc {
   hit_count?: number
   created_at: string
   updated_at: string
+}
+
+export interface DialogImportResult {
+  imported: number
+  created: number
+  updated: number
+  skipped_invalid: number
+  skipped_missed: number
+  gap_count: number
+  gap_titles: string[]
+}
+
+export interface DocBatchResult {
+  updated: number
+  failed_ids: number[]
+}
+
+export interface FaqPackResult {
+  applied: boolean
+  created: number
+  content_updated: number
+  enabling: number
+  disabling_active: number
+  skipped_ambiguous: string[]
 }
 
 export interface MissedQuestion {
@@ -585,6 +621,36 @@ export function setToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY)
 }
 
+/** 下载 FAQ 表。request() 会把成功响应当 JSON 解析，文件要单独走。 */
+export async function downloadFaqPack(): Promise<void> {
+  const token = getToken()
+  const resp = await fetch(`${appBase()}/api/knowledge/faq/export`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (resp.status === 401) {
+    setToken(null)
+    window.location.href = `${appBase()}/login`
+    throw new Error('未登录')
+  }
+  if (!resp.ok) {
+    const text = await resp.text()
+    let detail = text
+    try {
+      detail = JSON.parse(text).detail || text
+    } catch { /* 保留原文 */ }
+    throw new Error(detail)
+  }
+  const blob = await resp.blob()
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'faq.xlsx'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
   const headers: Record<string, string> = {
@@ -734,12 +800,28 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+  batchDocs: (ids: number[], action: 'active' | 'disabled' | 'delete') =>
+    request<DocBatchResult>('/api/knowledge/docs/batch', {
+      method: 'POST',
+      body: JSON.stringify({ ids, action }),
+    }),
   listChunks: (id: number) => request<KnowledgeChunk[]>(`/api/knowledge/docs/${id}/chunks`),
   deleteDoc: (id: number) => request(`/api/knowledge/docs/${id}`, { method: 'DELETE' }),
   uploadDoc: (file: File) => {
     const form = new FormData()
     form.append('file', file)
     return request<KnowledgeDoc>('/api/knowledge/upload', { method: 'POST', body: form })
+  },
+  importDialogs: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<DialogImportResult>('/api/knowledge/import-dialogs', { method: 'POST', body: form })
+  },
+  importFaqPack: (file: File, apply: boolean) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('apply', apply ? 'true' : 'false')
+    return request<FaqPackResult>('/api/knowledge/faq/import', { method: 'POST', body: form })
   },
   recallTest: (query: string) =>
     request<RecallTestResult>('/api/knowledge/recall-test', {
@@ -810,6 +892,10 @@ export const api = {
   // tickets
   listTickets: (status = '', page = 1) =>
     request<{ total: number; items: Ticket[] }>(`/api/tickets?status=${status}&page=${page}`),
+  listLeads: (q = '', platform = '', page = 1) =>
+    request<{ total: number; items: LeadCapture[] }>(
+      `/api/leads?q=${encodeURIComponent(q)}&platform=${encodeURIComponent(platform)}&page=${page}`,
+    ),
   ticketsByConversation: (conversationId: number) =>
     request<Ticket[]>(`/api/tickets/by-conversation/${conversationId}`),
   createTicket: (conversationId: number, type: string, title: string, content: string) =>

@@ -1,8 +1,9 @@
 import clsx from 'clsx'
-import { FileText, FlaskConical, Plus, Upload, X } from 'lucide-react'
+import { Download, FileText, FlaskConical, Plus, Upload, X } from 'lucide-react'
 import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { api, KnowledgeChunk, KnowledgeDoc, MissedQuestion, RecallTestResult } from '../api/client'
+import { api, downloadFaqPack, KnowledgeChunk, KnowledgeDoc, MissedQuestion, RecallTestResult } from '../api/client'
+import { confirmDialog } from '../components/ui/dialogs'
 import Empty from '../components/ui/Empty'
 import { toast } from '../components/ui/toast'
 
@@ -38,7 +39,11 @@ export default function Knowledge() {
   const [missed, setMissed] = useState<MissedQuestion[]>([])
   const [nav, setNav] = useState<NavKey>('all')
   const [category, setCategory] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'disabled'>('all')
   const [q, setQ] = useState('')
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [acting, setActing] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [creating, setCreating] = useState(false)
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT)
@@ -51,6 +56,10 @@ export default function Knowledge() {
   const [testResult, setTestResult] = useState<RecallTestResult | null>(null)
   const [testing, setTesting] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  const dialogRef = useRef<HTMLInputElement>(null)
+  const faqPackRef = useRef<HTMLInputElement>(null)
+  const [importing, setImporting] = useState(false)
+  const [packImporting, setPackImporting] = useState(false)
 
   const refresh = async () => {
     const [list, pending] = await Promise.all([api.listDocs(), api.listMissed()])
@@ -77,15 +86,16 @@ export default function Knowledge() {
     return visible.filter((d) => {
       if (nav === 'faq' && d.doc_type !== 'faq') return false
       if (nav === 'file' && d.doc_type !== 'file') return false
+      if (statusFilter !== 'all' && d.status !== statusFilter) return false
       if (category && (d.category || '未分类') !== category) return false
       if (!keyword) return true
       const similars = (d.similar_questions || []).join(' ')
       const hay = `${d.title} ${d.question || ''} ${d.answer || ''} ${d.category || ''} ${similars}`.toLowerCase()
       return hay.includes(keyword)
     })
-  }, [visible, nav, category, q])
+  }, [visible, nav, category, q, statusFilter])
 
-  const selected = visible.find((d) => d.id === selectedId) || null
+  const activeDoc = visible.find((d) => d.id === selectedId) || null
   const counts = {
     all: visible.length,
     faq: visible.filter((d) => d.doc_type === 'faq').length,
@@ -132,7 +142,7 @@ export default function Knowledge() {
     e.preventDefault()
     if (!draft.title.trim() || !draft.question.trim() || !draft.answer.trim()) return
     setSaving(true)
-    let savedId = selected?.id ?? null
+    let savedId = activeDoc?.id ?? null
     try {
       const similars = draft.similars.map((s) => s.trim()).filter(Boolean)
       if (missedId) {
@@ -141,8 +151,8 @@ export default function Knowledge() {
         toast.success('已转为 FAQ 并索引')
         setMissedId(null)
         setNav('faq')
-      } else if (selected && selected.doc_type === 'faq') {
-        const updated = await api.updateFaq(selected.id, draft.title.trim(), draft.question.trim(), draft.answer.trim(), draft.category, similars)
+      } else if (activeDoc && activeDoc.doc_type === 'faq') {
+        const updated = await api.updateFaq(activeDoc.id, draft.title.trim(), draft.question.trim(), draft.answer.trim(), draft.category, similars)
         savedId = updated.id
         toast.success(updated.status === 'active' ? 'FAQ 已更新并重新索引' : 'FAQ 已保存，启用后才会进入检索')
       } else {
@@ -162,10 +172,10 @@ export default function Knowledge() {
   }
 
   const saveFile = async () => {
-    if (!selected || selected.doc_type !== 'file') return
+    if (!activeDoc || activeDoc.doc_type !== 'file') return
     setSaving(true)
     try {
-      const updated = await api.updateDocMeta(selected.id, {
+      const updated = await api.updateDocMeta(activeDoc.id, {
         title: draft.title.trim(),
         category: draft.category.trim() || '未分类',
       })
@@ -191,6 +201,142 @@ export default function Knowledge() {
       }
     } catch (err: any) {
       toast.error(err?.message || '状态更新失败')
+    }
+  }
+
+  const chosenIds = () => filtered.filter((doc) => selected.has(doc.id)).map((doc) => doc.id)
+
+  const toggleSelected = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelectFiltered = () => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      const allOn = filtered.length > 0 && filtered.every((doc) => next.has(doc.id))
+      filtered.forEach((doc) => {
+        if (allOn) next.delete(doc.id)
+        else next.add(doc.id)
+      })
+      return next
+    })
+  }
+
+  const removeDocs = async (ids: number[], title?: string) => {
+    if (!ids.length) return
+    const ok = await confirmDialog({
+      title: ids.length === 1 ? `删除「${title || '这条知识'}」？` : `删除选中的 ${ids.length} 条？`,
+      message: '只从当前环境的列表消失，AI 也不再引用。要生产一起关掉，把该行状态写成停用后导入。',
+      confirmText: '删除',
+      danger: true,
+    })
+    if (!ok) return
+    setActing(true)
+    try {
+      const result = await api.batchDocs(ids, 'delete')
+      if (result.failed_ids.length) toast.error(`已删除 ${result.updated} 条，${result.failed_ids.length} 条失败`)
+      else toast.success(`已删除 ${result.updated} 条`)
+      if (selectedId != null && ids.includes(selectedId)) setSelectedId(null)
+      setSelected((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
+      await refresh()
+    } catch (err: any) {
+      toast.error(err?.message || '删除失败')
+    } finally {
+      setActing(false)
+    }
+  }
+
+  const runBatch = async (action: 'active' | 'disabled') => {
+    const ids = chosenIds()
+    if (!ids.length) return
+    setActing(true)
+    try {
+      const result = await api.batchDocs(ids, action)
+      const label = action === 'active' ? '启用' : '停用'
+      if (result.failed_ids.length) toast.error(`已${label} ${result.updated} 条，${result.failed_ids.length} 条失败`)
+      else toast.success(`已${label} ${result.updated} 条`)
+      setSelected(new Set())
+      const list = await refresh()
+      if (selectedId != null) {
+        const current = list.find((doc) => doc.id === selectedId)
+        if (current) setChunks(await api.listChunks(current.id).catch(() => []))
+      }
+    } catch (err: any) {
+      toast.error(err?.message || '状态更新失败')
+    } finally {
+      setActing(false)
+    }
+  }
+
+  const onExportFaq = async () => {
+    setExporting(true)
+    try {
+      await downloadFaqPack()
+    } catch (err: any) {
+      toast.error(err?.message || '导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const onImportFaqPack = async (file: File) => {
+    setPackImporting(true)
+    try {
+      const preview = await api.importFaqPack(file, false)
+      const unchanged = preview.created === 0
+        && preview.content_updated === 0
+        && preview.enabling === 0
+        && preview.disabling_active === 0
+        && preview.skipped_ambiguous.length === 0
+      if (unchanged) {
+        toast.info('这张表和当前知识库一致')
+        return
+      }
+      const skip = preview.skipped_ambiguous.length
+        ? `同标题有多条、未改动：${preview.skipped_ambiguous.slice(0, 5).join('、')}。`
+        : ''
+      const ok = await confirmDialog({
+        title: '按这张表更新知识库？',
+        message: `新建 ${preview.created} 条，覆盖 ${preview.content_updated} 条，将启用 ${preview.enabling} 条，将停用 ${preview.disabling_active} 条当前已启用的。文件里没有的条目保持不变。${skip}`,
+        confirmText: '导入',
+        danger: preview.disabling_active > 0,
+      })
+      if (!ok) return
+      const result = await api.importFaqPack(file, true)
+      toast.success(`已导入：新建 ${result.created}，覆盖 ${result.content_updated}，启用 ${result.enabling}`)
+      await refresh()
+      setNav('faq')
+      setCreating(false)
+      setSelectedId(null)
+    } catch (err: any) {
+      toast.error(err?.message || '导入失败')
+    } finally {
+      setPackImporting(false)
+    }
+  }
+
+  const onImportDialogs = async (file: File) => {
+    setImporting(true)
+    try {
+      const result = await api.importDialogs(file)
+      toast.success(`已导入 ${result.imported} 条，均为停用；另有 ${result.gap_count} 条待补未入库`)
+      await refresh()
+      setNav('faq')
+      setCreating(false)
+      setSelectedId(null)
+    } catch (err: any) {
+      toast.error(err?.message || '导入失败')
+    } finally {
+      setImporting(false)
     }
   }
 
@@ -226,11 +372,11 @@ export default function Knowledge() {
     }
   }
 
-  const showEditor = creating || !!selected
+  const showEditor = creating || !!activeDoc
 
   return (
     <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-950">
-      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-800 px-4 py-3 flex items-center gap-3">
+      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-800 px-4 py-3 flex items-center gap-2 flex-wrap">
         <h1 className="text-base font-semibold text-gray-800 dark:text-gray-100">知识库</h1>
         <div className="flex-1" />
         <button
@@ -239,6 +385,49 @@ export default function Knowledge() {
         >
           <Plus size={14} /> 新建 FAQ
         </button>
+        <button
+          onClick={onExportFaq}
+          disabled={exporting}
+          className="text-sm px-3 py-1.5 rounded-lg border dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-1 disabled:opacity-50"
+        >
+          <Download size={14} /> {exporting ? '导出中…' : '导出 FAQ'}
+        </button>
+        <button
+          onClick={() => faqPackRef.current?.click()}
+          disabled={packImporting}
+          className="text-sm px-3 py-1.5 rounded-lg border dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-1 disabled:opacity-50"
+        >
+          <Upload size={14} /> {packImporting ? '导入中…' : '导入 FAQ'}
+        </button>
+        <input
+          ref={faqPackRef}
+          type="file"
+          accept=".xlsx"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (file) onImportFaqPack(file)
+            e.target.value = ''
+          }}
+        />
+        <button
+          onClick={() => dialogRef.current?.click()}
+          disabled={importing}
+          className="text-sm px-3 py-1.5 rounded-lg border dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-1 disabled:opacity-50"
+        >
+          <Upload size={14} /> {importing ? '导入中…' : '导入历史对话'}
+        </button>
+        <input
+          ref={dialogRef}
+          type="file"
+          accept=".xlsx"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0]
+            if (file) onImportDialogs(file)
+            e.target.value = ''
+          }}
+        />
         <button
           onClick={() => fileRef.current?.click()}
           className="text-sm px-3 py-1.5 rounded-lg border dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 inline-flex items-center gap-1"
@@ -338,37 +527,95 @@ export default function Knowledge() {
             </div>
           ) : (
             <>
-              <div className="px-3 py-2">
+              <div className="px-3 py-2 space-y-2">
                 <input
                   value={q}
                   onChange={(e) => setQ(e.target.value)}
                   placeholder="搜索标题、问法、答案"
                   className="w-full bg-white dark:bg-gray-900 border dark:border-gray-800 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-primary-500"
                 />
+                <div className="flex items-center gap-1 text-xs">
+                  {([
+                    ['all', '全部'],
+                    ['active', '启用'],
+                    ['disabled', '停用'],
+                  ] as const).map(([key, label]) => (
+                    <button
+                      key={key}
+                      onClick={() => setStatusFilter(key)}
+                      className={clsx(
+                        'px-2 py-1 rounded',
+                        statusFilter === key ? 'bg-primary-50 text-primary-700 dark:bg-primary-600/15 dark:text-primary-200' : 'text-gray-500 hover:bg-white dark:hover:bg-gray-900',
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  <button
+                    onClick={toggleSelectFiltered}
+                    disabled={!filtered.length || acting}
+                    className="ml-auto text-gray-500 disabled:opacity-40"
+                  >
+                    {filtered.length > 0 && filtered.every((doc) => selected.has(doc.id)) ? '取消全选' : '全选当前筛选'}
+                  </button>
+                </div>
+                {filtered.some((doc) => selected.has(doc.id)) && (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-gray-500">已选 {filtered.filter((doc) => selected.has(doc.id)).length}</span>
+                    <button disabled={acting} onClick={() => runBatch('active')} className="px-2 py-1 rounded bg-primary-600 text-white disabled:opacity-50">启用</button>
+                    <button disabled={acting} onClick={() => runBatch('disabled')} className="px-2 py-1 rounded border dark:border-gray-700 text-gray-600 dark:text-gray-300 disabled:opacity-50">停用</button>
+                    <button
+                      disabled={acting}
+                      onClick={() => {
+                        const rows = filtered.filter((doc) => selected.has(doc.id))
+                        removeDocs(rows.map((doc) => doc.id), rows.length === 1 ? rows[0].title : undefined)
+                      }}
+                      className="px-2 py-1 rounded text-red-500 disabled:opacity-50"
+                    >
+                      删除
+                    </button>
+                  </div>
+                )}
               </div>
               <div className="flex-1 overflow-y-auto">
                 {filtered.map((doc) => (
-                  <button
+                  <div
                     key={doc.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => openDoc(doc)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') openDoc(doc)
+                    }}
                     className={clsx(
-                      'w-full text-left px-4 py-2.5 border-b dark:border-gray-800/80',
+                      'w-full text-left px-4 py-2.5 border-b dark:border-gray-800/80 cursor-pointer',
                       selectedId === doc.id && !creating ? 'bg-primary-50 dark:bg-primary-600/15' : 'hover:bg-white dark:hover:bg-gray-900',
                     )}
                   >
                     <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(doc.id)}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={() => toggleSelected(doc.id)}
+                        className="shrink-0"
+                        aria-label={`选择 ${doc.title}`}
+                      />
                       <span className="text-sm text-gray-800 dark:text-gray-100 truncate flex-1">{doc.title}</span>
                       <span className={clsx('text-[10px] px-1.5 py-px rounded', doc.doc_type === 'faq' ? 'bg-primary-50 text-primary-700' : 'bg-gray-100 text-gray-500 dark:bg-gray-800')}>
                         {doc.doc_type === 'faq' ? 'FAQ' : '文档'}
                       </span>
                     </div>
-                    <div className="text-[11px] text-gray-400 mt-0.5 flex gap-2">
+                    {doc.doc_type === 'faq' && doc.question && (
+                      <div className="text-[11px] text-gray-500 dark:text-gray-400 truncate mt-0.5 pl-6">{doc.question}</div>
+                    )}
+                    <div className="text-[11px] text-gray-400 mt-0.5 flex gap-2 pl-6">
                       <span>{doc.category || '未分类'}</span>
                       <span>{doc.chunk_count} 切片</span>
                       <span>引用 {doc.hit_count || 0} 次</span>
                       <span className={doc.status === 'active' ? 'text-primary-600' : 'text-gray-400'}>{statusLabel(doc.status)}</span>
                     </div>
-                  </button>
+                  </div>
                 ))}
                 {filtered.length === 0 && (
                   <Empty icon={FileText} title="没有匹配的知识" hint="新建 FAQ，或上传 PDF / Word / Markdown" />
@@ -384,7 +631,7 @@ export default function Knowledge() {
               选择一条知识，或新建 FAQ
             </div>
           )}
-          {showEditor && (creating || selected?.doc_type === 'faq') && (
+          {showEditor && (creating || activeDoc?.doc_type === 'faq') && (
             <form onSubmit={saveFaq} className="p-4 space-y-3">
               <div className="text-sm font-medium text-gray-800 dark:text-gray-100">
                 {missedId ? '未命中转 FAQ' : creating ? '新建 FAQ' : '编辑 FAQ'}
@@ -425,30 +672,26 @@ export default function Knowledge() {
               <Field label="答案">
                 <textarea value={draft.answer} onChange={(e) => setDraft({ ...draft, answer: e.target.value })} rows={6} className={inputCls} placeholder="标准款 99 元" />
               </Field>
-              {selected && !creating && (
-                <EnableRow doc={selected} onToggle={() => toggleStatus(selected)} />
+              {activeDoc && !creating && (
+                <EnableRow doc={activeDoc} onToggle={() => toggleStatus(activeDoc)} />
               )}
               <button disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
                 {saving ? '保存中…' : '保存并索引'}
               </button>
-              {selected && !creating && (
+              {activeDoc && !creating && (
                 <button
                   type="button"
-                  onClick={async () => {
-                    await api.deleteDoc(selected.id)
-                    toast.info('已归档')
-                    setSelectedId(null)
-                    refresh()
-                  }}
-                  className="w-full text-xs text-red-500"
+                  disabled={acting}
+                  onClick={() => removeDocs([activeDoc.id], activeDoc.title)}
+                  className="w-full text-xs text-red-500 disabled:opacity-50"
                 >
-                  归档
+                  删除
                 </button>
               )}
               <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
             </form>
           )}
-          {showEditor && selected && selected.doc_type === 'file' && !creating && (
+          {showEditor && activeDoc && activeDoc.doc_type === 'file' && !creating && (
             <div className="p-4 space-y-3">
               <div className="text-sm font-medium text-gray-800 dark:text-gray-100">文档</div>
               <Field label="标题">
@@ -457,20 +700,16 @@ export default function Knowledge() {
               <Field label="分类">
                 <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} className={inputCls} list="kb-categories" />
               </Field>
-              <EnableRow doc={selected} onToggle={() => toggleStatus(selected)} />
+              <EnableRow doc={activeDoc} onToggle={() => toggleStatus(activeDoc)} />
               <button onClick={saveFile} disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
                 {saving ? '保存中…' : '保存'}
               </button>
               <button
-                onClick={async () => {
-                  await api.deleteDoc(selected.id)
-                  toast.info('已归档')
-                  setSelectedId(null)
-                  refresh()
-                }}
-                className="w-full text-xs text-red-500"
+                disabled={acting}
+                onClick={() => removeDocs([activeDoc.id], activeDoc.title)}
+                className="w-full text-xs text-red-500 disabled:opacity-50"
               >
-                归档
+                删除
               </button>
               <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
             </div>

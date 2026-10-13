@@ -13,6 +13,7 @@ jieba>=0.42.1
 pypdf>=4.2
 python-docx>=1.1
 python-multipart>=0.0.9
+openpyxl>=3.1
 pytest>=8.0
 pytest-asyncio>=0.23
 cryptography>=42.0

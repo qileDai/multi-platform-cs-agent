@@ -16,6 +16,7 @@ import {
   Sparkles,
   Sun,
   TrendingUp,
+  UserCheck,
   Users,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
@@ -28,6 +29,7 @@ const CS_NAV = [
   { path: '/', label: '对话', icon: MessageSquare },
   { path: '/knowledge', label: '知识库', icon: BookOpen },
   { path: '/tickets', label: '工单', icon: ClipboardList },
+  { path: '/leads', label: '留资', icon: UserCheck },
   { path: '/dashboard', label: '数据', icon: BarChart3 },
 ]
 

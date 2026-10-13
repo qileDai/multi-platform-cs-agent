@@ -1,9 +1,11 @@
 """知识库接口：FAQ CRUD、文档上传、召回测试台、未命中问题、违禁词库。"""
+import io
 import json
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,9 +15,10 @@ from ..database import get_db
 from ..models import Agent, BannedWord, KnowledgeChunk, KnowledgeDoc, MissedQuestion
 from ..rag import ingest, pipeline
 from ..rag.ingest import load_similar_questions
-from ..schemas import (BannedWordIn, BannedWordOut, DocMetaUpdate, DocStatusUpdate, FaqCreate, FaqUpdate,
-                       KnowledgeChunkOut, KnowledgeDocOut, MissedQuestionOut, RecallTestRequest,
-                       RecallTestResult)
+from ..schemas import (BannedWordIn, BannedWordOut, DialogImportOut, DocBatchIn, DocBatchOut,
+                       DocMetaUpdate, DocStatusUpdate, FaqCreate, FaqPackOut, FaqUpdate,
+                       KnowledgeChunkOut, KnowledgeDocOut, MissedQuestionOut,
+                       RecallTestRequest, RecallTestResult)
 from .deps import get_current_agent, require_admin
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,12 @@ def _doc_out(db: Session, doc: KnowledgeDoc) -> KnowledgeDocOut:
 
 @router.get("/docs", response_model=list[KnowledgeDocOut])
 def list_docs(agent: Agent = Depends(get_current_agent), db: Session = Depends(get_db)):
-    docs = db.query(KnowledgeDoc).order_by(KnowledgeDoc.updated_at.desc()).all()
+    docs = (
+        db.query(KnowledgeDoc)
+        .filter(KnowledgeDoc.status != "archived")
+        .order_by(KnowledgeDoc.updated_at.desc())
+        .all()
+    )
     return [_doc_out(db, d) for d in docs]
 
 
@@ -97,17 +105,57 @@ async def update_faq(doc_id: int, req: FaqUpdate, agent: Agent = Depends(get_cur
     return _doc_out(db, doc)
 
 
+async def _apply_doc_action(db: Session, ids: list[int], action: str) -> tuple[int, list[int]]:
+    """改状态并按新状态对齐索引。已经是目标状态的跳过。"""
+    if action not in ("active", "disabled", "delete"):
+        raise HTTPException(400, "动作只能是启用、停用或删除")
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        raise HTTPException(400, "请选择知识")
+    target = "archived" if action == "delete" else action
+    docs = db.query(KnowledgeDoc).filter(KnowledgeDoc.id.in_(unique_ids)).all()
+    by_id = {doc.id: doc for doc in docs}
+    failed: list[int] = []
+    changed: list[int] = []
+    now = datetime.utcnow()
+    for doc_id in unique_ids:
+        doc = by_id.get(doc_id)
+        if doc is None or (action != "delete" and doc.status == "archived"):
+            failed.append(doc_id)
+            continue
+        if doc.status == target:
+            continue
+        doc.status = target
+        doc.updated_at = now
+        changed.append(doc_id)
+    db.commit()
+    if not changed:
+        return 0, failed
+    updated, index_failed = await ingest.sync_doc_index(changed)
+    failed.extend(index_failed)
+    return updated, failed
+
+
+@router.post("/docs/batch", response_model=DocBatchOut)
+async def batch_docs(req: DocBatchIn, agent: Agent = Depends(get_current_agent),
+                     db: Session = Depends(get_db)):
+    updated, failed = await _apply_doc_action(db, req.ids, req.action)
+    audit.log(
+        db, agent, "kb_doc_batch", target="knowledge",
+        detail=f"{req.action} updated={updated} failed={len(failed)}",
+    )
+    return DocBatchOut(updated=updated, failed_ids=failed)
+
+
 @router.delete("/docs/{doc_id}")
-def delete_doc(doc_id: int, agent: Agent = Depends(get_current_agent),
-               db: Session = Depends(get_db)):
+async def delete_doc(doc_id: int, agent: Agent = Depends(get_current_agent),
+                     db: Session = Depends(get_db)):
     doc = db.get(KnowledgeDoc, doc_id)
     if doc is None:
         raise HTTPException(404, "文档不存在")
-    doc.status = "archived"
-    db.commit()
-    audit.log(db, agent, "kb_doc_delete", target=f"doc:{doc_id}", detail=doc.title)
-    ingest._delete_chunks(db, doc_id)
-    ingest.rebuild_bm25_from_db()
+    title = doc.title
+    await _apply_doc_action(db, [doc_id], "delete")
+    audit.log(db, agent, "kb_doc_delete", target=f"doc:{doc_id}", detail=title)
     return {"ok": True}
 
 
@@ -143,20 +191,13 @@ async def set_doc_status(doc_id: int, req: DocStatusUpdate, agent: Agent = Depen
         raise HTTPException(404, "文档不存在")
     if req.status not in ("active", "disabled"):
         raise HTTPException(400, "状态只能是启用或停用")
-    doc.updated_at = datetime.utcnow()
-    if req.status == "disabled":
-        doc.status = "disabled"
-        db.commit()
-        ingest._delete_chunks(db, doc.id)
-        ingest.rebuild_bm25_from_db()
-    else:
-        doc.status = "active"
-        db.commit()
-        if doc.doc_type == "faq":
-            await ingest.ingest_faq(doc.id)
-        else:
-            await ingest.ingest_document(doc.id)
-    audit.log(db, agent, "kb_doc_status", target=f"doc:{doc.id}", detail=req.status)
+    previous = doc.status
+    updated, failed = await _apply_doc_action(db, [doc_id], req.status)
+    if doc_id in failed:
+        raise HTTPException(500, "索引更新失败")
+    if previous != req.status and updated:
+        audit.log(db, agent, "kb_doc_status", target=f"doc:{doc.id}", detail=req.status)
+    db.refresh(doc)
     return _doc_out(db, doc)
 
 
@@ -200,6 +241,320 @@ async def upload_doc(file: UploadFile, agent: Agent = Depends(get_current_agent)
     audit.log(db, agent, "kb_doc_upload", target=f"doc:{doc.id}", detail=doc.title)
     await ingest.ingest_document(doc.id)
     return _doc_out(db, doc)
+
+
+def _similar_lines(text: str) -> list[str]:
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+@router.post("/import-dialogs", response_model=DialogImportOut)
+async def import_dialogs(file: UploadFile, agent: Agent = Depends(get_current_agent),
+                         db: Session = Depends(get_db)):
+    """美洽历史对话表洗成 FAQ。有答案的以停用入库，待补不建文档。"""
+    name = (file.filename or "").lower()
+    if not name.endswith(".xlsx"):
+        raise HTTPException(400, "只接受美洽导出的 xlsx")
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "文件不能超过 10MB")
+    from scripts.clean_meiqia_to_faq import clean_xlsx_bytes
+    try:
+        faq_rows, gap_rows, stats = clean_xlsx_bytes(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    created = 0
+    updated = 0
+    reindex_ids: list[int] = []
+    for row in faq_rows:
+        title = (row.get("标题") or "").strip()
+        question = (row.get("标准问") or "").strip()
+        answer = (row.get("答案") or "").strip()
+        if not title or not question or not answer:
+            continue
+        category = (row.get("分类") or "未分类").strip() or "未分类"
+        similars = _similar_lines(row.get("相似问") or "")
+        content = f"问：{question}\n答：{answer}"
+        doc = (
+            db.query(KnowledgeDoc)
+            .filter(
+                KnowledgeDoc.doc_type == "faq",
+                KnowledgeDoc.title == title,
+                KnowledgeDoc.status != "archived",
+            )
+            .order_by(KnowledgeDoc.id.asc())
+            .first()
+        )
+        if doc is None:
+            doc = KnowledgeDoc(
+                title=title, doc_type="faq", content=content, category=category,
+                similar_questions=_dump_similar(similars), status="disabled",
+            )
+            db.add(doc)
+            db.flush()
+            created += 1
+            continue
+        doc.content = content
+        doc.category = category
+        doc.similar_questions = _dump_similar(similars)
+        doc.version = (doc.version or 1) + 1
+        doc.updated_at = datetime.utcnow()
+        updated += 1
+        if doc.status == "active":
+            reindex_ids.append(doc.id)
+    db.commit()
+    for doc_id in reindex_ids:
+        await ingest.ingest_faq(doc_id)
+    audit.log(
+        db, agent, "kb_dialog_import", target="knowledge",
+        detail=f"created={created} updated={updated} gap={len(gap_rows)}",
+    )
+    return DialogImportOut(
+        imported=created + updated,
+        created=created,
+        updated=updated,
+        skipped_invalid=int(stats["invalid"]),
+        skipped_missed=int(stats["missed"]),
+        gap_count=len(gap_rows),
+        gap_titles=[row.get("标题") or "" for row in gap_rows if row.get("标题")],
+    )
+
+
+FAQ_PACK_HEADERS = ("标题", "分类", "标准问", "相似问", "答案", "状态")
+_REQUIRED_PACK_HEADERS = ("标题", "标准问", "答案")
+
+
+class _PackRow:
+    def __init__(self, title: str, category: str, question: str, answer: str,
+                 similars: list[str], status: str):
+        self.title = title
+        self.category = category
+        self.question = question
+        self.answer = answer
+        self.similars = similars
+        self.status = status
+
+
+class _PackWrite:
+    def __init__(self, doc: KnowledgeDoc | None, row: _PackRow, content_changed: bool):
+        self.doc = doc
+        self.row = row
+        self.content_changed = content_changed
+
+
+def _cell_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _load_pack_rows(data: bytes) -> list[_PackRow]:
+    from openpyxl import load_workbook
+
+    try:
+        workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, "无法读取表格") from exc
+    try:
+        sheet = workbook.active
+        row_iter = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(row_iter)
+        except StopIteration:
+            raise HTTPException(400, "表格是空的") from None
+        headers = [_cell_text(cell) for cell in (header_row or ())]
+        missing = [name for name in _REQUIRED_PACK_HEADERS if name not in headers]
+        if missing:
+            raise HTTPException(400, "表格缺少列：" + "、".join(missing))
+        index = {name: headers.index(name) for name in FAQ_PACK_HEADERS if name in headers}
+
+        def column(raw, name: str) -> str:
+            pos = index.get(name)
+            if pos is None or raw is None or pos >= len(raw):
+                return ""
+            return _cell_text(raw[pos])
+
+        rows: list[_PackRow] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for offset, raw in enumerate(row_iter, start=2):
+            if raw is None or all(_cell_text(cell) == "" for cell in raw):
+                continue
+            title = column(raw, "标题")
+            question = column(raw, "标准问")
+            answer = column(raw, "答案")
+            status_text = column(raw, "状态")
+            if not title or not question or not answer:
+                errors.append(f"第 {offset} 行缺少标题、标准问或答案")
+                continue
+            if status_text in ("", "停用"):
+                status = "disabled"
+            elif status_text == "启用":
+                status = "active"
+            else:
+                errors.append(f"第 {offset} 行状态无法识别")
+                continue
+            if title in seen:
+                errors.append(f"标题重复：{title}")
+                continue
+            seen.add(title)
+            rows.append(_PackRow(
+                title=title,
+                category=column(raw, "分类") or "未分类",
+                question=question,
+                answer=answer,
+                similars=_similar_lines(column(raw, "相似问")),
+                status=status,
+            ))
+        if errors:
+            shown = errors[:8]
+            if len(errors) > 8:
+                shown.append(f"另有 {len(errors) - 8} 个问题")
+            raise HTTPException(400, "；".join(shown))
+        if not rows:
+            raise HTTPException(400, "表格里没有 FAQ")
+        return rows
+    finally:
+        workbook.close()
+
+
+def _pack_plan(db: Session, rows: list[_PackRow]):
+    existing = (
+        db.query(KnowledgeDoc)
+        .filter(KnowledgeDoc.doc_type == "faq", KnowledgeDoc.status != "archived")
+        .all()
+    )
+    by_title: dict[str, list[KnowledgeDoc]] = {}
+    for doc in existing:
+        by_title.setdefault(doc.title, []).append(doc)
+    writes: list[_PackWrite] = []
+    skipped: list[str] = []
+    created = content_updated = enabling = disabling_active = 0
+    for row in rows:
+        matches = by_title.get(row.title, [])
+        if len(matches) > 1:
+            skipped.append(row.title)
+            continue
+        content = f"问：{row.question}\n答：{row.answer}"
+        if not matches:
+            created += 1
+            if row.status == "active":
+                enabling += 1
+            writes.append(_PackWrite(None, row, False))
+            continue
+        doc = matches[0]
+        content_changed = (
+            doc.content != content
+            or (doc.category or "未分类") != row.category
+            or load_similar_questions(doc.similar_questions) != row.similars
+        )
+        if content_changed:
+            content_updated += 1
+        if row.status == "active" and doc.status != "active":
+            enabling += 1
+        if doc.status == "active" and row.status != "active":
+            disabling_active += 1
+        if content_changed or doc.status != row.status:
+            writes.append(_PackWrite(doc, row, content_changed))
+    skipped.sort()
+    return writes, created, content_updated, enabling, disabling_active, skipped
+
+
+def _apply_pack_writes(db: Session, writes: list[_PackWrite]) -> list[int]:
+    index_ids: list[int] = []
+    now = datetime.utcnow()
+    for item in writes:
+        row = item.row
+        content = f"问：{row.question}\n答：{row.answer}"
+        similars = _dump_similar(row.similars)
+        if item.doc is None:
+            doc = KnowledgeDoc(
+                title=row.title, doc_type="faq", content=content, category=row.category,
+                similar_questions=similars, status=row.status,
+            )
+            db.add(doc)
+            db.flush()
+            if row.status == "active":
+                index_ids.append(doc.id)
+            continue
+        was_active = item.doc.status == "active"
+        item.doc.content = content
+        item.doc.category = row.category
+        item.doc.similar_questions = similars
+        item.doc.status = row.status
+        item.doc.version = (item.doc.version or 1) + 1
+        item.doc.updated_at = now
+        if row.status == "active" or was_active:
+            index_ids.append(item.doc.id)
+    db.commit()
+    return index_ids
+
+
+def _pack_response(applied: bool, created: int, content_updated: int, enabling: int,
+                   disabling_active: int, skipped: list[str]) -> FaqPackOut:
+    return FaqPackOut(
+        applied=applied, created=created, content_updated=content_updated,
+        enabling=enabling, disabling_active=disabling_active, skipped_ambiguous=skipped,
+    )
+
+
+@router.get("/faq/export")
+def export_faq_pack(agent: Agent = Depends(get_current_agent), db: Session = Depends(get_db)):
+    from openpyxl import Workbook
+
+    docs = (
+        db.query(KnowledgeDoc)
+        .filter(KnowledgeDoc.doc_type == "faq", KnowledgeDoc.status != "archived")
+        .order_by(KnowledgeDoc.id.asc())
+        .all()
+    )
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "FAQ"
+    sheet.append(list(FAQ_PACK_HEADERS))
+    for doc in docs:
+        question, answer = _parse_faq(doc.content)
+        sheet.append([
+            doc.title,
+            doc.category or "未分类",
+            question,
+            "\n".join(load_similar_questions(doc.similar_questions)),
+            answer,
+            "启用" if doc.status == "active" else "停用",
+        ])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="faq.xlsx"'},
+    )
+
+
+@router.post("/faq/import", response_model=FaqPackOut)
+async def import_faq_pack(file: UploadFile, apply: str = Form("false"),
+                          agent: Agent = Depends(get_current_agent), db: Session = Depends(get_db)):
+    """带状态的 FAQ 表。apply 不是 true 时只校验和统计，不写库。"""
+    name = (file.filename or "").lower()
+    if not name.endswith(".xlsx"):
+        raise HTTPException(400, "只接受 xlsx")
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "文件不能超过 10MB")
+    rows = _load_pack_rows(data)
+    writes, created, content_updated, enabling, disabling_active, skipped = _pack_plan(db, rows)
+    do_apply = apply.strip().lower() in {"1", "true", "yes", "on"}
+    if not do_apply:
+        return _pack_response(False, created, content_updated, enabling, disabling_active, skipped)
+    index_ids = _apply_pack_writes(db, writes)
+    if index_ids:
+        await ingest.sync_doc_index(index_ids)
+    audit.log(
+        db, agent, "kb_faq_pack_import", target="knowledge",
+        detail=f"created={created} content_updated={content_updated} enabling={enabling} disabling={disabling_active}",
+    )
+    return _pack_response(True, created, content_updated, enabling, disabling_active, skipped)
 
 
 # ============ 召回测试台 ============

@@ -23,7 +23,7 @@ from ..models import Conversation, Customer, KnowledgeDoc, LlmUsage, Message
 from ..rag import cache as answer_cache, pipeline, rewrite
 from ..schemas import AgentReply
 from ..services import handoff, note_unmatched, record_missed_question, send_outbound
-from . import confidence, context, evidence, humanize, prompt as prompt_mod, tools
+from . import confidence, context, evidence, humanize, lead_flow, prompt as prompt_mod, tools
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +38,13 @@ FALLBACK_TIMEOUT_SECONDS = 15
 _CONFIRM_REPLY = "我先让同事帮您确认"
 _TASK_RE = re.compile(r"订单|物流|快递|退货|退换|换货|退款")
 _FACT_TOOLS = frozenset({"query_order", "query_logistics"})
-_HELLO_REPLY = "在的，我是小赢。香港公司注册、开户都可以问我"
+_HELLO_REPLY = "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
 _THANKS_REPLY = "客气啦，有问题随时喊我"
 _LAUGH_REPLY = "哈哈，注册还是开户，您想先看哪块"
 _GREETING_REPLIES = {"谢谢": _THANKS_REPLY, "哈哈": _LAUGH_REPLY}
-_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
-_LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
+_COLON_ITEM_RE = re.compile(r"^\d+\s*[:：]")
 _LIST_LEAD = "清单我按资料发你"
 _EMPTY_REPLY = "不好意思，我这边没说清楚，先帮您转给同事哈"
 _MISS_REPLY = "这个问题我这边没查到靠谱资料，先帮您转给同事哈"
@@ -224,6 +225,7 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         platform = conversation.platform
         conversation_id_ = conversation.id
         customer_id = customer.id
+        nickname = customer.nickname if customer is not None else ""
         user_message_id = last_user_msg.id
     finally:
         db.close()
@@ -254,6 +256,25 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
 
     started = _trace_started()
     history_text, recent, summary = context.get_history_for_prompt(conversation_id_)
+    if not lead_flow.must_handoff(user_text):
+        phone = lead_flow.phone_in_message(user_text)
+        wechat = "" if phone else lead_flow.wechat_in_message(user_text)
+        if phone or wechat:
+            lead_flow.save_lead(
+                customer_id=customer_id,
+                conversation_id=conversation_id_,
+                platform=platform,
+                nickname=nickname,
+                contact=phone or wechat,
+                contact_type="phone" if phone else "wechat",
+                business=lead_flow.business_phrase(user_text, recent),
+            )
+            text, _sent = await _deliver_ai(
+                conversation_id_, [lead_flow.ARRANGE], local=local, allow_owned=owned,
+                extra={"intent": "consult_feature", "confidence": 0.95, "citations": [], "grounded": False},
+                anchor_user_message_id=user_message_id if local else None,
+            )
+            return text
     retrieval = await _retrieve_covering(user_text, recent, summary)
     for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
         _add_stage_ms(key, int(retrieval.stage_ms.get(key, 0)))
@@ -433,6 +454,18 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         not reply.handoff or confidence.risk_tier(user_text) == "low"
     ):
         reply.handoff = False
+    if _contact_when_unanswered(
+        user_text, kept, retrieval_passed=retrieval.passed, forced_human=forced_human, tool_ok=tool_ok,
+    ):
+        line = lead_flow.script_for_miss(user_text, recent)
+        if line:
+            kept = [line]
+            dropped = []
+            reply.handoff = False
+            reply.handoff_reason = ""
+            reply.confidence = max(reply.confidence, 0.9)
+            shop_gap = False
+            record_missed_question(user_text, platform, conversation_id_)
     reply_blob = "\n".join(kept)
     if confidence_meta is None and ((reply.confidence < 0.6 and _expects_shop_fact(reply_blob)) or bool(dropped)):
         reply.handoff = True
@@ -539,7 +572,10 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
             anchor_user_message_id=user_message_id if local else None,
         )
         if sent:
-            _apply_side_effects(customer_id, reply)
+            _apply_side_effects(
+                customer_id, reply, conversation_id=conversation_id_, platform=platform,
+                user_text=user_text, recent=recent,
+            )
         if sent and retrieval.passed and not must_handoff:
             _bump_knowledge_hits(retrieval.contexts)
             if not _FACT_TOOLS.intersection(tool_names_used):
@@ -571,6 +607,16 @@ def _over_budget(started: float) -> bool:
 
 def _expects_shop_fact(user_text: str) -> bool:
     return bool(_SHOP_FACT.search(user_text or ""))
+
+
+def _contact_when_unanswered(user_text: str, kept: list[str], *, retrieval_passed: bool,
+                             forced_human: bool, tool_ok: bool) -> bool:
+    """知识库没有，模型也没留下能发的句子时，才改用留资原句。"""
+    if retrieval_passed or forced_human or tool_ok or lead_flow.must_handoff(user_text):
+        return False
+    if _TASK_RE.search(user_text or ""):
+        return False
+    return not any(line for line in kept if line and line != _CONFIRM_REPLY)
 
 
 def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str], list[str]]:
@@ -1032,6 +1078,11 @@ def _format_list_item(item: str) -> str:
     return f"{marker}{body}"
 
 
+def _colon_marked(items: list[str]) -> bool:
+    """「1：公司名称」这种带冒号的条目，原文自己有导语，不再加清单导语。"""
+    return any(_COLON_ITEM_RE.match((item or "").strip()) for item in items)
+
+
 def _format_source_list(items: list[str]) -> str:
     lines = [_format_list_item(item) for item in items]
     return f"{_LIST_LEAD}\n\n" + "\n".join(lines)
@@ -1061,7 +1112,10 @@ def _reply_with_source_list(user_text: str, contexts: list[dict], facets: list[s
         return [_format_source_list(chosen)]
     if any(not _LIST_ITEM_RE.match(line) for line in lines):
         body = [_format_list_item(line) if _LIST_ITEM_RE.match(line) else line for line in lines]
-        return [f"{_LIST_LEAD}\n\n" + "\n".join(body)]
+        text = "\n".join(body)
+        if _colon_marked(numbered):
+            return [text]
+        return [f"{_LIST_LEAD}\n\n" + text]
     return [_format_source_list(chosen)]
 
 
@@ -1093,6 +1147,8 @@ def _section_lines(contexts: list[dict]) -> list[str]:
             if not line or line.startswith("【"):
                 continue
             if line.startswith("问：") or line.startswith("问:"):
+                continue
+            if line.startswith("相似：") or line.startswith("相似:"):
                 continue
             if heading and line == heading:
                 continue
@@ -1462,26 +1518,42 @@ def _parse_contract(raw: str) -> AgentReply:
     return AgentReply.model_validate(data)
 
 
-def _apply_side_effects(customer_id: int, reply: AgentReply):
-    """标签合并 + 留资更新。"""
+def _apply_side_effects(customer_id: int, reply: AgentReply, *, conversation_id: int = 0,
+                        platform: str = "", user_text: str = "", recent: list | None = None):
+    """标签合并 + 留资更新。号码必须出现在当前这条用户消息里。"""
     db = SessionLocal()
+    nickname = ""
     try:
         customer = db.get(Customer, customer_id)
         if customer is None:
             return
+        nickname = customer.nickname or ""
         if reply.tags:
             existing = list(customer.tags or [])
             for tag in reply.tags:
                 if tag and tag not in existing:
                     existing.append(tag)
             customer.tags = existing
-        if reply.lead.phone:
-            customer.lead_phone = reply.lead.phone
-        if reply.lead.wechat:
-            customer.lead_wechat = reply.lead.wechat
-        if reply.lead.note:
-            customer.lead_note = reply.lead.note
         customer.updated_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
+    phone = lead_flow.phone_in_message(user_text)
+    wechat = ""
+    if not phone:
+        mentioned = (reply.lead.wechat or "").strip()
+        if mentioned and mentioned in (user_text or ""):
+            wechat = mentioned
+        else:
+            wechat = lead_flow.wechat_in_message(user_text)
+    contact = phone or wechat
+    if contact and conversation_id:
+        lead_flow.save_lead(
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+            platform=platform,
+            nickname=nickname,
+            contact=contact,
+            contact_type="phone" if phone else "wechat",
+            business=lead_flow.business_phrase(user_text, recent) or (reply.lead.note or ""),
+        )

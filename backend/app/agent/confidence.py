@@ -19,7 +19,7 @@ _LIST_LEAD = "清单我按资料发你"
 _HEADING_RE = re.compile(
     r"^(?:#{1,6}\s+\S|[一二三四五六七八九十百]+、\s*\S|（[一二三四五六七八九十百]+）\s*\S|\([一二三四五六七八九十百]+\)\s*\S)"
 )
-_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
 _TOPIC_WORDS = ("开户", "注册", "年审", "面签", "退货", "审计", "报税", "记账")
 _PHRASE_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 _HIGH_RISK_RE = re.compile(

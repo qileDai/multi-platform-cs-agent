@@ -358,8 +358,7 @@ async def test_pure_greeting_stays_with_ai(db, conversation, monkeypatch):
             .first()
         )
         assert "没查到靠谱资料" not in ai.content
-        assert "小赢" in ai.content
-        assert "开户" in ai.content
+        assert ai.content == "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
         assert ai.extra["timing"]["total_ms"] >= 0
         assert ai.extra["timing"]["draft_ms"] == 0
     assert called == []
@@ -574,6 +573,95 @@ async def test_numbered_list_reply_uses_source_items(db, conversation, monkeypat
     assert db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_colon_list_keeps_every_source_item(db, conversation, monkeypatch):
+    """「1：」清单按原文整段发出，模型只写了前两条也不截断。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="办理需要哪些材料",
+    ))
+    db.commit()
+    source = "\n".join([
+        "问：办理需要哪些材料",
+        "相似：注册需要什么资料",
+        "答：注册香港公司主要涉及：",
+        "1：公司名称",
+        "2：地址（我司提供）",
+        "3：经营范围",
+        "4：注册资金",
+        "5：股东董事相关身份信息",
+    ])
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": source, "source": "香港公司注册资料"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["注册香港公司主要涉及：\n1：公司名称\n2：地址（我司提供）"],
+            intent="consult_feature", confidence=0.8,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.settings, "humanize_base_delay_ms", 0)
+    monkeypatch.setattr(engine.settings, "humanize_per_char_ms", 0)
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 1
+    sent = rows[0].content
+    assert sent.startswith("注册香港公司主要涉及：")
+    assert "1：公司名称" in sent
+    assert "2：地址（我司提供）" in sent
+    assert "3：经营范围" in sent
+    assert "4：注册资金" in sent
+    assert "5：股东董事相关身份信息" in sent
+    assert "清单我按资料发你" not in sent
+    assert "相似" not in sent
+
+
+@pytest.mark.asyncio
+async def test_kb_miss_and_empty_model_asks_contact(db, conversation, monkeypatch):
+    """知识库没有，模型也没有回复时，用留资原句，不转人工。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="我要注册香港公司",
+    ))
+    db.commit()
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(passed=False, reason="no_hits", rewritten_queries=[query])
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(reply_messages=[], intent="other", confidence=0.0, handoff=False)
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    db.refresh(conversation)
+    assert conversation.mode == "ai"
+    sent = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).one().content
+    assert sent == "您这边联系方式多少呢，我们专员给您讲解一下注册香港公司"
 
 
 _MIANQIAN_ITEMS = [

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
+from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, leads, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
 from .api.deps import require_admin
 from .wecom import callback as wecom_callback
@@ -248,7 +248,7 @@ async def lifespan(app: FastAPI):
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
             db.add_all([
-                QuickReply(title="打招呼", content="在的，我是小赢。香港公司注册、开户都可以问我"),
+                QuickReply(title="打招呼", content="您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"),
                 QuickReply(title="稍等", content="稍等哈，我帮您查一下"),
                 QuickReply(title="转人工", content="这个我让同事来帮您处理哈，马上来"),
                 QuickReply(title="感谢", content="客气啦，有问题随时喊我"),
@@ -257,11 +257,17 @@ async def lifespan(app: FastAPI):
         else:
             stale = (
                 db.query(QuickReply)
-                .filter(QuickReply.title == "打招呼", QuickReply.content == "来啦，想问啥呀")
+                .filter(
+                    QuickReply.title == "打招呼",
+                    QuickReply.content.in_([
+                        "来啦，想问啥呀",
+                        "在的，我是小赢。香港公司注册、开户都可以问我",
+                    ]),
+                )
                 .all()
             )
             for item in stale:
-                item.content = "在的，我是小赢。香港公司注册、开户都可以问我"
+                item.content = "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
         db.commit()
         # 违禁词库加载（含入口/出口方向）
         contentfilter.load_db_words(
@@ -341,7 +347,7 @@ app.add_middleware(
 
 for r in [auth.router, webhooks.router, conversations.router, messages.router,
           account_bindings.router,
-          knowledge.router, agents.router, stats.router, quick.router, tickets.router,
+          knowledge.router, agents.router, stats.router, quick.router, tickets.router, leads.router,
           rpa.router, settings_api.router, evals.router, media_router, ws.router,
           accounts.router, contents.router, publish.router, comments.router,
           funnel.router, wecom_callback.router, analytics.router, inspiration.router,

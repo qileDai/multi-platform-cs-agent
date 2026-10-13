@@ -20,28 +20,29 @@ import {
   Users,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { NavLink, Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { useTheme } from '../hooks/useTheme'
 import { useAuth } from '../store'
+import { canSee, firstVisiblePath, moduleForPath } from '../utils/modules'
 
 const CS_NAV = [
-  { path: '/', label: '对话', icon: MessageSquare },
-  { path: '/knowledge', label: '知识库', icon: BookOpen },
-  { path: '/tickets', label: '工单', icon: ClipboardList },
-  { path: '/leads', label: '留资', icon: UserCheck },
-  { path: '/dashboard', label: '数据', icon: BarChart3 },
+  { path: '/', label: '对话', icon: MessageSquare, module: 'workbench' },
+  { path: '/knowledge', label: '知识库', icon: BookOpen, module: 'knowledge' },
+  { path: '/tickets', label: '工单', icon: ClipboardList, module: 'tickets' },
+  { path: '/leads', label: '留资', icon: UserCheck, module: 'leads' },
+  { path: '/dashboard', label: '数据', icon: BarChart3, module: 'dashboard' },
 ]
 
 const MATRIX_NAV = [
-  { path: '/accounts', label: '账号', icon: Users },
-  { path: '/studio', label: '创作', icon: PenSquare },
-  { path: '/publish', label: '发布', icon: CalendarClock },
-  { path: '/comments', label: '评论', icon: MessageCircle },
-  { path: '/funnel', label: '漏斗', icon: Filter },
-  { path: '/analytics', label: '效果', icon: TrendingUp },
-  { path: '/inspiration', label: '灵感', icon: Lightbulb },
-  { path: '/mock', label: '模拟', icon: FlaskConical },
+  { path: '/accounts', label: '账号', icon: Users, module: 'accounts' },
+  { path: '/studio', label: '创作', icon: PenSquare, module: 'studio' },
+  { path: '/publish', label: '发布', icon: CalendarClock, module: 'publish' },
+  { path: '/comments', label: '评论', icon: MessageCircle, module: 'comments' },
+  { path: '/funnel', label: '漏斗', icon: Filter, module: 'funnel' },
+  { path: '/analytics', label: '效果', icon: TrendingUp, module: 'analytics' },
+  { path: '/inspiration', label: '灵感', icon: Lightbulb, module: 'inspiration' },
+  { path: '/mock', label: '模拟', icon: FlaskConical, module: 'mock' },
 ]
 
 const STATUS_MAP: Record<string, { label: string; color: string }> = {
@@ -96,8 +97,16 @@ export default function Layout() {
   const [unread, setUnread] = useState(0)
   const [statusOpen, setStatusOpen] = useState(false)
   const statusRef = useRef<HTMLDivElement>(null)
+  const seeWorkbench = canSee(agent, 'workbench')
+  const seeSettings = canSee(agent, 'settings')
+  const csNav = CS_NAV.filter((item) => canSee(agent, item.module))
+  const matrixNav = MATRIX_NAV.filter((item) => canSee(agent, item.module))
+  const required = moduleForPath(location.pathname)
+  const allowed = !required || canSee(agent, required)
+  const fallback = firstVisiblePath(agent)
 
   useEffect(() => {
+    if (!seeWorkbench) return
     let alive = true
     const load = () =>
       api.statsOverview().then((s) => alive && setUnread(s.total_unread)).catch(() => {})
@@ -107,7 +116,7 @@ export default function Layout() {
       alive = false
       clearInterval(timer)
     }
-  }, [])
+  }, [seeWorkbench])
 
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -131,7 +140,7 @@ export default function Layout() {
           <Sparkles size={20} />
         </div>
 
-        {CS_NAV.map((item) => (
+        {csNav.map((item) => (
           <NavItem
             key={item.path}
             {...item}
@@ -140,13 +149,13 @@ export default function Layout() {
           />
         ))}
 
-        <div className="w-8 border-t border-gray-700 my-1.5" />
+        {csNav.length > 0 && matrixNav.length > 0 ? <div className="w-8 border-t border-gray-700 my-1.5" /> : null}
 
-        {MATRIX_NAV.map((item) => (
+        {matrixNav.map((item) => (
           <NavItem key={item.path} {...item} />
         ))}
 
-        <NavItem path="/settings" label="设置" icon={SettingsIcon} csActive={onWorkbench} />
+        {seeSettings ? <NavItem path="/settings" label="设置" icon={SettingsIcon} csActive={onWorkbench} /> : null}
 
         <div className="flex-1" />
 
@@ -204,7 +213,15 @@ export default function Layout() {
       </nav>
 
       <div className="flex-1 min-w-0">
-        <Outlet />
+        {allowed ? (
+          <Outlet />
+        ) : fallback ? (
+          <Navigate to={fallback} replace />
+        ) : (
+          <div className="h-full flex items-center justify-center text-sm text-gray-500">
+            当前账号没有可访问的模块，请联系管理员
+          </div>
+        )}
       </div>
     </div>
   )

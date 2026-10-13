@@ -63,6 +63,7 @@ class AgentOut(BaseModel):
     role: str
     status: str
     max_concurrent: Optional[int] = 20
+    modules: Optional[list[str]] = None  # None = 不限制；管理员始终忽略
 
     class Config:
         from_attributes = True
@@ -80,6 +81,7 @@ class AgentCreate(BaseModel):
     display_name: str
     role: str = "agent"
     max_concurrent: int = 20
+    modules: Optional[list[str]] = None  # 客服缺省为客服组；管理员忽略
 
 
 class AgentUpdate(BaseModel):
@@ -87,6 +89,7 @@ class AgentUpdate(BaseModel):
     display_name: Optional[str] = None
     role: Optional[Literal["admin", "agent"]] = None
     password: Optional[str] = None
+    modules: Optional[list[str]] = None
 
 
 class AgentStatusUpdate(BaseModel):

@@ -5,12 +5,14 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, leads, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
-from .api.deps import require_admin
+from .api.deps import agent_for_module_check, require_admin
+from .core.modules import agent_can, allowed_modules
 from .wecom import callback as wecom_callback
 from .api.messages import media_router
 from .api.ws import manager
@@ -344,6 +346,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def guard_modules(request: Request, call_next):
+    """按路径拦截未授权模块。登录、webhook、RPA worker、签名素材不在此列。"""
+    if request.method != "OPTIONS":
+        needed = allowed_modules(request.method, request.url.path)
+        if needed:
+            try:
+                agent = agent_for_module_check(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            if not any(agent_can(agent, key) for key in needed):
+                return JSONResponse({"detail": "无权访问该模块"}, status_code=403)
+    return await call_next(request)
 
 for r in [auth.router, webhooks.router, conversations.router, messages.router,
           account_bindings.router,

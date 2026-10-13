@@ -7,6 +7,7 @@ export interface Agent {
   role: string
   status: string
   max_concurrent?: number
+  modules?: string[] | null
 }
 
 export interface LeadCapture {
@@ -870,14 +871,28 @@ export const api = {
 
   // agents
   listAgents: () => request<Agent[]>('/api/agents'),
-  createAgent: (username: string, password: string, displayName: string, role = 'agent', maxConcurrent = 20) =>
+  createAgent: (
+    username: string,
+    password: string,
+    displayName: string,
+    role = 'agent',
+    maxConcurrent = 20,
+    modules?: string[],
+  ) =>
     request<Agent>('/api/agents', {
       method: 'POST',
-      body: JSON.stringify({ username, password, display_name: displayName, role, max_concurrent: maxConcurrent }),
+      body: JSON.stringify({
+        username,
+        password,
+        display_name: displayName,
+        role,
+        max_concurrent: maxConcurrent,
+        ...(modules ? { modules } : {}),
+      }),
     }),
   updateAgent: (
     id: number,
-    data: { max_concurrent?: number; display_name?: string; role?: string; password?: string },
+    data: { max_concurrent?: number; display_name?: string; role?: string; password?: string; modules?: string[] },
   ) => request<Agent>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAgent: (id: number) => request(`/api/agents/${id}`, { method: 'DELETE' }),
   setMyStatus: (status: string) =>

@@ -32,6 +32,18 @@ export default function App() {
     loadMe()
   }, [])
 
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === 'visible') loadMe()
+    }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [loadMe])
+
   if (!ready) {
     return <div className="h-full flex items-center justify-center text-gray-400">加载中...</div>
   }

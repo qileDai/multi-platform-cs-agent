@@ -18,6 +18,8 @@ class Agent(Base):
     password_hash = Column(String(128), nullable=False)
     display_name = Column(String(64), nullable=False)
     role = Column(String(16), default="agent")  # admin | agent
+    # None = 不限制（旧账号）；非空为可见模块 key 列表。管理员忽略此列。
+    modules = Column(JSON, nullable=True)
     status = Column(String(16), default="offline")  # active(接待中) | resting(休息) | offline
     max_concurrent = Column(Integer, default=20)  # 接待上限；0 = 不自动分配，仍可接受转接
     created_at = Column(DateTime, default=datetime.utcnow)

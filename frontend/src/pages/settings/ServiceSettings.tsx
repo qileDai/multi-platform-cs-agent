@@ -6,6 +6,13 @@ import { confirmDialog } from '../../components/ui/dialogs'
 import Empty from '../../components/ui/Empty'
 import { toast } from '../../components/ui/toast'
 import { useAuth } from '../../store'
+import {
+  ALL_MODULE_KEYS,
+  CS_MODULE_KEYS,
+  MATRIX_MODULE_KEYS,
+  MODULES,
+  moduleSummary,
+} from '../../utils/modules'
 
 const fieldClass = 'w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1 outline-none focus:border-blue-500'
 
@@ -19,6 +26,8 @@ type AgentDraft = {
   password: string
   role: 'agent' | 'admin'
   maxConcurrent: number
+  modules: string[]
+  unrestricted: boolean
 }
 
 const TABS: { id: Tab; label: string }[] = [
@@ -36,12 +45,14 @@ const STATUS_LABEL: Record<string, string> = {
 function FormModal({
   title,
   submitText,
+  wide,
   onClose,
   onSubmit,
   children,
 }: {
   title: string
   submitText: string
+  wide?: boolean
   onClose: () => void
   onSubmit: () => void
   children: ReactNode
@@ -49,7 +60,10 @@ function FormModal({
   return (
     <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={onClose}>
       <form
-        className="bg-white dark:bg-gray-800 rounded-2xl shadow-pop w-[420px] p-5"
+        className={clsx(
+          'bg-white dark:bg-gray-800 rounded-2xl shadow-pop p-5 max-h-[90vh] overflow-y-auto',
+          wide ? 'w-[560px]' : 'w-[420px]',
+        )}
         onClick={(e) => e.stopPropagation()}
         onSubmit={(e: FormEvent) => {
           e.preventDefault()
@@ -104,7 +118,16 @@ export default function ServiceSettings() {
 
   const openCreate = () => {
     if (tab === 'agents') {
-      setAgentDraft({ id: null, username: '', displayName: '', password: '', role: 'agent', maxConcurrent: 20 })
+      setAgentDraft({
+        id: null,
+        username: '',
+        displayName: '',
+        password: '',
+        role: 'agent',
+        maxConcurrent: 20,
+        modules: [...CS_MODULE_KEYS],
+        unrestricted: false,
+      })
     } else if (tab === 'quick') {
       setQuickDraft({ id: null, title: '', content: '', personal: false })
     } else {
@@ -125,13 +148,18 @@ export default function ServiceSettings() {
       toast.error('接待上限不能为负数')
       return
     }
+    if (agentDraft.role === 'agent' && agentDraft.modules.length === 0) {
+      toast.error('至少选择一个可见模块')
+      return
+    }
+    const modules = agentDraft.role === 'agent' ? agentDraft.modules : undefined
     try {
       if (agentDraft.id == null) {
         if (!username || !password) {
           toast.error('请填写账号和密码')
           return
         }
-        await api.createAgent(username, password, displayName, agentDraft.role, agentDraft.maxConcurrent)
+        await api.createAgent(username, password, displayName, agentDraft.role, agentDraft.maxConcurrent, modules)
         toast.success('客服账号已创建')
       } else {
         await api.updateAgent(agentDraft.id, {
@@ -139,6 +167,7 @@ export default function ServiceSettings() {
           role: agentDraft.role,
           max_concurrent: agentDraft.maxConcurrent,
           ...(password ? { password } : {}),
+          ...(modules ? { modules } : {}),
         })
         toast.success('客服账号已保存')
         if (agentDraft.id === me?.id) await loadMe()
@@ -293,6 +322,7 @@ export default function ServiceSettings() {
                   <th className="px-4 py-2.5 font-normal">姓名</th>
                   <th className="px-2 py-2.5 font-normal">账号</th>
                   <th className="px-2 py-2.5 font-normal">角色</th>
+                  <th className="px-2 py-2.5 font-normal">可见模块</th>
                   <th className="px-2 py-2.5 font-normal">状态</th>
                   <th className="px-2 py-2.5 font-normal">接待上限</th>
                   {isAdmin && <th className="px-4 py-2.5 font-normal w-28 text-right">操作</th>}
@@ -304,6 +334,7 @@ export default function ServiceSettings() {
                     <td className="px-4 py-2.5 text-gray-800 dark:text-gray-100">{a.display_name}</td>
                     <td className="px-2 py-2.5 text-gray-500">@{a.username}</td>
                     <td className="px-2 py-2.5 text-gray-500">{a.role === 'admin' ? '管理员' : '客服'}</td>
+                    <td className="px-2 py-2.5 text-gray-500">{moduleSummary(a)}</td>
                     <td className={`px-2 py-2.5 ${a.status === 'active' ? 'text-green-600' : 'text-gray-400'}`}>
                       {STATUS_LABEL[a.status] || a.status}
                     </td>
@@ -318,6 +349,8 @@ export default function ServiceSettings() {
                             password: '',
                             role: a.role === 'admin' ? 'admin' : 'agent',
                             maxConcurrent: a.max_concurrent ?? 20,
+                            modules: a.modules ?? [...ALL_MODULE_KEYS],
+                            unrestricted: a.role !== 'admin' && a.modules == null,
                           })}
                           className="text-blue-500 hover:text-blue-700 mr-3"
                         >
@@ -430,6 +463,7 @@ export default function ServiceSettings() {
         <FormModal
           title={agentDraft.id == null ? '新增客服' : '编辑客服'}
           submitText={agentDraft.id == null ? '添加' : '保存'}
+          wide
           onClose={() => setAgentDraft(null)}
           onSubmit={saveAgent}
         >
@@ -487,6 +521,73 @@ export default function ServiceSettings() {
               className={fieldClass}
             />
           </label>
+          <div className="text-xs text-gray-500 dark:text-gray-400">
+            <div className="flex items-center gap-2 mb-2">
+              <span>可见模块</span>
+              {agentDraft.role === 'agent' && (
+                <span className="ml-auto flex gap-1">
+                  {(
+                    [
+                      ['客服组', CS_MODULE_KEYS],
+                      ['矩阵组', MATRIX_MODULE_KEYS],
+                      ['全选', ALL_MODULE_KEYS],
+                    ] as const
+                  ).map(([label, keys]) => (
+                    <button
+                      key={label}
+                      type="button"
+                      onClick={() => setAgentDraft({ ...agentDraft, modules: [...keys], unrestricted: false })}
+                      className="px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </span>
+              )}
+            </div>
+            {agentDraft.role === 'admin' ? (
+              <p className="text-gray-400">管理员可见全部模块</p>
+            ) : (
+              <>
+                {agentDraft.unrestricted && (
+                  <p className="text-amber-600 dark:text-amber-400 mb-2">
+                    该账号尚未单独配置，当前可见全部。保存后按勾选生效。
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {(
+                    [
+                      ['客服', 'cs'],
+                      ['矩阵', 'matrix'],
+                      ['设置', 'settings'],
+                    ] as const
+                  ).map(([title, group]) => (
+                    <div key={group}>
+                      <div className="text-[11px] text-gray-400 mb-1">{title}</div>
+                      <div className="grid grid-cols-4 gap-1.5">
+                        {MODULES.filter((item) => item.group === group).map((item) => (
+                          <label key={item.key} className="flex items-center gap-1.5 text-gray-700 dark:text-gray-200">
+                            <input
+                              type="checkbox"
+                              checked={agentDraft.modules.includes(item.key)}
+                              onChange={() => {
+                                const has = agentDraft.modules.includes(item.key)
+                                const modules = has
+                                  ? agentDraft.modules.filter((key) => key !== item.key)
+                                  : [...agentDraft.modules, item.key]
+                                setAgentDraft({ ...agentDraft, modules, unrestricted: false })
+                              }}
+                            />
+                            {item.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </FormModal>
       )}
 

@@ -428,8 +428,7 @@ async def test_human_greeting_sends_without_mode_change(db, conversation, monkey
     ai = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one()
-    assert "小赢" in ai.content
-    assert "开户" in ai.content
+    assert ai.content == "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
     assert db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "system",
     ).count() == 0

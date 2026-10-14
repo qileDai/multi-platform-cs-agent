@@ -45,6 +45,7 @@ _GREETING_REPLIES = {"谢谢": _THANKS_REPLY, "哈哈": _LAUGH_REPLY}
 _LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
 _LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
 _COLON_ITEM_RE = re.compile(r"^\d+\s*[:：]")
+_LIST_ANNOUNCE_RE = re.compile(r"(?:如下|分别是|主要包括)[：:。．]?$")
 _LIST_LEAD = "清单我按资料发你"
 _EMPTY_REPLY = "不好意思，我这边没说清楚，先帮您转给同事哈"
 _MISS_REPLY = "这个问题我这边没查到靠谱资料，先帮您转给同事哈"
@@ -278,6 +279,24 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     retrieval = await _retrieve_covering(user_text, recent, summary)
     for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
         _add_stage_ms(key, int(retrieval.stage_ms.get(key, 0)))
+    exact_messages = _exact_faq_messages(user_text, retrieval)
+    if exact_messages:
+        _save_retrieval_trace(user_message_id, retrieval)
+        payload = confidence.answer_confidence_payload(
+            faithfulness_score=1.0, precision=1.0, cause="", retried=False, raw_precision=1.0,
+        )
+        text, sent = await _deliver_ai(
+            conversation_id_, exact_messages, local=local, allow_owned=owned,
+            extra={
+                "intent": "consult_feature", "confidence": 0.95,
+                "citations": _citation_payload(retrieval.contexts),
+                "grounded": True, "answer_confidence": payload,
+            },
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        if sent:
+            _bump_knowledge_hits(retrieval.contexts)
+        return text
     if retrieval.query_vector:
         cached = await answer_cache.lookup(user_text, retrieval.query_vector)
     else:
@@ -442,6 +461,12 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
 
     kept, list_dropped = _without_ungrounded_lists(kept, blob)
     dropped.extend(list_dropped)
+    if not any(line.strip() for line in kept):
+        answer = _single_faq_answer(retrieval.contexts)
+        if answer:
+            kept = [answer]
+            reply.handoff = False
+            reply.handoff_reason = ""
     shop_gap = bool(gaps) or ((not retrieval.passed) and _expects_shop_fact(user_text) and not tool_ok)
     if not kept:
         kept = [_CONFIRM_REPLY]
@@ -637,6 +662,14 @@ def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str]
                     dropped.append(line)
                     continue
             lines.append(line)
+        if not any(_LIST_ITEM_RE.match(line) for line in lines if line):
+            announced: list[str] = []
+            for line in lines:
+                if line and _LIST_ANNOUNCE_RE.search(re.sub(r"\s+", "", line)):
+                    dropped.append(line)
+                    continue
+                announced.append(line)
+            lines = announced
         while lines and not lines[0]:
             lines.pop(0)
         while lines and not lines[-1]:
@@ -1053,6 +1086,48 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
         extra={"intent": "other", "confidence": reply.confidence, "citations": [], "from_dialogue": True, "grounded": True},
     )
     return text
+
+
+def _faq_answer_body(content: str) -> str:
+    """取出 FAQ 切片里「答：」之后的正文。问句和相似问不发出。"""
+    lines = (content or "").splitlines()
+    start = None
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped.startswith("答：") or stripped.startswith("答:"):
+            start = index
+            break
+    if start is None:
+        return ""
+    first = lines[start].strip()
+    first = first.removeprefix("答：").removeprefix("答:").strip()
+    rest = [line.strip() for line in lines[start + 1:] if line.strip()]
+    parts = ([first] if first else []) + rest
+    return "\n".join(parts).strip()
+
+
+def _exact_faq_messages(user_text: str, retrieval) -> list[str] | None:
+    """精确命中单条 FAQ 时用原文。清单仍走现有格式，其余发答正文。"""
+    if not getattr(retrieval, "exact_faq", False) or len(retrieval.contexts) != 1:
+        return None
+    context = retrieval.contexts[0]
+    if context.get("doc_type") not in (None, "", "faq"):
+        return None
+    listed = _reply_with_source_list(user_text, retrieval.contexts, list(retrieval.facets or []))
+    if listed:
+        return listed
+    body = _faq_answer_body(context.get("content") or "")
+    return [body] if body else None
+
+
+def _single_faq_answer(contexts: list[dict]) -> str:
+    """检索结果只剩一条 FAQ 时，用它的答正文兜底。"""
+    if len(contexts or []) != 1:
+        return ""
+    context = contexts[0]
+    if context.get("doc_type") not in (None, "", "faq"):
+        return ""
+    return _faq_answer_body(context.get("content") or "")
 
 
 def _numbered_items(text: str) -> list[str]:

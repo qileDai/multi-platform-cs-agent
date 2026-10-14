@@ -133,17 +133,46 @@ def _statements(messages: list[str]) -> list[str]:
     return lines
 
 
-def _chinese_windows(text: str) -> list[str]:
+_SIMILAR_LINE_RE = re.compile(r"^\s*相似[:：]")
+
+
+def _chinese_windows(text: str, min_size: int = 4) -> list[str]:
+    """回复侧至少连续 4 个字。两三个字撞上资料，不能把整句算成有依据。"""
     chars = re.findall(r"[\u4e00-\u9fff]", text or "")
     windows: list[str] = []
-    for size in range(2, min(8, len(chars) + 1)):
+    for size in range(min_size, min(8, len(chars) + 1)):
         for index in range(len(chars) - size + 1):
             windows.append("".join(chars[index:index + size]))
     return windows
 
 
+def _evidence_fact_in_statement(statement: str, blob: str) -> bool:
+    """资料里的三字事实出现在回复中，例如「身份证」。两个字不算。"""
+    compact_statement = _compact(statement)
+    for run in re.findall(r"[\u4e00-\u9fff]+", blob or ""):
+        if len(run) < 3:
+            continue
+        for size in range(3, min(len(run), 8) + 1):
+            for index in range(len(run) - size + 1):
+                if run[index:index + size] in compact_statement:
+                    return True
+    return False
+
+
+def _scoring_blob(contexts: list[dict]) -> str:
+    """相似问只用于检索，不作为忠实度证据。"""
+    parts: list[str] = []
+    for item in contexts or []:
+        kept = [
+            raw for raw in (item.get("content") or "").splitlines()
+            if not _SIMILAR_LINE_RE.match(raw)
+        ]
+        parts.append("\n".join(kept))
+    return "\n".join(parts)
+
+
 def statement_supported(statement: str, blob: str) -> bool:
-    """编号行必须整句落在相关段落里。口语复述只要关键信息或数字对得上。"""
+    """编号行的关键短语都要落在证据里。散文至少要有连续 4 个字对得上。"""
     if evidence.claims_unsupported([statement], blob):
         return False
     compact_statement = _compact(statement)
@@ -156,13 +185,15 @@ def statement_supported(statement: str, blob: str) -> bool:
         return bool(required) and all(item in compact_blob for item in required)
     if any(item in compact_blob for item in _chinese_windows(compact_statement)):
         return True
+    if _evidence_fact_in_statement(statement, blob):
+        return True
     folded = evidence.fold_digits(statement or "")
     return evidence._AMOUNT.search(folded) is not None
 
 
 def faithfulness(messages: list[str], contexts: list[dict]) -> float:
     """能被相关段落推断的陈述占比。没有相关段落或没有陈述时为 0。"""
-    blob = "\n".join((item.get("content") or "") for item in contexts or [])
+    blob = _scoring_blob(contexts)
     statements = _statements(messages)
     if not contexts or not statements or not blob.strip():
         return 0.0
@@ -172,7 +203,7 @@ def faithfulness(messages: list[str], contexts: list[dict]) -> float:
 
 def supported_messages(messages: list[str], contexts: list[dict]) -> list[str]:
     """只留下能从相关段落推断的句子。"""
-    blob = "\n".join((item.get("content") or "") for item in contexts or [])
+    blob = _scoring_blob(contexts)
     kept: list[str] = []
     for message in messages or []:
         lines = []

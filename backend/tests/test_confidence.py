@@ -36,6 +36,24 @@ def test_account_opening_claims_are_not_faithful_to_registration_section():
     assert "公司名称" in kept
 
 
+def test_similar_question_and_short_overlap_are_not_faithful():
+    contexts = [{
+        "content": (
+            "问：如何获取资料、流程及费用？\n"
+            "相似：香港公司如何注册？\n"
+            "答：您这边联系方式多少呢，我们专员给您讲解一下办理的流程、资料和费用，让您参考了解下"
+        ),
+    }]
+    invented = ["香港公司注册的具体步骤如下："]
+    assert confidence.faithfulness(invented, contexts) < confidence.PASS_SCORE
+    kept = confidence.supported_messages(invented, contexts)
+    assert kept == []
+
+    short = ["可以很快"]
+    blob = [{"content": "答：可以不用。"}]
+    assert confidence.faithfulness(short, blob) < confidence.PASS_SCORE
+
+
 def test_verbatim_section_is_fully_faithful():
     section = "1、公司名称\n中文名：\n2、注册资本\n①证件照片"
     score = confidence.faithfulness([section], [{"content": section}])

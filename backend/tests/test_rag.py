@@ -1172,6 +1172,103 @@ async def test_exact_faq_beats_stale_cache_and_other_doc(db, conversation, monke
 
 
 @pytest.mark.asyncio
+async def test_exact_faq_sends_stored_answer_not_invented_steps(db, conversation, monkeypatch):
+    """精确命中留资、费用、是否能办时发答正文，不发模型编的步骤。"""
+    import json
+
+    from app.agent import engine
+    from app.agent.lead_flow import ASK_FULL
+    from app.schemas import AgentReply
+
+    lead = KnowledgeDoc(
+        title="办理流程", doc_type="faq", status="active",
+        content=f"问：如何获取资料、流程及费用？\n答：{ASK_FULL}",
+        similar_questions=json.dumps(["香港公司如何注册？"], ensure_ascii=False),
+    )
+    price = KnowledgeDoc(
+        title="庆典注册费", doc_type="faq", status="active",
+        content="问：庆典注册费是多少\n答：10周年庆典3980的活动价。",
+    )
+    visit = KnowledgeDoc(
+        title="注册要不要本人到场", doc_type="faq", status="active",
+        content="问：注册要不要本人亲自到场\n答：可以不用。",
+    )
+    db.add_all([lead, price, visit])
+    db.commit()
+    for doc in (lead, price, visit):
+        db.refresh(doc)
+        await ingest.ingest_faq(doc.id)
+
+    calls = {"llm": 0, "cache": 0}
+
+    async def fake_lookup(*_a, **_k):
+        calls["cache"] += 1
+        return ["香港公司注册的具体步骤如下："]
+
+    async def fake_llm(*_a, **_k):
+        calls["llm"] += 1
+        return AgentReply(
+            reply_messages=["香港公司注册的具体步骤如下：\n1. 提供公司名称及地址\n2. 准备董事和股东的身份证明"],
+            intent="consult_feature", confidence=0.9,
+        )
+
+    async def no_rewrite(query, history, summary=""):
+        return [query]
+
+    monkeypatch.setattr(engine.answer_cache, "lookup", fake_lookup)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr("app.rag.pipeline.rewrite.rewrite_query", no_rewrite)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+
+    async def ask(text: str) -> str:
+        db.add(Message(
+            conversation_id=conversation.id, sender_type="user", msg_type="text", content=text,
+        ))
+        db.commit()
+        await engine.process_ai_reply(conversation.id)
+        db.expire_all()
+        row = (
+            db.query(Message)
+            .filter(Message.conversation_id == conversation.id, Message.sender_type == "ai")
+            .order_by(Message.id.desc())
+            .first()
+        )
+        return row.content if row is not None else ""
+
+    try:
+        sent = await ask("香港公司如何注册？")
+        assert ASK_FULL in sent
+        assert "具体步骤" not in sent
+        assert "公司名称及地址" not in sent
+
+        sent = await ask("庆典注册费是多少")
+        assert sent == "10周年庆典3980的活动价。"
+        assert "具体步骤" not in sent
+
+        sent = await ask("注册要不要本人亲自到场")
+        assert sent == "可以不用。"
+        assert calls["llm"] == 0
+        assert calls["cache"] == 0
+    finally:
+        for doc in (lead, price, visit):
+            doc.status = "archived"
+        db.commit()
+        ingest.rebuild_bm25_from_db()
+
+
+def test_hollow_list_lead_is_dropped():
+    from app.agent import engine
+
+    kept, dropped = engine._without_ungrounded_lists(
+        ["香港公司注册的具体步骤如下：\n1. 提供公司名称及地址"],
+        "答：您这边联系方式多少呢",
+    )
+    assert kept == []
+    assert any("具体步骤" in line for line in dropped)
+    assert any("公司名称" in line for line in dropped)
+
+
+@pytest.mark.asyncio
 async def test_exact_faq_keeps_rewrite_and_skips_retrieval_network(db, monkeypatch):
     doc = KnowledgeDoc(
         title="香港开户资料", doc_type="faq", status="active",

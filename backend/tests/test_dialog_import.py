@@ -3,12 +3,14 @@ import io
 import uuid
 import zipfile
 
+from datetime import datetime, timedelta
+
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_current_agent
 from app.core.security import hash_password
 from app.main import app
-from app.models import Agent, KnowledgeChunk, KnowledgeDoc
+from app.models import Agent, Conversation, Customer, KnowledgeChunk, KnowledgeDoc, Message
 
 
 def _sheet_xml() -> str:
@@ -35,8 +37,17 @@ def _sheet_xml() -> str:
             f"</row>"
         )
 
+    headers = (
+        '<row r="1">'
+        '<c r="A1" t="str"><v>对话ID</v></c>'
+        '<c r="C1" t="str"><v>有效对话</v></c>'
+        '<c r="D1" t="str"><v>遗漏对话</v></c>'
+        '<c r="BS1" t="str"><v>对话创建时间</v></c>'
+        '<c r="CK1" t="str"><v>对话内容</v></c>'
+        "</row>"
+    )
     rows = [
-        '<row r="1"><c r="A1" t="str"><v>对话ID</v></c></row>',
+        headers,
         row(2, "有效", "未遗漏", price),
         row(3, "有效", "未遗漏", interest),
         row(4, "有效", "遗漏", price),
@@ -107,6 +118,70 @@ def test_import_dialogs_creates_disabled_faq_and_skips_gap(db):
         assert rejected.status_code == 400
     finally:
         app.dependency_overrides.pop(get_current_agent, None)
-        db.query(KnowledgeDoc).filter(KnowledgeDoc.title.in_(titles)).delete(synchronize_session=False)
+        doc_ids = [
+            row.id for row in db.query(KnowledgeDoc).filter(KnowledgeDoc.title.in_(titles)).all()
+        ]
+        if doc_ids:
+            db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id.in_(doc_ids)).delete(synchronize_session=False)
+            db.query(KnowledgeDoc).filter(KnowledgeDoc.id.in_(doc_ids)).delete(synchronize_session=False)
         db.query(Agent).filter(Agent.id == agent.id).delete(synchronize_session=False)
         db.commit()
+
+
+def test_offer_query_keeps_marketing_category():
+    from app.rag.pipeline import _blocked_categories
+
+    assert "营销话术" in _blocked_categories("注册需要什么资料")
+    assert "留资话术" in _blocked_categories("注册多少钱")
+    assert "营销话术" not in _blocked_categories("注册多少钱")
+
+
+def test_intent_is_explicit_only():
+    from app.agent.lead_flow import wants_to_proceed
+
+    assert wants_to_proceed("我要注册香港公司")
+    assert wants_to_proceed("可以，办吧")
+    assert not wants_to_proceed("注册需要什么资料")
+    assert not wants_to_proceed("怎么收费")
+
+
+async def test_silence_followup_stops_at_two(db, monkeypatch):
+    from app.services import sweep_lead_followups
+
+    customer = Customer(platform="mock", platform_user_id=uuid.uuid4().hex[:12], nickname="测")
+    db.add(customer)
+    db.flush()
+    conversation = Conversation(
+        customer_id=customer.id, platform="mock", mode="ai", status="open",
+        lead_followups=0, last_message_at=datetime.utcnow() - timedelta(minutes=10),
+    )
+    db.add(conversation)
+    db.flush()
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="ai", content="注册资料发给您了",
+        created_at=conversation.last_message_at,
+    ))
+    db.add(KnowledgeDoc(
+        title="还在线", doc_type="faq", category="跟进话术", status="active",
+        content="问：跟进\n答：老板，您还在线吗？留个联系方式",
+    ))
+    db.commit()
+    calls = []
+
+    async def fake_send(conversation_id, content, **kwargs):
+        calls.append(content)
+        return Message(id=len(calls), conversation_id=conversation_id, sender_type="ai", content=content)
+
+    monkeypatch.setattr("app.services.send_outbound", fake_send)
+    assert await sweep_lead_followups() == 1
+    assert await sweep_lead_followups() == 1
+    assert await sweep_lead_followups() == 0
+    db.expire_all()
+    saved = db.get(Conversation, conversation.id)
+    assert saved.lead_followups == 2
+    assert len(calls) == 2
+    db.query(KnowledgeDoc).filter(KnowledgeDoc.category == "跟进话术").delete(synchronize_session=False)
+    db.query(Message).filter(Message.conversation_id == conversation.id).delete(synchronize_session=False)
+    db.delete(saved)
+    db.delete(customer)
+    db.commit()

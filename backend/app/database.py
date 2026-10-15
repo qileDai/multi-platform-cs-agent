@@ -82,3 +82,4 @@ def init_db():
     _ensure_column("knowledge_docs", "hit_count", "hit_count INTEGER DEFAULT 0")
     _ensure_column("account_bindings", "reopen_requested", "reopen_requested INTEGER DEFAULT 0")
     _ensure_column("missed_questions", "suggested_answer", "suggested_answer TEXT DEFAULT ''")
+    _ensure_column("conversations", "lead_followups", "lead_followups INTEGER DEFAULT 0")

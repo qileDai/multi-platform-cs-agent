@@ -97,6 +97,11 @@ async def session_sweeper():
         except Exception:  # noqa: BLE001
             logger.exception("会话超时扫描失败")
         try:
+            from .services import sweep_lead_followups
+            await sweep_lead_followups()
+        except Exception:  # noqa: BLE001
+            logger.exception("沉默留资跟进失败")
+        try:
             _rpa_housekeep_once()
         except Exception:  # noqa: BLE001
             logger.exception("RPA 运维清扫失败")

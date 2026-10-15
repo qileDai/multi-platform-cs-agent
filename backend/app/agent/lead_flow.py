@@ -74,6 +74,40 @@ def _mentions_account(user_text: str, recent: list[dict] | None) -> bool:
     return any(word in blob for word in ("开户", "开银行账户", "银行账户"))
 
 
+def library_script(category: str) -> str:
+    """从已启用的话术库取一条原句。没有则返回空。"""
+    from ..database import SessionLocal
+    from ..models import KnowledgeDoc
+
+    db = SessionLocal()
+    try:
+        doc = (
+            db.query(KnowledgeDoc)
+            .filter(
+                KnowledgeDoc.doc_type == "faq",
+                KnowledgeDoc.status == "active",
+                KnowledgeDoc.category == category,
+            )
+            .order_by(KnowledgeDoc.hit_count.desc(), KnowledgeDoc.id.asc())
+            .first()
+        )
+        if doc is None:
+            return ""
+        _question, _, answer = (doc.content or "").partition("\n")
+        return answer.removeprefix("答：").removeprefix("答:").strip()
+    finally:
+        db.close()
+
+
+def wants_to_proceed(text: str) -> bool:
+    """明确要办理。接着问资料、费用、流程不算。"""
+    raw = text or ""
+    return any(phrase in raw for phrase in (
+        "我要注册", "我要办", "帮我办", "想注册", "想办理", "怎么办理",
+        "可以，办", "可以办吧", "办吧", "给我办", "我要开户",
+    ))
+
+
 def script_for_miss(user_text: str, recent: list[dict] | None = None) -> str | None:
     """知识没命中时用的原句。投诉和要真人返回 None，交给转人工。"""
     if must_handoff(user_text):

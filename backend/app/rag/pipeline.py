@@ -81,7 +81,7 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
 
     # 3. RRF 融合（每路独立计名次，同一路内重复 chunk 只计一次）
     fused = _rrf_fuse(rankings)
-    candidates = fused[:20]
+    candidates = _without_blocked(fused[:20], query)
     result.fused_top = _fused_preview(candidates)
     if not candidates:
         result.reason = "no_hits"
@@ -148,6 +148,36 @@ async def _finish_retrieve(result: RetrievalResult, query: str, history: list[di
     return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
 
+_NON_ANSWER_CATEGORIES = {"留资话术", "跟进话术"}
+_MARKET_CATEGORY = "营销话术"
+_OFFER_QUERY = re.compile(r"多少钱|费用|收费|价格|优惠|活动|3980|周年")
+
+
+def _blocked_categories(query: str) -> set[str]:
+    """普通回答不拿留资和跟进。不问费用时也不拿营销话术。"""
+    blocked = set(_NON_ANSWER_CATEGORIES)
+    if not _OFFER_QUERY.search(query or ""):
+        blocked.add(_MARKET_CATEGORY)
+    return blocked
+
+
+def _categories_for(doc_ids: set[int]) -> dict[int, str]:
+    if not doc_ids:
+        return {}
+    db = SessionLocal()
+    try:
+        rows = db.query(KnowledgeDoc.id, KnowledgeDoc.category).filter(KnowledgeDoc.id.in_(doc_ids)).all()
+        return {row.id: row.category or "" for row in rows}
+    finally:
+        db.close()
+
+
+def _without_blocked(hits: list[dict], query: str) -> list[dict]:
+    blocked = _blocked_categories(query)
+    categories = _categories_for({hit.get("doc_id") for hit in hits if isinstance(hit.get("doc_id"), int)})
+    return [hit for hit in hits if categories.get(hit.get("doc_id"), "") not in blocked]
+
+
 def _exact_faq_context(query: str) -> dict | None:
     """用户原句等于 FAQ 的问题、标题或相似问时，返回这条 FAQ 切片。"""
     phrase = _compact(query)
@@ -165,6 +195,10 @@ def _exact_faq_context(query: str) -> dict | None:
             labels.append(_compact(first.removeprefix("问：").removeprefix("问:")))
             labels.extend(_compact(item) for item in ingest.load_similar_questions(doc.similar_questions))
             if phrase not in labels:
+                continue
+            category = doc.category or ""
+            # 原句等于留资或跟进时，这条就是答案。模糊检索仍排除它们。
+            if category in _blocked_categories(query) and category not in _NON_ANSWER_CATEGORIES:
                 continue
             chunk = (
                 db.query(KnowledgeChunk)

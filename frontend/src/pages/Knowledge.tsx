@@ -60,6 +60,7 @@ export default function Knowledge() {
   const faqPackRef = useRef<HTMLInputElement>(null)
   const [importing, setImporting] = useState(false)
   const [packImporting, setPackImporting] = useState(false)
+  const [limit, setLimit] = useState(200)
 
   const refresh = async () => {
     const [list, pending] = await Promise.all([api.listDocs(), api.listMissed()])
@@ -83,17 +84,26 @@ export default function Knowledge() {
 
   const filtered = useMemo(() => {
     const keyword = q.trim().toLowerCase()
-    return visible.filter((d) => {
+    const isId = /^\d+$/.test(keyword)
+    const rows = visible.filter((d) => {
       if (nav === 'faq' && d.doc_type !== 'faq') return false
       if (nav === 'file' && d.doc_type !== 'file') return false
       if (statusFilter !== 'all' && d.status !== statusFilter) return false
       if (category && (d.category || '未分类') !== category) return false
       if (!keyword) return true
+      if (isId) return String(d.id).includes(keyword)
       const similars = (d.similar_questions || []).join(' ')
       const hay = `${d.title} ${d.question || ''} ${d.answer || ''} ${d.category || ''} ${similars}`.toLowerCase()
       return hay.includes(keyword)
     })
+    return rows.sort((a, b) => b.id - a.id)
   }, [visible, nav, category, q, statusFilter])
+
+  useEffect(() => {
+    setLimit(200)
+  }, [nav, category, q, statusFilter])
+
+  const shown = useMemo(() => filtered.slice(0, limit), [filtered, limit])
 
   const activeDoc = visible.find((d) => d.id === selectedId) || null
   const counts = {
@@ -138,13 +148,19 @@ export default function Knowledge() {
     navigate('/knowledge', { replace: true, state: null })
   }, [location.state])
 
+  const closeEditor = () => {
+    setSelectedId(null)
+    setCreating(false)
+    setMissedId(null)
+  }
+
   const saveFaq = async (e: FormEvent) => {
     e.preventDefault()
     if (!draft.title.trim() || !draft.question.trim() || !draft.answer.trim()) return
     setSaving(true)
     let savedId = activeDoc?.id ?? null
     try {
-      const similars = draft.similars.map((s) => s.trim()).filter(Boolean)
+      const similars = Array.from(new Set(draft.similars.map((s) => s.trim()).filter(Boolean)))
       if (missedId) {
         const res = await api.resolveMissed(missedId, draft.title.trim(), draft.question.trim(), draft.answer.trim(), draft.category, similars)
         savedId = res.doc_id
@@ -578,7 +594,7 @@ export default function Knowledge() {
                 )}
               </div>
               <div className="flex-1 overflow-y-auto">
-                {filtered.map((doc) => (
+                {shown.map((doc) => (
                   <div
                     key={doc.id}
                     role="button"
@@ -587,8 +603,8 @@ export default function Knowledge() {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') openDoc(doc)
                     }}
-                    className={clsx(
-                      'w-full text-left px-4 py-2.5 border-b dark:border-gray-800/80 cursor-pointer',
+                className={clsx(
+                  'group w-full text-left px-4 py-2.5 border-b dark:border-gray-800/80 cursor-pointer',
                       selectedId === doc.id && !creating ? 'bg-primary-50 dark:bg-primary-600/15' : 'hover:bg-white dark:hover:bg-gray-900',
                     )}
                   >
@@ -609,14 +625,39 @@ export default function Knowledge() {
                     {doc.doc_type === 'faq' && doc.question && (
                       <div className="text-[11px] text-gray-500 dark:text-gray-400 truncate mt-0.5 pl-6">{doc.question}</div>
                     )}
-                    <div className="text-[11px] text-gray-400 mt-0.5 flex gap-2 pl-6">
+                    <div className="text-[11px] text-gray-400 mt-0.5 flex items-center gap-2 pl-6">
+                      <span>#{doc.id}</span>
                       <span>{doc.category || '未分类'}</span>
                       <span>{doc.chunk_count} 切片</span>
                       <span>引用 {doc.hit_count || 0} 次</span>
                       <span className={doc.status === 'active' ? 'text-primary-600' : 'text-gray-400'}>{statusLabel(doc.status)}</span>
+                      <button
+                        type="button"
+                        disabled={acting}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleStatus(doc)
+                        }}
+                        className={clsx(
+                          'ml-auto rounded px-1.5 py-px opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity disabled:opacity-40',
+                          doc.status === 'active'
+                            ? 'text-gray-500 bg-gray-100 dark:bg-gray-800 dark:text-gray-300'
+                            : 'bg-primary-600 text-white',
+                        )}
+                      >
+                        {doc.status === 'active' ? '停用' : '启用'}
+                      </button>
                     </div>
                   </div>
                 ))}
+                {filtered.length > shown.length && (
+                  <div className="px-4 py-3 flex items-center gap-3 text-xs text-gray-400">
+                    <span>已显示 {shown.length} / {filtered.length} 条</span>
+                    <button onClick={() => setLimit((n) => n + 200)} className="text-primary-600">
+                      显示更多
+                    </button>
+                  </div>
+                )}
                 {filtered.length === 0 && (
                   <Empty icon={FileText} title="没有匹配的知识" hint="新建 FAQ，或上传 PDF / Word / Markdown" />
                 )}
@@ -625,93 +666,104 @@ export default function Knowledge() {
           )}
         </section>
 
-        <aside className="w-[360px] shrink-0 border-l dark:border-gray-800 bg-white dark:bg-gray-900 overflow-y-auto">
+        <aside className="w-[360px] shrink-0 border-l dark:border-gray-800 bg-white dark:bg-gray-900 flex flex-col">
           {!showEditor && (
             <div className="h-full flex items-center justify-center text-sm text-gray-400 px-6 text-center">
               选择一条知识，或新建 FAQ
             </div>
           )}
           {showEditor && (creating || activeDoc?.doc_type === 'faq') && (
-            <form onSubmit={saveFaq} className="p-4 space-y-3">
-              <div className="text-sm font-medium text-gray-800 dark:text-gray-100">
-                {missedId ? '未命中转 FAQ' : creating ? '新建 FAQ' : '编辑 FAQ'}
-              </div>
-              <Field label="标题">
-                <input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className={inputCls} placeholder="产品价格" />
-              </Field>
-              <Field label="分类">
-                <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} className={inputCls} list="kb-categories" placeholder="未分类" />
-              </Field>
-              <Field label="标准问">
-                <input value={draft.question} onChange={(e) => setDraft({ ...draft, question: e.target.value })} className={inputCls} placeholder="这个多少钱" />
-              </Field>
-              <Field label="相似问">
-                <div className="space-y-1.5">
-                  {draft.similars.map((item, i) => (
-                    <div key={i} className="flex gap-1">
-                      <input
-                        value={item}
-                        onChange={(e) => {
-                          const next = [...draft.similars]
-                          next[i] = e.target.value
-                          setDraft({ ...draft, similars: next })
-                        }}
-                        className={inputCls}
-                        placeholder="什么价 / 怎么卖"
-                      />
-                      <button type="button" onClick={() => setDraft({ ...draft, similars: draft.similars.filter((_, j) => j !== i) })} className="text-gray-400 px-1">
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ))}
-                  <button type="button" onClick={() => setDraft({ ...draft, similars: [...draft.similars, ''] })} className="text-xs text-primary-600">
-                    添加相似问
-                  </button>
+            <form onSubmit={saveFaq} className="flex-1 min-h-0 flex flex-col">
+              <div className="p-4 pb-3 flex items-center gap-2">
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-100">
+                  {missedId ? '未命中转 FAQ' : creating ? '新建 FAQ' : '编辑 FAQ'}
                 </div>
-              </Field>
-              <Field label="答案">
-                <textarea value={draft.answer} onChange={(e) => setDraft({ ...draft, answer: e.target.value })} rows={6} className={inputCls} placeholder="标准款 99 元" />
-              </Field>
-              {activeDoc && !creating && (
+                <button type="button" onClick={closeEditor} className="ml-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-3">
+                <Field label="标题">
+                  <input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className={inputCls} placeholder="产品价格" />
+                </Field>
+                <Field label="分类">
+                  <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} className={inputCls} list="kb-categories" placeholder="未分类" />
+                </Field>
+                <Field label="标准问">
+                  <input value={draft.question} onChange={(e) => setDraft({ ...draft, question: e.target.value })} className={inputCls} placeholder="这个多少钱" />
+                </Field>
+                <Field label="相似问">
+                  <textarea
+                    value={draft.similars.join('\n')}
+                    onChange={(e) => setDraft({ ...draft, similars: e.target.value.split('\n') })}
+                    onPaste={(e) => {
+                      const text = e.clipboardData.getData('text')
+                      if (!text) return
+                      const parts = text.split(/[\n,，、/／]+/).map((s) => s.trim()).filter(Boolean)
+                      const merged = Array.from(new Set([...draft.similars.filter((s) => s.trim()), ...parts]))
+                      e.preventDefault()
+                      setDraft({ ...draft, similars: merged })
+                    }}
+                    rows={5}
+                    className={inputCls}
+                    placeholder={'每行一条相似问\n可整段粘贴，自动按 换行/逗号/顿号/斜杠 拆分'}
+                  />
+                </Field>
+                <Field label="答案">
+                  <textarea value={draft.answer} onChange={(e) => setDraft({ ...draft, answer: e.target.value })} rows={6} className={inputCls} placeholder="标准款 99 元" />
+                </Field>
+                {activeDoc && !creating && (
+                  <EnableRow doc={activeDoc} onToggle={() => toggleStatus(activeDoc)} />
+                )}
+                <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
+              </div>
+              <div className="p-4 pt-3 border-t dark:border-gray-800 space-y-2">
+                <button disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
+                  {saving ? '保存中…' : '保存并索引'}
+                </button>
+                {activeDoc && !creating && (
+                  <button
+                    type="button"
+                    disabled={acting}
+                    onClick={() => removeDocs([activeDoc.id], activeDoc.title)}
+                    className="w-full text-xs text-red-500 disabled:opacity-50"
+                  >
+                    删除
+                  </button>
+                )}
+              </div>
+            </form>
+          )}
+          {showEditor && activeDoc && activeDoc.doc_type === 'file' && !creating && (
+            <div className="flex-1 min-h-0 flex flex-col">
+              <div className="p-4 pb-3 flex items-center gap-2">
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-100">文档</div>
+                <button type="button" onClick={closeEditor} className="ml-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-3">
+                <Field label="标题">
+                  <input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className={inputCls} />
+                </Field>
+                <Field label="分类">
+                  <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} className={inputCls} list="kb-categories" />
+                </Field>
                 <EnableRow doc={activeDoc} onToggle={() => toggleStatus(activeDoc)} />
-              )}
-              <button disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
-                {saving ? '保存中…' : '保存并索引'}
-              </button>
-              {activeDoc && !creating && (
+                <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
+              </div>
+              <div className="p-4 pt-3 border-t dark:border-gray-800 space-y-2">
+                <button onClick={saveFile} disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
+                  {saving ? '保存中…' : '保存'}
+                </button>
                 <button
-                  type="button"
                   disabled={acting}
                   onClick={() => removeDocs([activeDoc.id], activeDoc.title)}
                   className="w-full text-xs text-red-500 disabled:opacity-50"
                 >
                   删除
                 </button>
-              )}
-              <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
-            </form>
-          )}
-          {showEditor && activeDoc && activeDoc.doc_type === 'file' && !creating && (
-            <div className="p-4 space-y-3">
-              <div className="text-sm font-medium text-gray-800 dark:text-gray-100">文档</div>
-              <Field label="标题">
-                <input value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} className={inputCls} />
-              </Field>
-              <Field label="分类">
-                <input value={draft.category} onChange={(e) => setDraft({ ...draft, category: e.target.value })} className={inputCls} list="kb-categories" />
-              </Field>
-              <EnableRow doc={activeDoc} onToggle={() => toggleStatus(activeDoc)} />
-              <button onClick={saveFile} disabled={saving} className="w-full bg-primary-600 hover:bg-primary-700 text-white text-sm rounded-lg py-2 disabled:opacity-50">
-                {saving ? '保存中…' : '保存'}
-              </button>
-              <button
-                disabled={acting}
-                onClick={() => removeDocs([activeDoc.id], activeDoc.title)}
-                className="w-full text-xs text-red-500 disabled:opacity-50"
-              >
-                删除
-              </button>
-              <ChunkList chunks={chunks} open={chunksOpen} onToggle={() => setChunksOpen(!chunksOpen)} />
+              </div>
             </div>
           )}
           <datalist id="kb-categories">

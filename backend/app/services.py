@@ -4,7 +4,7 @@
 """
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -869,6 +869,64 @@ async def retry_outbound_send(payload: dict[str, Any]):
         await _broadcast_message(conversation, message)
     finally:
         db.close()
+
+
+async def sweep_lead_followups() -> int:
+    """顾客沉默超过 5 分钟，用跟进话术再留资。整段会话最多两次。"""
+    from .agent import lead_flow
+
+    cutoff = datetime.utcnow() - timedelta(minutes=5)
+    db = SessionLocal()
+    due: list[int] = []
+    try:
+        conversations = (
+            db.query(Conversation)
+            .filter(
+                Conversation.mode == "ai",
+                Conversation.status == "open",
+                Conversation.lead_followups < 2,
+                Conversation.last_message_at < cutoff,
+            )
+            .all()
+        )
+        for conversation in conversations:
+            customer = db.get(Customer, conversation.customer_id)
+            if customer is not None and ((customer.lead_phone or "").strip() or (customer.lead_wechat or "").strip()):
+                continue
+            last = (
+                db.query(Message)
+                .filter(Message.conversation_id == conversation.id, Message.is_internal.is_(False))
+                .order_by(Message.id.desc())
+                .first()
+            )
+            if last is None or last.sender_type != "ai":
+                continue
+            due.append(conversation.id)
+    finally:
+        db.close()
+
+    sent = 0
+    script = lead_flow.library_script("跟进话术") or lead_flow.library_script("留资话术") or lead_flow.ASK_FULL
+    for conversation_id in due:
+        message = await send_outbound(
+            conversation_id,
+            script,
+            sender_type="ai",
+            extra={"lead_followup": True},
+        )
+        if message is None:
+            continue
+        mark = SessionLocal()
+        try:
+            conversation = mark.get(Conversation, conversation_id)
+            if conversation is None:
+                continue
+            conversation.lead_followups = (conversation.lead_followups or 0) + 1
+            mark.commit()
+            sent += 1
+        finally:
+            mark.close()
+    return sent
 
 
 register_handler("inbound_message", handle_inbound)

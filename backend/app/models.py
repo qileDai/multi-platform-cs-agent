@@ -80,6 +80,7 @@ class Conversation(Base):
     summary = Column(Text, default="")  # 滚动小结（长上下文压缩）
     summary_upto_message_id = Column(Integer, default=0)
     last_message_at = Column(DateTime, default=datetime.utcnow, index=True)
+    lead_followups = Column(Integer, default=0)  # 沉默留资跟进已发次数，整段会话最多 2
     created_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime, nullable=True)
 

@@ -576,6 +576,13 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     # #endregion
     citations = _citation_payload(retrieval.contexts)
     must_handoff = bool(reply.handoff) or shop_gap
+    if not must_handoff and messages and lead_flow.wants_to_proceed(user_text):
+        if lead_flow.phone_in_message(user_text) or lead_flow.wechat_in_message(user_text):
+            line = lead_flow.ARRANGE
+        else:
+            line = lead_flow.library_script("留资话术") or lead_flow.script_for_miss(user_text, recent) or ""
+        if line and all(line not in part for part in messages):
+            messages = [*messages, line][:3]
     extra = {
         "intent": reply.intent,
         "confidence": reply.confidence,
@@ -641,7 +648,19 @@ def _contact_when_unanswered(user_text: str, kept: list[str], *, retrieval_passe
         return False
     if _TASK_RE.search(user_text or ""):
         return False
-    return not any(line for line in kept if line and line != _CONFIRM_REPLY)
+    return not any(
+        line for line in kept
+        if line and line != _CONFIRM_REPLY and not evidence.is_handoff_guide(line)
+    )
+
+
+def _contact_line(user_text: str, recent: list[dict] | None = None) -> str:
+    """留资话术优先，没有再用按业务拼的原句。"""
+    return (
+        lead_flow.library_script("留资话术")
+        or lead_flow.script_for_miss(user_text, recent)
+        or lead_flow.ASK_FULL
+    )
 
 
 def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str], list[str]]:

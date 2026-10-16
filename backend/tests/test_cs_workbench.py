@@ -164,22 +164,28 @@ async def test_contact_question_replies_consistent_script(db, conversation, monk
 async def test_ours_contact_uses_library_script(db, conversation, monkeypatch):
     """问「你们微信多少」：优先用话术库留资话术原句解释平台限制。"""
     from app.models import KnowledgeDoc
+    from app.rag import pipeline as rag_pipeline
 
     monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
-    db.add(KnowledgeDoc(
+    doc = KnowledgeDoc(
         doc_type="faq", status="active", category="留资话术", title="留个电话",
         content="问：留个电话\n答：平台限制发不了联系方式，您发下电话或者微信，安排专员给您介绍",
-    ))
+    )
+    db.add(doc)
     db.commit()
-    db.add(Message(conversation_id=conversation.id, sender_type="user",
-                   msg_type="text", content="你们微信多少"))
-    db.commit()
-
-    await engine.process_ai_reply(conversation.id)
-
-    ai = _latest_ai_message(db, conversation.id)
-    assert ai is not None
-    assert "平台限制" in ai.content
+    try:
+        db.add(Message(conversation_id=conversation.id, sender_type="user",
+                       msg_type="text", content="你们微信多少"))
+        db.commit()
+        await engine.process_ai_reply(conversation.id)
+        ai = _latest_ai_message(db, conversation.id)
+        assert ai is not None
+        assert "平台限制" in ai.content
+    finally:
+        # 共享测试库：删掉自种文档并失效 FAQ 钉住缓存，避免影响后续用例的兜底话术
+        db.query(KnowledgeDoc).filter(KnowledgeDoc.id == doc.id).delete()
+        db.commit()
+        rag_pipeline.invalidate_faq_pins()
 
 
 @pytest.mark.asyncio

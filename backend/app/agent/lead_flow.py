@@ -11,6 +11,19 @@ BANK_TYPE = "您好，您这边是想开公司户还是个人户呢？"
 
 _PHONE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 _WECHAT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{4,19}$")
+# 前缀式：（任意引导语）+ 微信/微信号/weixin/wx/vx + 分隔符 + ID。允许纯数字 ID（QQ 风格），「微信」字样即用户明示。
+# ID 必须顶到句尾，避免把「微信可以加吗」这类问句里的词误当 ID。
+_WECHAT_PREFIX = re.compile(
+    r"^(?:.*?)\s*(?:微信号?|weixin|wx|vx)(?:号)?[:：是为是\s，,、]*([A-Za-z0-9_-]{5,20})$", re.IGNORECASE,
+)
+# 后缀式：ID + 微信（真实语料有「278158820微信」这种写法）。
+_WECHAT_SUFFIX = re.compile(
+    r"^([A-Za-z0-9_-]{5,20})(?:微信|weixin|wx|vx)$", re.IGNORECASE,
+)
+# 尾部常见收尾标点与客套词（可连用，如「，谢谢」），识别前剥掉。
+_TRAILING_PUNCT_RE = re.compile(
+    r"(?:[。．.!！?？，,、;；~～]|谢谢|多谢|麻烦了|辛苦了|哈|呀|呢|啦|哦|噢)+$"
+)
 _HANDOFF = ("投诉", "退款", "赔偿", "转人工", "真人", "人工客服")
 _BUSINESS = (
     "注册香港公司",
@@ -35,9 +48,17 @@ def phone_in_message(text: str) -> str:
 
 
 def wechat_in_message(text: str) -> str:
+    """识别用户留下的微信号。前缀/后缀式允许纯数字 ID（明示「微信」）；裸消息只认字母开头。"""
     token = re.sub(r"\s+", "", text or "")
-    if token.lower() in {"hello", "wechat"}:
+    token = _TRAILING_PUNCT_RE.sub("", token)
+    if token.lower() in {"hello", "wechat", "weixin", "wx", "vx", "v", "微信", "微信号"}:
         return ""
+    matched = _WECHAT_PREFIX.match(token)
+    if matched:
+        return matched.group(1)
+    matched = _WECHAT_SUFFIX.match(token)
+    if matched:
+        return matched.group(1)
     if _WECHAT.match(token):
         return token
     return ""

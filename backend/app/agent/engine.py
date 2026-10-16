@@ -59,6 +59,22 @@ _GREETINGS = frozenset({
     "hi", "hello",
 })
 _GREETING_TAILS = "呀啊呢哈哦"
+# 纯应答：整条只是「好的/嗯/ok」。上一条客服消息在要联系方式或安排专员时，应答=等专员。
+_ACKS = frozenset({
+    "好的", "好嘞", "好滴", "好呀", "好", "嗯", "嗯嗯", "哦", "哦哦", "噢",
+    "ok", "okay", "行", "可以", "中",
+})
+_ACK_WAIT_REPLY = "好嘞，请您稍等"
+_ACK_GENERIC_REPLY = "好嘞，有啥想了解的随时问我"
+_ACK_CONTEXT_RE = re.compile(r"联系方式|电话|微信|专员|稍等")
+# 联系意图：问怎么联系/要联系方式。答案固定，走确定性话术，不进 RAG。
+_CONTACT_ASK_RE = re.compile(
+    r"怎么联系|如何联系|怎么沟通|如何沟通|联系方式|联系你们|微信多少|电话多少|号码多少|联系电话|留个电话"
+)
+# 问的是「我们的」联系方式：平台发不了，用留资话术原句解释并请对方留联系方式。
+_OURS_CONTACT_RE = re.compile(
+    r"(微信|电话|号码|联系方式)(是多少|多少)|你们.{0,3}(微信|电话|号码|联系方式)|留个电话"
+)
 
 
 def _greeting_key(text: str) -> str | None:
@@ -79,6 +95,38 @@ def is_pure_greeting(text: str) -> bool:
 def greeting_reply(text: str) -> str:
     """你好、哈喽用开场；谢谢和哈哈用短句，不套业务介绍。"""
     return _GREETING_REPLIES.get(_greeting_key(text) or "", _HELLO_REPLY)
+
+
+def is_pure_ack(text: str) -> bool:
+    """整条只是应答（好的/嗯/ok）。后面还带着问题时返回 False，继续走检索。"""
+    cleaned = re.sub(r"[\s，。！？、~～!?,.·…]+", "", text or "")
+    return cleaned.lower() in _ACKS
+
+
+def _ack_reply(recent: list[dict]) -> str:
+    """看最近一条客服消息：在要联系方式或安排专员时，应答=请稍等；否则通用接话。"""
+    for row in reversed(list(recent or [])):
+        if row.get("sender_type") in ("ai", "agent"):
+            if _ACK_CONTEXT_RE.search(row.get("content") or ""):
+                return _ACK_WAIT_REPLY
+            return _ACK_GENERIC_REPLY
+    return _ACK_GENERIC_REPLY
+
+
+def asks_contact(text: str) -> bool:
+    """在问怎么联系/要联系方式。只匹配固定短语，不碰「联系我」这类交代语。"""
+    return bool(_CONTACT_ASK_RE.search(text or ""))
+
+
+def _contact_intent_reply(user_text: str, recent: list[dict]) -> str:
+    """问我们的联系方式：优先留资话术原句。问怎么联系：按业务拼 contact_ask。"""
+    business = lead_flow.business_phrase(user_text, recent)
+    if _OURS_CONTACT_RE.search(user_text or ""):
+        return (
+            lead_flow.library_script("留资话术")
+            or lead_flow.contact_ask(business)
+        )
+    return lead_flow.contact_ask(business)
 
 
 def _activate_trace() -> contextvars.Token:
@@ -350,6 +398,13 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
 
     started = _trace_started()
     history_text, recent, summary = context.get_history_for_prompt(conversation_id_)
+    if is_pure_ack(user_text):
+        text, _sent = await _deliver_ai(
+            conversation_id_, [_ack_reply(recent)], local=local, allow_owned=owned,
+            extra={"intent": "chitchat", "confidence": 1.0, "citations": []},
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        return text
     if not lead_flow.must_handoff(user_text):
         phone = lead_flow.phone_in_message(user_text)
         wechat = "" if phone else lead_flow.wechat_in_message(user_text)
@@ -369,6 +424,14 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
                 anchor_user_message_id=user_message_id if local else None,
             )
             return text
+    if asks_contact(user_text) and not lead_flow.must_handoff(user_text):
+        # 联系意图答案固定：走确定性话术，不进 RAG，保证同类问法回复恒一致。
+        text, _sent = await _deliver_ai(
+            conversation_id_, [_contact_intent_reply(user_text, recent)], local=local, allow_owned=owned,
+            extra={"intent": "consult_feature", "confidence": 0.9, "citations": [], "grounded": True},
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        return text
     retrieval = await _retrieve_covering(user_text, recent, summary)
     for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
         _add_stage_ms(key, int(retrieval.stage_ms.get(key, 0)))

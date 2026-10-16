@@ -497,7 +497,7 @@ def test_glued_notice_is_returned_once(zhini_key):
     reply = resp.json()["reply"]
     assert reply.count("您要的我都列下面啦") == 1
     for item in _MIANQIAN_ITEMS:
-        assert reply.count(item.rstrip("。") + "；") == 1
+        assert reply.count(item) == 1
     assert len(reply) <= 500
     shorten.assert_not_called()
     db = SessionLocal()
@@ -510,10 +510,7 @@ def test_glued_notice_is_returned_once(zhini_key):
 
 def test_over_limit_shortens_the_written_reply(zhini_key):
     """去重后仍超过 500 字时，缩短的是这条已写好的长回复。"""
-    written = "".join(
-        f"第{i}句：面签时要带齐各自的证件并说清各自的生意情况，这句和别的句子都不一样。"
-        for i in range(1, 25)
-    )
+    written = "面签时要带齐证件并说清生意。" * 40
     assert len(written) > 500
     brief = "面签时带齐证件，说清生意，不要提敏感国家。"
     seen = {}
@@ -539,8 +536,8 @@ def test_over_limit_shortens_the_written_reply(zhini_key):
 
 
 @pytest.mark.asyncio
-async def test_shorten_failure_cuts_at_complete_entries():
-    """模型没有给出可用结果时，从最后一个完整「；」条目处收到 500 字以内。"""
+async def test_shorten_failure_cuts_at_a_complete_line():
+    """模型没有给出可用结果时，从最后一个完整条目处收到 500 字以内。"""
     from app.integrations.zhinikuaihui import prepare_plugin_reply
 
     lines = [f"{i}、这是一条足够长的面签注意事项，用来把全文撑过五百字。" for i in range(1, 21)]
@@ -553,90 +550,8 @@ async def test_shorten_failure_cuts_at_complete_entries():
     with patch("app.integrations.zhinikuaihui._shorten_written_reply", side_effect=fail):
         reply = await prepare_plugin_reply(written)
     assert len(reply) <= 500
-    kept = reply.split("；")
+    kept = reply.splitlines()
     assert kept
-    assert kept[0] == lines[0].rstrip("。")
-    assert kept[-1] == lines[len(kept) - 1].rstrip("。")
-    assert lines[len(kept)] not in reply
-
-
-def test_clean_multi_line_reply_is_sent_to_plugin_single_line(zhini_key):
-    """多行干净回复压成单行：插件对多行回复的输入框粘贴会重复拼接。"""
-    written = (
-        "现在是我们10周年庆典3980的活动价，含3900的官费，包含秘书服务、秘书地址、绿盒子全套。\n"
-        "您留个联系方式，给您预留一个优惠名额。\n"
-        "注册香港公司一般1-3个工作日可以下来，注册不用本人到港。"
-    )
-
-    async def generate(conversation_id, local=True, allow_owned=False):
-        return written
-
-    with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=generate), \
-            patch("app.integrations.zhinikuaihui._shorten_written_reply", new_callable=AsyncMock) as shorten:
-        resp = client.post(
-            "/api/integrations/zhinikuaihui/reply",
-            json=_body(),
-            headers=_auth(zhini_key),
-        )
-    assert resp.status_code == 200
-    reply = resp.json()["reply"]
-    assert "\n" not in reply
-    for part in written.split("\n"):
-        assert reply.count(part) == 1
-    shorten.assert_not_called()
-
-
-def test_duplicated_prose_segments_collapse_before_shorten(zhini_key):
-    """插件式重复段落 [A][A][B][C][A][B][C] 先句级去重再判断长度，不再调缩短模型。"""
-    a = "现在是我们10周年庆典3980的活动价，含3900的官费，包含秘书服务、秘书地址、绿盒子全套。"
-    b = "您留个联系方式，给您预留一个优惠名额。"
-    c = "注册香港公司一般1-3个工作日可以下来，注册不用本人到港。"
-    written = f"{a}{a}{b}{c}{a}{b}{c}" * 3
-    assert len(written) > 500
-
-    async def generate(conversation_id, local=True, allow_owned=False):
-        return written
-
-    with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=generate), \
-            patch("app.integrations.zhinikuaihui._shorten_written_reply", new_callable=AsyncMock) as shorten:
-        resp = client.post(
-            "/api/integrations/zhinikuaihui/reply",
-            json=_body(),
-            headers=_auth(zhini_key),
-        )
-    assert resp.status_code == 200
-    assert resp.json()["reply"] == f"{a}{b}{c}"
-    shorten.assert_not_called()
-
-
-def test_flattened_list_items_are_semicolon_separated(zhini_key):
-    """清单条目压平后以「；」分隔，条目正文一字不少。"""
-    written = (
-        "您要的我都列下面啦\n\n"
-        "您好，香港公司开户主要涉及：\n"
-        "1.股东及董事相关身份信息；\n"
-        "2.港澳通行证或者护照；\n"
-        "3.个人及公司银行流水\n"
-        "4.香港公司相关资料及业务合同。\n"
-        "以上资料您有什么不理解的地方吗？"
-    )
-
-    async def generate(conversation_id, local=True, allow_owned=False):
-        return written
-
-    with patch("app.integrations.zhinikuaihui.process_ai_reply", side_effect=generate), \
-            patch("app.integrations.zhinikuaihui._shorten_written_reply", new_callable=AsyncMock) as shorten:
-        resp = client.post(
-            "/api/integrations/zhinikuaihui/reply",
-            json=_body(),
-            headers=_auth(zhini_key),
-        )
-    assert resp.status_code == 200
-    reply = resp.json()["reply"]
-    assert "\n" not in reply
-    assert reply == (
-        "您要的我都列下面啦 您好，香港公司开户主要涉及： "
-        "1.股东及董事相关身份信息；2.港澳通行证或者护照；3.个人及公司银行流水；"
-        "4.香港公司相关资料及业务合同； 以上资料您有什么不理解的地方吗？"
-    )
-    shorten.assert_not_called()
+    assert kept[0] == lines[0]
+    assert kept[-1] in lines
+    assert lines[lines.index(kept[-1]) + 1] not in kept

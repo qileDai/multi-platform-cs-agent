@@ -176,24 +176,28 @@ async def _route_after_user_message(conversation_id: int, *, risk_level: str, mo
 
 
 async def _resume_if_unanswered(conversation_id: int, user_message_id: int):
-    """重试时消息已在库：后面已有 AI / 人工 / 系统回复则结束，否则按当前规则补跑。"""
+    """重试时消息已在库：紧跟着的已是回复则结束，否则按当前规则补跑。
+
+    后面先插入更新的用户消息时（回复答的是下一问），本条仍算没答上，需要补跑。
+    """
     db = SessionLocal()
     try:
         conversation = db.get(Conversation, conversation_id)
         user_message = db.get(Message, user_message_id)
         if conversation is None or user_message is None:
             return
-        answered = (
-            db.query(Message.id)
+        first_after = (
+            db.query(Message.sender_type)
             .filter(
                 Message.conversation_id == conversation_id,
                 Message.id > user_message_id,
-                Message.sender_type.in_(("ai", "agent", "system")),
                 Message.is_internal.is_(False),
             )
+            .order_by(Message.id)
             .first()
         )
-        if answered is not None:
+        # 紧跟本条出现的是回复才算已答；先出现新用户消息说明本条被跳过了
+        if first_after is not None and first_after[0] != "user":
             return
         content = user_message.content or ""
         risk_level = contentfilter.check_inbound(content)["level"] if content else "ok"

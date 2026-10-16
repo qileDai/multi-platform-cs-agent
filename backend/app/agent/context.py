@@ -1,10 +1,9 @@
 """上下文窗口管理：最近 N 条原文 + 更早历史的 LLM 滚动小结，控制 token 成本。"""
 import logging
 
-from openai import AsyncOpenAI
-
 from ..config import settings
 from ..database import SessionLocal
+from ..llm import get_llm_client, record_usage
 from ..models import Conversation, Customer, Message
 
 logger = logging.getLogger(__name__)
@@ -12,7 +11,13 @@ logger = logging.getLogger(__name__)
 RECENT_WINDOW = 10       # 注入提示词的最近原文条数
 SUMMARY_MIN_NEW = 4      # 自上次小结以来至少这么多条，就重写一版覆盖全段的小结
 
-SUMMARY_PROMPT = """把下面的客服对话历史压缩成 100 字以内的小结，保留：用户需求、已给出的关键信息（价格/政策）、用户情绪和待办事项。只输出小结文本。
+SUMMARY_PROMPT = """把下面的客服对话历史压缩成 300 字以内的结构化小结，按四行输出（没有对应内容就写无）：
+需求：用户要办的业务和当前进度
+关键事实：已经对客户说过的价格、费用、办理天数、银行名单、资料清单和已答应事项，逐条原样保留，不要改写数字
+待办：还没办或等人跟进的事项
+情绪：用户当前情绪
+
+只输出小结文本，不要解释。
 
 已有小结：{existing_summary}
 
@@ -62,7 +67,7 @@ def customer_profile_text(conversation_id: int) -> str:
         if conversation is None:
             return "无"
         customer = db.get(Customer, conversation.customer_id)
-        previous = (
+        previous_rows = (
             db.query(Conversation)
             .filter(
                 Conversation.customer_id == conversation.customer_id,
@@ -70,7 +75,8 @@ def customer_profile_text(conversation_id: int) -> str:
                 Conversation.summary != "",
             )
             .order_by(Conversation.id.desc())
-            .first()
+            .limit(3)
+            .all()
         )
         lines: list[str] = []
         tags = [tag for tag in list((customer.tags if customer else None) or []) if tag]
@@ -82,8 +88,9 @@ def customer_profile_text(conversation_id: int) -> str:
             lines.append("手机号：" + phone)
         if wechat:
             lines.append("微信：" + wechat)
-        if previous and (previous.summary or "").strip():
-            lines.append("上一通小结：" + previous.summary.strip())
+        for row, label in zip(previous_rows, ("上一通小结", "上上通小结", "更早小结")):
+            if (row.summary or "").strip():
+                lines.append(f"{label}：" + row.summary.strip())
         return "\n".join(lines) if lines else "无"
     finally:
         db.close()
@@ -122,14 +129,16 @@ async def maybe_update_summary(conversation_id: int):
             f"{'用户' if m.sender_type == 'user' else '客服'}: {m.content}" for m in messages
         )
         try:
-            client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key, timeout=8.0)
+            client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
             resp = await client.chat.completions.create(
                 model=settings.llm_model,
                 messages=[{"role": "user", "content": SUMMARY_PROMPT.format(
                     existing_summary=conversation.summary or "（无）", new_messages=text)}],
                 temperature=0,
-                max_tokens=300,
+                max_tokens=500,
+                timeout=8.0,
             )
+            record_usage(conversation_id, settings.llm_model, getattr(resp, "usage", None))
             conversation.summary = (resp.choices[0].message.content or "").strip()
             conversation.summary_upto_message_id = messages[-1].id
             db.commit()

@@ -8,9 +8,8 @@ import json
 import logging
 import re
 
-from openai import AsyncOpenAI
-
 from ..config import settings
+from ..llm import get_llm_client, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +79,16 @@ async def rewrite_query(query: str, history: list[dict], summary: str = "") -> l
             for h in earlier
         )
         history_text = "\n".join(lines) or "（无更早对话）"
-        client = AsyncOpenAI(
-            base_url=settings.llm_base_url, api_key=settings.llm_api_key, timeout=8.0,
-        )
+        client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": _render_prompt(history_text, query)}],
             temperature=0,
             max_tokens=200,
             response_format={"type": "json_object"},
+            timeout=8.0,
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         data = json.loads(resp.choices[0].message.content)
         queries = [data.get("standalone") or query]
         queries.extend(v for v in (data.get("variants") or []) if v)
@@ -127,16 +126,16 @@ async def broaden_query(query: str, used: list[str], reason: str, history: list[
         + f"\n\n用户原话：{query}"
     )
     try:
-        client = AsyncOpenAI(
-            base_url=settings.llm_base_url, api_key=settings.llm_api_key, timeout=8.0,
-        )
+        client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=120,
             response_format={"type": "json_object"},
+            timeout=8.0,
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         text = (json.loads(resp.choices[0].message.content).get("query") or "").strip()
     except Exception:  # noqa: BLE001
         logger.exception("放宽改写失败，停止重试")

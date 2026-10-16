@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -136,15 +137,7 @@ async def retrieve(query: str, history: list[dict] | None = None, top_k: int = 3
 
 async def _finish_retrieve(result: RetrievalResult, query: str, history: list[dict], summary: str,
                            top_k: int, broaden: bool) -> RetrievalResult:
-    """原问对上启用 FAQ 时，本轮只用这条 FAQ，不再扩检。"""
-    pinned = _exact_faq_context(query)
-    if pinned is not None:
-        result.contexts = [pinned]
-        result.passed = True
-        result.reason = "passed"
-        result.gaps = []
-        result.exact_faq = True
-        return result
+    """第一轮没过阈值时，用更宽的问法再检一次。"""
     return await _maybe_broaden(result, query, history or [], summary, top_k, broaden)
 
 
@@ -178,45 +171,86 @@ def _without_blocked(hits: list[dict], query: str) -> list[dict]:
     return [hit for hit in hits if categories.get(hit.get("doc_id"), "") not in blocked]
 
 
-def _exact_faq_context(query: str) -> dict | None:
-    """用户原句等于 FAQ 的问题、标题或相似问时，返回这条 FAQ 切片。"""
-    phrase = _compact(query)
-    if len(phrase) < 2:
-        return None
+_faq_pins_lock = threading.Lock()
+_faq_pins: dict[str, int] | None = None  # compact 问题/标题/相似问 -> doc_id
+
+
+def invalidate_faq_pins() -> None:
+    """知识库变更后清掉精确命中缓存（ingest 写路径调用）。"""
+    global _faq_pins
+    with _faq_pins_lock:
+        _faq_pins = None
+
+
+def _labels_of(doc) -> set[str]:
+    """一条 FAQ 的全部可钉住标签：标题、问句、相似问。"""
+    labels = {_compact(doc.title or "")}
+    first, _, _rest = (doc.content or "").partition("\n")
+    labels.add(_compact(first.removeprefix("问：").removeprefix("问:")))
+    labels.update(_compact(item) for item in ingest.load_similar_questions(doc.similar_questions))
+    labels.discard("")
+    return labels
+
+
+def _build_faq_pins() -> dict[str, int]:
+    """全量启用 FAQ 的 标签 -> doc_id。同一标签先建的优先。"""
     db = SessionLocal()
     try:
         docs = db.query(KnowledgeDoc).filter(
             KnowledgeDoc.doc_type == "faq",
             KnowledgeDoc.status == "active",
         ).all()
-        for doc in docs:
-            labels = [_compact(doc.title or "")]
-            first, _, _rest = (doc.content or "").partition("\n")
-            labels.append(_compact(first.removeprefix("问：").removeprefix("问:")))
-            labels.extend(_compact(item) for item in ingest.load_similar_questions(doc.similar_questions))
-            if phrase not in labels:
-                continue
-            category = doc.category or ""
-            # 原句等于留资或跟进时，这条就是答案。模糊检索仍排除它们。
-            if category in _blocked_categories(query) and category not in _NON_ANSWER_CATEGORIES:
-                continue
-            chunk = (
-                db.query(KnowledgeChunk)
-                .filter(KnowledgeChunk.doc_id == doc.id)
-                .order_by(KnowledgeChunk.chunk_index)
-                .first()
-            )
-            content = chunk.content if chunk is not None else ingest.faq_index_text(doc)
-            return {
-                "content": _with_title(doc.title, content),
-                "source": doc.title,
-                "doc_id": doc.id,
-                "doc_type": "faq",
-                "parent_id": None,
-                "chunk_id": f"chunk_{chunk.id}" if chunk is not None else None,
-                "score": None,
-            }
+    finally:
+        db.close()
+    pins: dict[str, int] = {}
+    for doc in docs:
+        for label in _labels_of(doc):
+            pins.setdefault(label, doc.id)
+    return pins
+
+
+def _exact_faq_context(query: str) -> dict | None:
+    """用户原句等于 FAQ 的问题、标题或相似问时，返回这条 FAQ 切片。
+
+    标签->doc_id 走进程内哈希；命中后再实时读这条文档校验状态和标签，
+    缓存过期（改库未触发失效）时自动重建。
+    """
+    phrase = _compact(query)
+    if len(phrase) < 2:
         return None
+    global _faq_pins
+    with _faq_pins_lock:
+        if _faq_pins is None:
+            _faq_pins = _build_faq_pins()
+        doc_id = _faq_pins.get(phrase)
+    if doc_id is None:
+        return None
+    db = SessionLocal()
+    try:
+        doc = db.get(KnowledgeDoc, doc_id)
+        if doc is None or doc.doc_type != "faq" or doc.status != "active" or phrase not in _labels_of(doc):
+            invalidate_faq_pins()
+            return None
+        category = doc.category or ""
+        # 原句等于留资或跟进时，这条就是答案。模糊检索仍排除它们。
+        if category in _blocked_categories(query) and category not in _NON_ANSWER_CATEGORIES:
+            return None
+        chunk = (
+            db.query(KnowledgeChunk)
+            .filter(KnowledgeChunk.doc_id == doc.id)
+            .order_by(KnowledgeChunk.chunk_index)
+            .first()
+        )
+        content = chunk.content if chunk is not None else ingest.faq_index_text(doc)
+        return {
+            "content": _with_title(doc.title, content),
+            "source": doc.title,
+            "doc_id": doc.id,
+            "doc_type": "faq",
+            "parent_id": None,
+            "chunk_id": f"chunk_{chunk.id}" if chunk is not None else None,
+            "score": None,
+        }
     finally:
         db.close()
 
@@ -314,30 +348,29 @@ def _exact_phrase_hits(query: str, candidates: list[dict]) -> list[dict]:
     if len(phrase) < 4:
         return []
     matched: list[dict] = []
-    title_checks: list[tuple[dict, int]] = []
+    title_checks: dict[int, dict] = {}
     for hit in candidates:
         if phrase in _compact(hit.get("content") or ""):
             matched.append(hit)
             continue
         doc_id = hit.get("doc_id")
-        try:
-            title_checks.append((hit, int(doc_id)))
-        except (TypeError, ValueError):
-            continue
+        if isinstance(doc_id, int):
+            title_checks.setdefault(doc_id, hit)
     if not title_checks:
         return matched
     db = SessionLocal()
     try:
-        titles: dict[int, str] = {}
-        for hit, doc_id in title_checks:
-            if doc_id not in titles:
-                doc = db.get(KnowledgeDoc, doc_id)
-                titles[doc_id] = _compact(doc.title if doc else "")
-            if phrase in titles[doc_id]:
-                matched.append(hit)
+        rows = (
+            db.query(KnowledgeDoc.id, KnowledgeDoc.title)
+            .filter(KnowledgeDoc.id.in_(list(title_checks)))
+            .all()
+        )
+        for row in rows:
+            if phrase in _compact(row.title or ""):
+                matched.append(title_checks[row.id])
+        return matched
     finally:
         db.close()
-    return matched
 
 
 def _path_counts(rankings: list[list[dict]]) -> tuple[int, int]:
@@ -381,7 +414,7 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool,
         if vec is not None:
             dense = [
                 {**hit, "score_kind": "dense"}
-                for hit in vectorstore.query(vec, top_k=20)
+                for hit in _safe_dense_hits(vec)
                 if (hit.get("score") or 0.0) >= settings.rag_dense_min_score
             ]
             if dense:
@@ -393,6 +426,15 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool,
         if sparse:
             rankings.append(sparse)
     return rankings, degraded, usable
+
+
+def _safe_dense_hits(vec: list[float]) -> list[dict]:
+    """向量库故障不让整个任务失败重试：本路降级纯 BM25，只记日志。"""
+    try:
+        return vectorstore.query(vec, top_k=20)
+    except Exception:  # noqa: BLE001
+        logger.warning("向量检索失败，本路降级纯 BM25", exc_info=True)
+        return []
 
 
 async def _rerank_one(text: str, documents: list[str], top_n: int) -> list[dict] | None:

@@ -13,13 +13,14 @@ import re
 import time
 from datetime import datetime
 
-from openai import APITimeoutError, AsyncOpenAI
+from openai import APITimeoutError
 from pydantic import ValidationError
 
 from ..config import settings
 from ..core import monitor
 from ..database import SessionLocal
-from ..models import Conversation, Customer, KnowledgeDoc, LlmUsage, Message
+from ..llm import get_llm_client, record_usage
+from ..models import Conversation, Customer, KnowledgeDoc, Message
 from ..rag import cache as answer_cache, pipeline, rewrite
 from ..schemas import AgentReply
 from ..services import handoff, note_unmatched, record_missed_question, send_outbound
@@ -31,6 +32,7 @@ _STAGE_KEYS = ("rewrite_ms", "embed_ms", "rerank_ms", "judge_ms", "draft_ms", "f
 _reply_trace: contextvars.ContextVar[dict | None] = contextvars.ContextVar("reply_trace", default=None)
 
 MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
+CATCHUP_MAX_MESSAGES = 3  # 一次接待后最多补答几条夹在中间的旧问题（防风暴）
 REPLY_BUDGET_SECONDS = 45
 DRAFT_RESERVE_SECONDS = 15
 MIN_LLM_SECONDS = 4
@@ -46,7 +48,10 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥�
 _LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
 _COLON_ITEM_RE = re.compile(r"^\d+\s*[:：]")
 _LIST_ANNOUNCE_RE = re.compile(r"(?:如下|分别是|主要包括)[：:。．]?$")
-_LIST_LEAD = "清单我按资料发你"
+# 条目去重用的标点归一：同一份清单常见「1：公司名称」和「1. 公司名称；」两种风格，
+# 只按原文精确比较会把同一项收两遍，答案里清单就重复了。
+_ITEM_PUNCT_RE = re.compile(r"[\s。；，、,;.:：()（）·…！!?？\"'“”‘’]+")
+_LIST_LEAD = "您要的我都列下面啦"
 _EMPTY_REPLY = "不好意思，我这边没说清楚，先帮您转给同事哈"
 _MISS_REPLY = "这个问题我这边没查到靠谱资料，先帮您转给同事哈"
 _GREETINGS = frozenset({
@@ -102,6 +107,9 @@ def _stamp_extra(extra: dict | None) -> dict:
     if state is None:
         return merged
     merged["timing"] = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
+    # 本轮正在回答的用户消息 id：补答判定的显式配对依据，随每条 AI 气泡入库
+    if state.get("answer_message_id") is not None and "answers_message_id" not in merged:
+        merged["answers_message_id"] = state["answer_message_id"]
     return merged
 
 
@@ -190,20 +198,86 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
                            allow_owned: bool = False) -> str:
     token = _activate_trace()
     try:
-        return await _process_ai_reply_impl(conversation_id, local=local, allow_owned=allow_owned)
+        text = await _process_ai_reply_impl(conversation_id, local=local, allow_owned=allow_owned)
     finally:
-        state = _reply_trace.get()
-        if state is not None:
-            _abandon_draft(state.get("draft"))
-        _reply_trace.reset(token)
+        _finish_reply_trace(token)
+    if local:
+        return text  # 同步回复接口一次只答一问
+    # 本轮只答了最新一条。用户连发多问时，中间可能还夹着没答上的旧问题：逐条补答（上限防风暴）
+    for _ in range(CATCHUP_MAX_MESSAGES):
+        pending_ids = _unanswered_user_message_ids(conversation_id)
+        if not pending_ids:
+            break
+        pending_id = pending_ids[0]
+        token = _activate_trace()
+        try:
+            await _process_ai_reply_impl(
+                conversation_id, local=False, allow_owned=allow_owned,
+                answer_message_id=pending_id,
+            )
+        finally:
+            _finish_reply_trace(token)
+    return text
+
+
+def _finish_reply_trace(token: contextvars.Token) -> None:
+    """收尾一轮接待：不等作废草稿，恢复计时上下文。"""
+    state = _reply_trace.get()
+    if state is not None:
+        _abandon_draft(state.get("draft"))
+    _reply_trace.reset(token)
+
+
+def _unanswered_user_message_ids(conversation_id: int) -> list[int]:
+    """按时间序返回还没被答上的用户消息 id（补答与防重复作答的判定基础）。
+
+    一条用户消息算已答，满足其一：
+    1) 显式配对：某条回复消息的 extra.answers_message_id 指向它；
+    2) 位置配对（兼容历史无标记数据）：紧跟其后、且在下一条用户消息之前
+       出现了非用户消息（即这条回复答的是它，而不是更新的问题）。
+    """
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Message.id, Message.sender_type, Message.extra)
+            .filter(Message.conversation_id == conversation_id,
+                    Message.is_internal.is_(False))
+            .order_by(Message.id)
+            .all()
+        )
+        linked = {
+            (extra or {}).get("answers_message_id")
+            for _id, sender, extra in rows
+            if sender != "user" and (extra or {}).get("answers_message_id") is not None
+        }
+        unanswered: list[int] = []
+        for index, (msg_id, sender, _extra) in enumerate(rows):
+            if sender != "user":
+                continue
+            if msg_id in linked:
+                continue
+            # 位置配对：看它后面第一条消息是谁
+            if index + 1 < len(rows) and rows[index + 1][1] != "user":
+                continue  # 紧跟回复，已答
+            unanswered.append(msg_id)
+        return unanswered
+    finally:
+        db.close()
+
+
+def _message_answered(conversation_id: int, user_message_id: int) -> bool:
+    """这条用户消息是否已被回复答上（含显式链接与位置配对两种情况）。"""
+    return user_message_id not in _unanswered_user_message_ids(conversation_id)
 
 
 async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
-                                 allow_owned: bool = False) -> str:
+                                 allow_owned: bool = False,
+                                 answer_message_id: int | None = None) -> str:
     """对一条用户消息执行完整 AI 接待流程。
 
     local=True 时只在本系统入库并返回拼成一段的正文，不走平台发送，也不做打字延迟。
     供知你快回同步回复接口使用。默认路径的返回值可忽略。
+    answer_message_id 指定要答的那条用户消息（补答夹在中间的旧问题）；默认答最新一条。
     """
     db = SessionLocal()
     try:
@@ -214,12 +288,27 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         if conversation.mode != "ai" and not owned:
             return ""
         customer = db.get(Customer, conversation.customer_id)
-        last_user_msg = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
-            .order_by(Message.id.desc())
-            .first()
-        )
+        if answer_message_id is not None:
+            # 补答指定旧问题：处理期间可能已被别的执行答上，答上就跳过
+            last_user_msg = (
+                db.query(Message)
+                .filter(Message.conversation_id == conversation_id,
+                        Message.id == answer_message_id,
+                        Message.sender_type == "user")
+                .first()
+            )
+            if last_user_msg is not None and _message_answered(conversation_id, answer_message_id):
+                last_user_msg = None
+        else:
+            last_user_msg = (
+                db.query(Message)
+                .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
+                .order_by(Message.id.desc())
+                .first()
+            )
+            if last_user_msg is not None and _message_answered(conversation_id, last_user_msg.id):
+                # 同一会话的排队任务可能多次触发接待：最新问题已被答上就不再重复作答
+                last_user_msg = None
         if last_user_msg is None:
             return ""
         user_text = last_user_msg.content
@@ -228,6 +317,10 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         customer_id = customer.id
         nickname = customer.nickname if customer is not None else ""
         user_message_id = last_user_msg.id
+        # 记入本轮接待上下文：这一轮发出的每条 AI 气泡都会带上 answers_message_id
+        state = _reply_trace.get()
+        if state is not None:
+            state["answer_message_id"] = user_message_id
     finally:
         db.close()
 
@@ -553,27 +646,6 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     messages = kept[:3]
     if len(retrieval.facets) < 2 and len(messages) > 1:
         messages = ["\n".join(messages)]
-    # #region agent log
-    try:
-        import json as _json
-        _lead = "清单我按资料发你"
-        _parts = [{
-            "length": len(part),
-            "leads": part.count(_lead),
-            "item1": part.count("1、"),
-        } for part in messages]
-        with open(r"D:\projects\multi-platform-cs-agent\debug-c4447d.log", "a", encoding="utf-8") as _handle:
-            _handle.write(_json.dumps({
-                "sessionId": "c4447d",
-                "hypothesisId": "C",
-                "location": "engine.py:_process_ai_reply_impl",
-                "message": "reply parts before deliver",
-                "data": {"parts": len(messages), "shapes": _parts},
-                "timestamp": int(time.time() * 1000),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
     citations = _citation_payload(retrieval.contexts)
     must_handoff = bool(reply.handoff) or shop_gap
     if not must_handoff and messages and lead_flow.wants_to_proceed(user_text):
@@ -1222,6 +1294,11 @@ def _topic_count(contexts: list[dict]) -> int:
     return len(keys)
 
 
+def _dedup_key(line: str) -> str:
+    """清单/段落去重键：空白与标点归一后再比较，编号风格的差异不算两条。"""
+    return _ITEM_PUNCT_RE.sub("", line or "")
+
+
 def _section_lines(contexts: list[dict]) -> list[str]:
     """同一主题里带编号的段落，保留夹在条目之间的字段行。"""
     seen: set[str] = set()
@@ -1246,7 +1323,7 @@ def _section_lines(contexts: list[dict]) -> list[str]:
                 continue
             if heading and line == heading:
                 continue
-            key = re.sub(r"\s+", "", line)
+            key = _dedup_key(line)
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -1260,8 +1337,7 @@ def _collect_numbered_items(contexts: list[dict]) -> list[str]:
     items: list[str] = []
     for item in contexts or []:
         for line in _numbered_items(item.get("content") or ""):
-            body = _LIST_MARKER_RE.sub("", line).strip()
-            key = re.sub(r"\s+", "", body)
+            key = _dedup_key(line)
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -1332,8 +1408,8 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
         db.close()
 
 
-_CHUNK_BUDGET = 500
-_TOTAL_BUDGET = 1200
+_CHUNK_BUDGET = 800
+_TOTAL_BUDGET = 2400
 
 
 def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = None,
@@ -1354,14 +1430,42 @@ def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = Non
 
 
 def _trim_knowledge(content: str, query: str, budget: int) -> str:
+    """超预算时标题行和编号条目整行保留，散文只留与问句有词面重叠的完整句子。不硬切条目。"""
     text = content or ""
     if len(text) <= budget:
         return text
-    sentences = [part for part in re.split(r"(?<=[。！？\n])", text) if part.strip()]
     needles = _overlap_needles(query)
-    picked = [part for part in sentences if any(needle in part for needle in needles)]
-    trimmed = "".join(picked) if picked else text
-    return trimmed[:budget]
+    kept: list[str] = []
+    used = 0
+
+    def _room_for(part: str) -> bool:
+        nonlocal used
+        if kept and used + len(part) + 1 > budget:
+            return False
+        kept.append(part)
+        used += len(part) + 1
+        return True
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("【") or _LIST_ITEM_RE.match(line):
+            if not _room_for(line):
+                break
+            continue
+        full = True
+        for sentence in (s for s in re.split(r"(?<=[。！？])", line) if s.strip()):
+            if not any(needle in sentence for needle in needles):
+                continue
+            if not _room_for(sentence.strip()):
+                full = False
+                break
+        if not full:
+            break
+    if not kept:
+        return text[:budget]
+    return "\n".join(kept)
 
 
 def _overlap_needles(query: str) -> list[str]:
@@ -1528,26 +1632,6 @@ async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0
     return reply
 
 
-def _record_usage(conversation_id: int, model: str, usage) -> None:
-    """记录 token 用量（独立短会话写入；失败静默，绝不影响回复主流程）。"""
-    if usage is None:
-        return
-    try:
-        db = SessionLocal()
-        try:
-            db.add(LlmUsage(
-                conversation_id=conversation_id, model=model,
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-                total_tokens=getattr(usage, "total_tokens", 0) or 0,
-            ))
-            db.commit()
-        finally:
-            db.close()
-    except Exception:  # noqa: BLE001
-        logger.warning("token 用量记录失败", exc_info=True)
-
-
 async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
                          model: str, conversation_id: int = 0,
                          timeout: float | None = None) -> tuple[AgentReply | None, bool]:
@@ -1556,22 +1640,22 @@ async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
     返回 (reply, hard_failed)：hard_failed=True 表示网络/服务级异常（调用方可用备用模型兜底）。
     timeout 为 None 时沿用 SDK 默认。接待路径传入剩余预算。
     """
-    client_kwargs = {"base_url": base_url, "api_key": api_key}
-    if timeout is not None:
-        client_kwargs["timeout"] = timeout
-    client = AsyncOpenAI(**client_kwargs)
+    client = get_llm_client(base_url, api_key)
     messages = [{"role": "user", "content": rendered_prompt}]
     raw = ""
 
     for attempt in range(2):
         try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
-            _record_usage(conversation_id, model, getattr(resp, "usage", None))
+            create_kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            if timeout is not None:
+                create_kwargs["timeout"] = timeout
+            resp = await client.chat.completions.create(**create_kwargs)
+            record_usage(conversation_id, model, getattr(resp, "usage", None))
             raw = resp.choices[0].message.content or ""
             return _parse_contract(raw), False
         except (ValidationError, json.JSONDecodeError) as exc:

@@ -101,7 +101,9 @@ async def _process_one(task_id: int):
             task.error = error
         else:
             task.status = status
-            task.error = error
+            # done 且此前失败过时保留最后一次失败原因，便于排查「重试后才成功」的任务
+            if status == "failed" or not task.error:
+                task.error = error
             if status == "failed":
                 # 重试用尽的最终失败：全类型告警（此前仅 inbound_message 有埋点）
                 from . import monitor

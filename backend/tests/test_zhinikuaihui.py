@@ -472,8 +472,8 @@ _MIANQIAN_ITEMS = [
 
 def _glued_mianqian() -> str:
     """开头两个导语粘在一起，第 8 条末尾再粘上一份同样的清单。"""
-    one = "清单我按资料发你\n\n" + "\n".join(_MIANQIAN_ITEMS)
-    return "清单我按资料发你" + one.rstrip("\n") + one
+    one = "您要的我都列下面啦\n\n" + "\n".join(_MIANQIAN_ITEMS)
+    return "您要的我都列下面啦" + one.rstrip("\n") + one
 
 
 def test_glued_notice_is_returned_once(zhini_key):
@@ -495,7 +495,7 @@ def test_glued_notice_is_returned_once(zhini_key):
         )
     assert resp.status_code == 200
     reply = resp.json()["reply"]
-    assert reply.count("清单我按资料发你") == 1
+    assert reply.count("您要的我都列下面啦") == 1
     for item in _MIANQIAN_ITEMS:
         assert reply.count(item) == 1
     assert len(reply) <= 500

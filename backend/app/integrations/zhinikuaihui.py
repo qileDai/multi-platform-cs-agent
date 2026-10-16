@@ -61,7 +61,7 @@ async def _note_skip(conversation_id: int, content: str) -> None:
 REPLY_PATH = "/api/integrations/zhinikuaihui/reply"
 CONNECTION_REPLY = "连接成功，可以开始回复。"
 REPLY_CHAR_LIMIT = 500
-_LIST_LEAD = "清单我按资料发你"
+_LIST_LEAD = "您要的我都列下面啦"
 _SHORTEN_TIMEOUT = 8.0
 PLATFORM_MAP = {
     "douyin": "douyin",
@@ -178,9 +178,6 @@ async def _handle_reply(body: dict, started: float) -> dict:
     async with lock:
         reply_text = await process_ai_reply(conversation_id, local=True, allow_owned=mode != "ai")
     reply_text = await prepare_plugin_reply((reply_text or "").strip()[:4000])
-    # #region agent log
-    _debug_log("B", "zhinikuaihui.py:_handle_reply", "reply returned to plugin", _debug_reply_shape(reply_text))
-    # #endregion
     if not reply_text:
         await _note_skip(conversation_id, "没有可发送的回复")
         return _log_outcome(started, _skip("没有可发送的回复"),
@@ -214,7 +211,7 @@ def _skip(reason: str) -> dict:
 
 
 def _collapse_leading_leads(text: str) -> str:
-    """开头连续的「清单我按资料发你」只留一句，中间可以没有换行。"""
+    """开头连续的「您要的我都列下面啦」只留一句，中间可以没有换行。"""
     body = (text or "").lstrip()
     lead = _LIST_LEAD
     while body.startswith(lead):
@@ -279,7 +276,7 @@ async def _shorten_written_reply(text: str) -> str:
     """只缩短已经写好的这段，不检索，不补充原文没有的事实。"""
     if not settings.llm_configured:
         return ""
-    from openai import AsyncOpenAI
+    from ..llm import get_llm_client, record_usage
 
     prompt = (
         "把下面这段已经写好的客服回复缩成不超过500字。"
@@ -288,94 +285,38 @@ async def _shorten_written_reply(text: str) -> str:
         "只输出缩短后的正文，不要解释。\n\n"
         + text
     )
-    client = AsyncOpenAI(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        timeout=_SHORTEN_TIMEOUT,
-    )
+    client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
     try:
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            timeout=_SHORTEN_TIMEOUT,
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         logger.warning("知你快回长回复缩短失败", exc_info=True)
         return ""
 
 
-def _debug_reply_shape(text: str) -> dict:
-    """只记长度和导语是否成对，不记正文。"""
-    raw = text or ""
-    collapsed = _collapse_leading_leads(raw)
-    lead = _LIST_LEAD
-    first = collapsed.find(lead)
-    second = collapsed.find(lead, first + len(lead)) if first >= 0 else -1
-    same = None
-    if second >= 0:
-        head = collapsed[first + len(lead):second]
-        tail = collapsed[second + len(lead):]
-        same = _same_notice(head, tail)
-    return {
-        "length": len(raw),
-        "leads": raw.count(lead),
-        "second_lead": second >= 0,
-        "halves_same": same,
-    }
-
-
-def _debug_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
-    # #region agent log
-    try:
-        import json
-        payload = {
-            "sessionId": "c4447d",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(r"D:\projects\multi-platform-cs-agent\debug-c4447d.log", "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
-
-
 async def prepare_plugin_reply(text: str) -> str:
     """交给插件前去掉重复份。去重后仍超过 500 字，再把这段长回复缩短。"""
-    # #region agent log
-    _debug_log("A", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply before dedupe", _debug_reply_shape(text))
-    # #endregion
     cleaned = dedupe_plugin_reply(text)
     if len(cleaned) <= REPLY_CHAR_LIMIT:
-        # #region agent log
-        _debug_log("A", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply after dedupe under limit", _debug_reply_shape(cleaned))
-        # #endregion
         return cleaned
     brief = await _shorten_written_reply(cleaned)
     brief = dedupe_plugin_reply(brief)
     if brief and len(brief) <= REPLY_CHAR_LIMIT:
         logger.info("知你快回长回复已缩短 before=%s after=%s", len(cleaned), len(brief))
-        # #region agent log
-        _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply after shorten", _debug_reply_shape(brief))
-        # #endregion
         return brief
     if brief and len(brief) > REPLY_CHAR_LIMIT:
         cut = _cut_complete(brief)
         if cut:
             logger.info("知你快回缩短结果仍超长，改按条目截断 after=%s", len(cut))
-            # #region agent log
-            _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply cut after shorten", _debug_reply_shape(cut))
-            # #endregion
             return cut
     cut = _cut_complete(cleaned)
     logger.info("知你快回长回复缩短失败，改按条目截断 after=%s", len(cut))
-    # #region agent log
-    _debug_log("D", "zhinikuaihui.py:prepare_plugin_reply", "plugin reply cut original", _debug_reply_shape(cut))
-    # #endregion
     return cut
 
 

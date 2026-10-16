@@ -499,6 +499,8 @@ def _delete_chunk_rows(db, doc_ids: list[int]) -> None:
     """清掉这些文档的切片、回答缓存和向量。向量删除失败只记日志。"""
     if not doc_ids:
         return
+    from . import pipeline  # 延迟导入，避免循环依赖
+    pipeline.invalidate_faq_pins()  # 精确 FAQ 命中缓存随之失效
     answer_cache.invalidate_docs(doc_ids)
     db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id.in_(doc_ids)).delete(synchronize_session=False)
     db.commit()

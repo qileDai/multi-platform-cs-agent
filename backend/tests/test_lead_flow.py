@@ -38,6 +38,33 @@ def test_phone_and_wechat_arrange_specialist():
     assert script_for_miss("yingtai2024") == ARRANGE
 
 
+def test_wechat_prefixed_numeric_id_recognized():
+    """「微信 1208230482」：带微信前缀的纯数字 ID 也要能留资。"""
+    assert wechat_in_message("微信 1208230482") == "1208230482"
+    assert script_for_miss("微信 1208230482") == ARRANGE
+
+
+def test_wechat_prefixed_and_suffixed_forms():
+    assert wechat_in_message("微信号：z35874144") == "z35874144"
+    assert wechat_in_message("vx-abc123") == "-abc123"
+    assert wechat_in_message("VX:yingtai2024") == "yingtai2024"
+    assert wechat_in_message("278158820微信") == "278158820"
+    assert wechat_in_message("我的微信是yingtai2024") == "yingtai2024"
+    assert wechat_in_message("加微信，mimi6400723") == "mimi6400723"
+    assert wechat_in_message("微信：1208230482，谢谢") == "1208230482"
+
+
+def test_wechat_non_id_phrases_not_misread():
+    assert wechat_in_message("微信可以加吗") == ""
+    assert wechat_in_message("微信多少") == ""
+    assert wechat_in_message("微信") == ""
+    assert wechat_in_message("hello") == ""
+    assert wechat_in_message("vx") == ""
+    assert wechat_in_message("多少钱") == ""
+    # 11 位手机号不因带「微信」字样被记成微信号：phone_in_message 优先
+    assert phone_in_message("微信13515027988") == "13515027988"
+
+
 def test_complaint_still_handoff():
     assert must_handoff("我要投诉")
     assert script_for_miss("我要投诉") is None

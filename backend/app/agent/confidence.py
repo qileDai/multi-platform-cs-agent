@@ -7,15 +7,14 @@ import json
 import logging
 import re
 
-from openai import AsyncOpenAI
-
 from ..config import settings
+from ..llm import get_llm_client, record_usage
 from . import evidence
 
 logger = logging.getLogger(__name__)
 
 PASS_SCORE = 0.6
-_LIST_LEAD = "清单我按资料发你"
+_LIST_LEAD = "您要的我都列下面啦"
 _HEADING_RE = re.compile(
     r"^(?:#{1,6}\s+\S|[一二三四五六七八九十百]+、\s*\S|（[一二三四五六七八九十百]+）\s*\S|\([一二三四五六七八九十百]+\)\s*\S)"
 )
@@ -288,18 +287,16 @@ async def judge_relevance(user_text: str, contexts: list[dict], *, timeout: floa
         f"用户原话：{user_text}\n\n资料：\n" + "\n\n".join(blocks)
     )
     try:
-        client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            timeout=max(1.0, timeout),
-        )
+        client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=120,
             response_format={"type": "json_object"},
+            timeout=max(1.0, timeout),
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception:  # noqa: BLE001
         logger.exception("上下文相关性判定失败")

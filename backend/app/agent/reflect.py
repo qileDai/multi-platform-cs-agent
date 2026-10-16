@@ -5,6 +5,7 @@ import logging
 from openai import AsyncOpenAI
 
 from ..config import settings
+from ..llm import get_llm_client, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +30,16 @@ async def review_reply(messages: list[str], evidence_text: str, *, timeout: floa
         + "\n\n待发句子：\n" + "\n".join(messages)
     )
     try:
-        client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            timeout=max(1.0, timeout),
-        )
+        client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=300,
             response_format={"type": "json_object"},
+            timeout=max(1.0, timeout),
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception:  # noqa: BLE001
         logger.exception("回复自检失败，沿用规则校验")

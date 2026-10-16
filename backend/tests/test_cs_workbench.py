@@ -113,6 +113,100 @@ async def test_rag_miss_hard_handoff(db, conversation, monkeypatch):
     assert "确认" in ai.content
 
 
+def _latest_ai_message(db, conversation_id):
+    return (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id, Message.sender_type == "ai")
+        .order_by(Message.id.desc())
+        .first()
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefixed_wechat_id_arranges_specialist(db, conversation, monkeypatch):
+    """「微信 1208230482」：存留资并回安排专员，不再掉进 RAG 生成。"""
+    from app.agent.lead_flow import ARRANGE
+    from app.models import LeadCapture
+
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="微信 1208230482"))
+    db.commit()
+
+    await engine.process_ai_reply(conversation.id)
+
+    lead = db.query(LeadCapture).filter(LeadCapture.conversation_id == conversation.id).first()
+    assert lead is not None
+    assert lead.contact == "1208230482"
+    assert lead.contact_type == "wechat"
+    ai = _latest_ai_message(db, conversation.id)
+    assert ai is not None
+    assert ai.content == ARRANGE
+
+
+@pytest.mark.asyncio
+async def test_contact_question_replies_consistent_script(db, conversation, monkeypatch):
+    """「怎么联系你们」和「好的 怎么联系你们」回复必须一致：确定性话术，不进 RAG。"""
+    from app.agent.lead_flow import ASK_FULL
+
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    for text in ("怎么联系你们", "好的 怎么联系你们"):
+        db.add(Message(conversation_id=conversation.id, sender_type="user",
+                       msg_type="text", content=text))
+        db.commit()
+        await engine.process_ai_reply(conversation.id)
+        ai = _latest_ai_message(db, conversation.id)
+        assert ai is not None
+        assert ai.content == ASK_FULL
+
+
+@pytest.mark.asyncio
+async def test_ours_contact_uses_library_script(db, conversation, monkeypatch):
+    """问「你们微信多少」：优先用话术库留资话术原句解释平台限制。"""
+    from app.models import KnowledgeDoc
+
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    db.add(KnowledgeDoc(
+        doc_type="faq", status="active", category="留资话术", title="留个电话",
+        content="问：留个电话\n答：平台限制发不了联系方式，您发下电话或者微信，安排专员给您介绍",
+    ))
+    db.commit()
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="你们微信多少"))
+    db.commit()
+
+    await engine.process_ai_reply(conversation.id)
+
+    ai = _latest_ai_message(db, conversation.id)
+    assert ai is not None
+    assert "平台限制" in ai.content
+
+
+@pytest.mark.asyncio
+async def test_pure_ack_waits_when_contact_asked(db, conversation, monkeypatch):
+    """纯应答：上一条在要联系方式时回「请您稍等」，冷会话回通用接话。"""
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="好的"))
+    db.commit()
+    await engine.process_ai_reply(conversation.id)
+    ai = _latest_ai_message(db, conversation.id)
+    assert ai is not None
+    assert ai.content == "好嘞，有啥想了解的随时问我"
+
+    db.add(Message(conversation_id=conversation.id, sender_type="ai",
+                   msg_type="text",
+                   content="您这边联系方式多少呢，我们专员给您讲解一下办理的流程、资料和费用，让您参考了解下"))
+    db.commit()
+    db.add(Message(conversation_id=conversation.id, sender_type="user",
+                   msg_type="text", content="好的"))
+    db.commit()
+    await engine.process_ai_reply(conversation.id)
+    ai = _latest_ai_message(db, conversation.id)
+    assert ai is not None
+    assert ai.content == "好嘞，请您稍等"
+
+
 @pytest.mark.asyncio
 async def test_ai_send_stopped_when_taken_over(db, conversation, monkeypatch):
     """生成过程中切到人工后，后续 AI 气泡不再发出。"""
@@ -567,7 +661,7 @@ async def test_numbered_list_reply_uses_source_items(db, conversation, monkeypat
     assert "公司业务证明和个人地址证明" in sent
     assert "开户调查问卷" in sent
     assert "需要准备开户调查问卷" not in sent
-    assert "清单我按资料发你\n\n1、董事个人身份证和港澳通行证\n2、香港公司全套注册资料原件" in sent
+    assert "您要的我都列下面啦\n\n1、董事个人身份证和港澳通行证\n2、香港公司全套注册资料原件" in sent
     assert "2、 香港" not in sent
     assert db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
@@ -628,8 +722,119 @@ async def test_colon_list_keeps_every_source_item(db, conversation, monkeypatch)
     assert "3：经营范围" in sent
     assert "4：注册资金" in sent
     assert "5：股东董事相关身份信息" in sent
-    assert "清单我按资料发你" not in sent
+    assert "您要的我都列下面啦" not in sent
     assert "相似" not in sent
+
+
+@pytest.mark.asyncio
+async def test_duplicate_faq_styles_answer_list_only_once(db, conversation, monkeypatch):
+    """两个 FAQ 只差标点风格（1. 名称；/ 1：名称）时，清单只发一份，不重复。"""
+    from app.schemas import AgentReply
+
+    db.add(Message(
+        conversation_id=conversation.id, sender_type="user", msg_type="text",
+        content="香港公司注册资料",
+    ))
+    db.commit()
+    doc_a = "\n".join([
+        "问：注册香港公司需要什么资料/条件/手续/材料",
+        "相似：注册香港公司需要什么资料",
+        "答：您好，注册香港公司主要涉及：",
+        "1. 公司名称；",
+        "2. 地址（我司提供）；",
+        "3. 经营范围；",
+        "4. 注册资金；",
+        "5. 股东董事相关身份信息。",
+        "以上资料您有什么不理解的地方吗？",
+        "您留联系方式，专员给您讲解资料和费用。",
+    ])
+    doc_b = "\n".join([
+        "问：注册需要什么资料",
+        "答：您好，注册香港公司主要涉及：",
+        "1：公司名称",
+        "2：地址（我司提供），",
+        "3：经营范围",
+        "4：注册资金",
+        "5:   股东董事相关身份信息",
+    ])
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": doc_a, "source": "注册香港公司需要什么资料"},
+                      {"content": doc_b, "source": "注册需要什么资料"}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["您好，注册香港公司主要涉及这些资料"],
+            intent="consult_feature", confidence=0.8,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.settings, "humanize_base_delay_ms", 0)
+    monkeypatch.setattr(engine.settings, "humanize_per_char_ms", 0)
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id, Message.sender_type == "ai",
+    ).all()
+    assert len(rows) == 1
+    sent = rows[0].content
+    # 每个条目只出现一份，另一种标点风格的副本被去掉
+    assert sent.count("公司名称") == 1
+    assert sent.count("经营范围") == 1
+    assert sent.count("股东董事相关身份信息") == 1
+    assert "1：公司名称" not in sent
+    assert "以上资料您有什么不理解的地方吗" in sent
+
+
+@pytest.mark.asyncio
+async def test_catchup_answers_every_squeezed_question(db, conversation, monkeypatch):
+    """连发多条不同问题时，被新消息挤掉没等到回复的旧问题逐条补答。"""
+    from app.schemas import AgentReply
+
+    for text in ("注册需要什么条件", "香港公司如何注册", "香港公司注册资料"):
+        db.add(Message(
+            conversation_id=conversation.id, sender_type="user", msg_type="text",
+            content=text,
+        ))
+    db.commit()
+
+    answered = []  # 每次应答实际处理的那条问题
+
+    async def fake_retrieve(query, history=None, top_k=3, summary=""):
+        answered.append(query)
+        return rag_pipeline.RetrievalResult(
+            passed=True, reason="passed", rewritten_queries=[query],
+            contexts=[{"content": f"问：{query}\n答：已为您解答", "source": query}],
+        )
+
+    async def fake_llm(*_a, **_k):
+        return AgentReply(
+            reply_messages=["好的，这就为您解答"],
+            intent="consult_feature", confidence=0.8,
+        )
+
+    monkeypatch.setattr(engine.pipeline, "retrieve", fake_retrieve)
+    monkeypatch.setattr(engine, "_call_llm_with_retry", fake_llm)
+    monkeypatch.setattr(engine.settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(engine.settings, "humanize_base_delay_ms", 0)
+    monkeypatch.setattr(engine.settings, "humanize_per_char_ms", 0)
+
+    await engine.process_ai_reply(conversation.id)
+    db.expire_all()
+    # 三条问题全部进入过应答流程（最新一条 + 两条补答）
+    assert set(answered) == {"注册需要什么条件", "香港公司如何注册", "香港公司注册资料"}
+    # 每条用户消息后面都有配对的 AI 回复，不再永久漏答
+    rows = db.query(Message).filter(
+        Message.conversation_id == conversation.id,
+        Message.is_internal.is_(False),
+    ).order_by(Message.id).all()
+    assert [r.sender_type for r in rows] == ["user", "user", "user", "ai", "ai", "ai"]
 
 
 @pytest.mark.asyncio
@@ -812,7 +1017,7 @@ async def test_price_without_numbered_list_stays_price(db, conversation, monkeyp
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
     ).one().content
     assert "99" in sent
-    assert "清单我按资料发你" not in sent
+    assert "您要的我都列下面啦" not in sent
 
 
 @pytest.mark.asyncio
@@ -930,9 +1135,12 @@ async def test_followup_uses_name_the_user_already_said(db, conversation, monkey
     db.expire_all()
     db.refresh(conversation)
     assert conversation.mode == "ai"
-    sent = db.query(Message).filter(
+    rows = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
-    ).one().content
+    ).all()
+    # 连发两问：最新一条先答，被挤掉的旧一条由补答跟上，每问都有配对回复
+    assert len(rows) == 2
+    sent = "\n".join(row.content for row in rows)
     assert "小明" in sent
     assert "你叫啥名字" not in sent
     assert any("我叫小明啊" in prompt and "不要再问一遍" in prompt for prompt in prompts)
@@ -947,9 +1155,12 @@ async def test_followup_uses_place_the_user_already_said(db, conversation, monke
 
     await engine.process_ai_reply(conversation.id)
     db.expire_all()
-    sent = db.query(Message).filter(
+    rows = db.query(Message).filter(
         Message.conversation_id == conversation.id, Message.sender_type == "ai",
-    ).one().content
+    ).all()
+    # 连发两问逐条补答：每问都有配对回复
+    assert len(rows) == 2
+    sent = "\n".join(row.content for row in rows)
     assert "香港" in sent
     assert "去哪" not in sent
     assert any("我今天要去香港" in prompt for prompt in prompts)
@@ -1121,7 +1332,7 @@ async def test_registration_howto_drops_account_opening_list(db, conversation, m
 
     async def fake_llm(*_a, **_k):
         return AgentReply(
-            reply_messages=["清单我按资料发你\n\n1、开户调查问卷"],
+            reply_messages=["您要的我都列下面啦\n\n1、开户调查问卷"],
             intent="consult_feature", confidence=0.95,
         )
 

@@ -198,16 +198,6 @@ def _rpa_housekeep_once():
 def _ensure_admin(db) -> None:
     """保证有 admin。非生产环境密码不是 admin123 时重置；生产环境只补建缺失账号。"""
     admin = db.query(Agent).filter(Agent.username == "admin").first()
-    # #region agent log
-    try:
-        import json, time
-        _hash = admin.password_hash if admin is not None else ""
-        _ok = bool(admin is not None and verify_password("admin123", _hash))
-        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "startup admin check", "data": {"app_env": settings.app_env, "admin_exists": admin is not None, "hash_len": len(_hash or ""), "hash_prefix": (_hash or "")[:4], "password_ok": _ok, "db": settings.database_url}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
     if admin is None:
         db.add(Agent(username="admin", password_hash=hash_password("admin123"),
                      display_name="管理员", role="admin", status="active"))
@@ -220,14 +210,6 @@ def _ensure_admin(db) -> None:
     admin.password_hash = hash_password("admin123")
     admin.role = "admin"
     logger.warning("非生产环境已将管理员 admin 的密码重置为 admin123")
-    # #region agent log
-    try:
-        import json, time
-        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "password reset written", "data": {"verify_after": verify_password("admin123", admin.password_hash)}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 
 def _warn_insecure_defaults(db) -> None:

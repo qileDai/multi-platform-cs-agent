@@ -489,7 +489,7 @@ async def test_rewrite_prompt_survives_json_braces(monkeypatch):
         chat = _Chat()
 
     monkeypatch.setattr(rewrite.settings, "llm_api_key", "test-key")
-    monkeypatch.setattr(rewrite, "AsyncOpenAI", lambda **_kwargs: _Client())
+    monkeypatch.setattr(rewrite, "get_llm_client", lambda *_a, **_k: _Client())
 
     history = [
         {"sender_type": "user", "content": "看看这个"},
@@ -536,7 +536,7 @@ async def test_rewrite_runs_on_first_turn(monkeypatch):
         chat = _Chat()
 
     monkeypatch.setattr(rewrite.settings, "llm_api_key", "test-key")
-    monkeypatch.setattr(rewrite, "AsyncOpenAI", lambda **kwargs: _Client())
+    monkeypatch.setattr(rewrite, "get_llm_client", lambda *_a, **_k: _Client())
     skipped = await rewrite.rewrite_query("你好", [{"sender_type": "user", "content": "你好"}])
     assert skipped == ["你好"]
     assert called == []
@@ -669,7 +669,7 @@ async def test_summary_after_four_messages(db, conversation, monkeypatch):
         chat = _Chat()
 
     monkeypatch.setattr(context.settings, "llm_api_key", "test-key")
-    monkeypatch.setattr(context, "AsyncOpenAI", lambda **_kwargs: _Client())
+    monkeypatch.setattr(context, "get_llm_client", lambda *_a, **_k: _Client())
     await context.maybe_update_summary(conversation.id)
     db.expire_all()
     db.refresh(conversation)

@@ -23,7 +23,9 @@ async def embed_texts(texts: list[str]) -> list[list[float]] | None:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            resp = await client.embeddings.create(model=settings.embedding_model, input=texts)
+            resp = await client.embeddings.create(
+                model=settings.embedding_model, input=texts, timeout=15.0,
+            )
             return [item.embedding for item in resp.data]
         except Exception as exc:  # noqa: BLE001
             last_error = exc

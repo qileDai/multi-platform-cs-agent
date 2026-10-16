@@ -162,6 +162,10 @@ def test_faq_pack_preview_roundtrip_and_guards(db):
         sheet = load_workbook(io.BytesIO(exported.content), data_only=True).active
         headers = [cell.value for cell in next(sheet.iter_rows(max_row=1))]
         assert headers[:6] == ["标题", "分类", "标准问", "相似问", "答案", "状态"]
+        # 只导出启用的：停用条目（答案「一」）不应出现在导出表里
+        rows_all = {raw[0]: raw for raw in sheet.iter_rows(min_row=2, values_only=True)}
+        assert title in rows_all
+        assert rows_all[ambiguous][4] == "二"
         matched = None
         for raw in sheet.iter_rows(min_row=2, values_only=True):
             if raw[0] == title:
@@ -186,14 +190,20 @@ def test_faq_pack_preview_roundtrip_and_guards(db):
         assert db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id == doc.id).count() == 1
         assert db.get(KnowledgeDoc, kept.id).content.endswith("别动")
 
-        rejected = _post_pack(client, _xlsx([
-            [fresh, "价格", "问", "相似", "答", "启用"],
-            [fresh, "价格", "问2", "相似", "答2", "停用"],
+        dup = f"重复{mark}"
+        overridden = _post_pack(client, _xlsx([
+            [dup, "价格", "问", "相似", "答", "启用"],
+            [dup, "价格", "问2", "相似", "答2", "停用"],
         ]), "true")
-        assert rejected.status_code == 400
-        assert "标题重复" in rejected.json()["detail"]
+        titles.append(dup)
+        assert overridden.status_code == 200, overridden.text
+        assert overridden.json()["duplicates_overridden"] == [dup]
         db.expire_all()
-        assert db.query(KnowledgeDoc).filter(KnowledgeDoc.title == fresh).count() == 0
+        dup_docs = db.query(KnowledgeDoc).filter(KnowledgeDoc.title == dup).all()
+        assert len(dup_docs) == 1
+        assert dup_docs[0].content.endswith("答2")
+        assert dup_docs[0].status == "disabled"
+        assert db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id == dup_docs[0].id).count() == 0
 
         no_status = _post_pack(
             client,
@@ -222,3 +232,25 @@ def test_faq_pack_preview_roundtrip_and_guards(db):
     finally:
         app.dependency_overrides.pop(get_current_agent, None)
         _cleanup(db, titles, agent.id)
+
+
+def test_create_faq_rejects_duplicate_title(db):
+    mark = uuid.uuid4().hex[:8]
+    title = f"重建标题{mark}"
+    agent = _agent(db)
+    app.dependency_overrides[get_current_agent] = lambda: agent
+    client = TestClient(app)
+    payload = {"title": title, "question": "怎么做", "answer": "就这样"}
+    try:
+        created = client.post("/api/knowledge/faq", json=payload)
+        assert created.status_code == 200, created.text
+        again = client.post("/api/knowledge/faq", json=payload)
+        assert again.status_code == 409, again.text
+        assert "该标题已存在" in again.json()["detail"]
+        db.expire_all()
+        assert db.query(KnowledgeDoc).filter(
+            KnowledgeDoc.title == title, KnowledgeDoc.status != "archived",
+        ).count() == 1
+    finally:
+        app.dependency_overrides.pop(get_current_agent, None)
+        _cleanup(db, [title], agent.id)

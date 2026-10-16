@@ -57,12 +57,6 @@ CONNECTION_REPLY = "连接成功，可以开始回复。"
 REPLY_CHAR_LIMIT = 500
 _LIST_LEAD = "您要的我都列下面啦"
 _SHORTEN_TIMEOUT = 8.0
-# 插件对多行回复的输入框粘贴会重复拼接、且停在生成阶段不自动发送；
-# 发给插件的正文一律压成单行：清单条目以「；」收尾，其余换行折叠为空格。
-_PLUGIN_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])")
-_SENT_SPLIT_RE = re.compile(r"([。！？!?；;])")
-_SENT_PUNCT_RE = re.compile(r"[\s。；，、,;.:：()（）·…！!?？\"'“”‘’]+")
-_SENT_DEDUPE_MIN = 10
 PLATFORM_MAP = {
     "douyin": "douyin",
     "xiaohongshu": "xiaohongshu",
@@ -254,87 +248,22 @@ def dedupe_plugin_reply(text: str) -> str:
     return _drop_repeated_notice(_collapse_leading_leads(text)).strip()
 
 
-def _flatten_for_plugin(text: str) -> str:
-    """压成单行：清单条目统一以「；」收尾，条目之间不另加空格，其余换行折叠为空格。"""
-    parts: list[str] = []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if _PLUGIN_LIST_ITEM_RE.match(line):
-            if line.endswith("。"):
-                line = line[:-1]
-            if not line.endswith(("；", ";", "：", ":")):
-                line += "；"
-        parts.append(line)
-    out = ""
-    for line in parts:
-        if not out:
-            out = line
-        elif out.endswith(("；", ";")) and _PLUGIN_LIST_ITEM_RE.match(line):
-            out += line
-        else:
-            out += " " + line
-    return out.strip()
-
-
-def _dedupe_sentences(text: str) -> str:
-    """单行文本里归一化后相同的句子只留第一份（防缩短模型复述同段）。
-
-    极短句不参与判重，避免误删正常重复的短句。
-    """
-    if not text:
-        return text
-    sentences: list[str] = []
-    buf = ""
-    for chunk in _SENT_SPLIT_RE.split(text):
-        buf += chunk
-        if _SENT_SPLIT_RE.match(chunk):
-            sentences.append(buf)
-            buf = ""
-    if buf:
-        sentences.append(buf)
-    seen: set[str] = set()
-    kept: list[str] = []
-    for sentence in sentences:
-        key = _SENT_PUNCT_RE.sub("", sentence)
-        if len(key) >= _SENT_DEDUPE_MIN:
-            if key in seen:
-                continue
-            seen.add(key)
-        kept.append(sentence)
-    return "".join(kept).strip()
-
-
-def _finalize_plugin_reply(text: str) -> str:
-    """发给插件前的统一收口：去掉重复份，再压成单行并做句级去重。"""
-    return _dedupe_sentences(_flatten_for_plugin(dedupe_plugin_reply(text)))
-
-
 def _cut_complete(text: str, limit: int = REPLY_CHAR_LIMIT) -> str:
-    """收到最后一个还能放进上限的完整条目，不把半条编号切进去。
-
-    多行按行切；压平后的单行按「；」条目边界切。都不行才按字符截。
-    """
+    """收到最后一个还能放进上限的完整条目，不把半条编号切进去。"""
     if len(text) <= limit:
         return text.strip()
-    units: list[str] = []
-    for line in (text or "").splitlines():
-        for piece in line.split("；"):
-            piece = piece.strip()
-            if piece:
-                units.append(piece)
+    lines = text.splitlines()
     kept: list[str] = []
     total = 0
-    for unit in units:
-        extra = len(unit) + (1 if kept else 0)
+    for line in lines:
+        extra = len(line) + (1 if kept else 0)
         if total + extra > limit:
             break
-        kept.append(unit)
+        kept.append(line)
         total += extra
-    if not kept:
-        return text[:limit].rstrip()
-    return "；".join(kept)
+    if kept:
+        return "\n".join(kept).rstrip()
+    return text[:limit].rstrip()
 
 
 async def _shorten_written_reply(text: str) -> str:
@@ -366,12 +295,12 @@ async def _shorten_written_reply(text: str) -> str:
 
 
 async def prepare_plugin_reply(text: str) -> str:
-    """交给插件前去掉重复份并压成单行。仍超过 500 字，再把这段长回复缩短。"""
-    cleaned = _finalize_plugin_reply(text)
+    """交给插件前去掉重复份。去重后仍超过 500 字，再把这段长回复缩短。"""
+    cleaned = dedupe_plugin_reply(text)
     if len(cleaned) <= REPLY_CHAR_LIMIT:
         return cleaned
     brief = await _shorten_written_reply(cleaned)
-    brief = _finalize_plugin_reply(brief)
+    brief = dedupe_plugin_reply(brief)
     if brief and len(brief) <= REPLY_CHAR_LIMIT:
         logger.info("知你快回长回复已缩短 before=%s after=%s", len(cleaned), len(brief))
         return brief

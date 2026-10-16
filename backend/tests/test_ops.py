@@ -116,7 +116,7 @@ async def test_read_timeout_is_a_warning(monkeypatch, caplog):
         def __init__(self, **_kwargs):
             self.chat = _Chat()
 
-    monkeypatch.setattr(engine, "AsyncOpenAI", _Client)
+    monkeypatch.setattr(engine, "get_llm_client", lambda *_a, **_k: _Client())
     with caplog.at_level(logging.WARNING):
         reply, hard_failed = await engine._call_llm_once(
             "hi", base_url="http://example.invalid", api_key="k", model="gpt-4o-mini", timeout=6,
@@ -154,10 +154,10 @@ async def test_judge_skipped_when_draft_time_is_short(monkeypatch):
 async def test_short_budget_does_not_call_draft_model(monkeypatch):
     """剩余不足 4 秒时不创建主模型客户端。"""
 
-    def boom(**_kwargs):
+    def boom(*_a, **_k):
         raise AssertionError("不应创建主模型客户端")
 
-    monkeypatch.setattr(engine, "AsyncOpenAI", boom)
+    monkeypatch.setattr(engine, "get_llm_client", boom)
     retrieval = rag_pipeline.RetrievalResult(
         passed=True, contexts=[{"content": "注册资料", "source": "注册.md"}],
     )

@@ -263,6 +263,80 @@ class TestZhiniContract:
         assert resp.status_code == 200
         assert resp.json()["action"] == "skip"
 
+    def test_skip_when_our_reply_is_later_than_the_customer_message(self, zhini_key):
+        """手动点开已回过的私信时，最后一条是自己发的，不入库也不生成。"""
+        body = _body()
+        trigger = body["message"]
+        body["messages"] = [
+            dict(trigger),
+            {
+                "id": "ours-later",
+                "text": "这条是我回的",
+                "direction": "outgoing",
+                "sender_id": "shop-account",
+                "sender_name": "客服",
+                "timestamp": int(trigger["timestamp"]) + 1000,
+                "type": "text",
+            },
+        ]
+        db = SessionLocal()
+        try:
+            before_messages = db.query(Message).count()
+            before_customers = db.query(Customer).count()
+        finally:
+            db.close()
+        with patch("app.integrations.zhinikuaihui.process_ai_reply", new_callable=AsyncMock) as generate:
+            resp = client.post(
+                "/api/integrations/zhinikuaihui/reply",
+                json=body,
+                headers=_auth(zhini_key),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "skip"
+        assert resp.json()["reason"] == "没有新的客户消息"
+        generate.assert_not_called()
+        db = SessionLocal()
+        try:
+            assert db.query(Message).count() == before_messages
+            assert db.query(Customer).count() == before_customers
+        finally:
+            db.close()
+
+    def test_reply_when_customer_message_is_later_than_our_reply(self, zhini_key):
+        """自己回过之后客户又发了新消息，最后一条是客户的，仍然回复。"""
+        body = _body()
+        trigger = body["message"]
+        trigger_ts = int(trigger["timestamp"])
+        body["messages"] = [
+            {
+                "id": "older-customer",
+                "text": "在吗",
+                "direction": "incoming",
+                "sender_id": body["customer_id"],
+                "timestamp": trigger_ts - 2000,
+                "type": "text",
+            },
+            {
+                "id": "ours-earlier",
+                "text": "在的",
+                "direction": "outgoing",
+                "sender_id": "shop-account",
+                "timestamp": trigger_ts - 1000,
+                "type": "text",
+            },
+        ]
+        with patch("app.integrations.zhinikuaihui.process_ai_reply", new_callable=AsyncMock) as generate:
+            generate.return_value = "继续回复"
+            resp = client.post(
+                "/api/integrations/zhinikuaihui/reply",
+                json=body,
+                headers=_auth(zhini_key),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["action"] == "reply"
+        assert resp.json()["reply"] == "继续回复"
+        generate.assert_awaited()
+
 
 def _zhini_conversation(db, *, mode: str = "human"):
     uid = uuid.uuid4().hex[:8]
@@ -398,8 +472,8 @@ _MIANQIAN_ITEMS = [
 
 def _glued_mianqian() -> str:
     """开头两个导语粘在一起，第 8 条末尾再粘上一份同样的清单。"""
-    one = "清单我按资料发你\n\n" + "\n".join(_MIANQIAN_ITEMS)
-    return "清单我按资料发你" + one.rstrip("\n") + one
+    one = "您要的我都列下面啦\n\n" + "\n".join(_MIANQIAN_ITEMS)
+    return "您要的我都列下面啦" + one.rstrip("\n") + one
 
 
 def test_glued_notice_is_returned_once(zhini_key):
@@ -421,7 +495,7 @@ def test_glued_notice_is_returned_once(zhini_key):
         )
     assert resp.status_code == 200
     reply = resp.json()["reply"]
-    assert reply.count("清单我按资料发你") == 1
+    assert reply.count("您要的我都列下面啦") == 1
     for item in _MIANQIAN_ITEMS:
         assert reply.count(item) == 1
     assert len(reply) <= 500

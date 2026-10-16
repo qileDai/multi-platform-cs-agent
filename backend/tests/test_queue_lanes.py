@@ -246,3 +246,121 @@ class TestQueueOpsApi:
         assert client.post("/api/queue/999999/retry",
                            headers={"Authorization": f"Bearer {token}"}).status_code == 404
         _clean_queue(db)
+
+
+# ============ fast lane 并发消费（CAS 认领 + 信号量限流 + 会话锁） ============
+
+
+class TestClaimNextPending:
+    def test_claim_is_atomic(self, db):
+        """CAS 认领：认领一次后（processing）再次认领取不到，双取被挡住。"""
+        _clean_queue(db)
+        tid = queue.enqueue("claim_cas_test", {})
+        try:
+            assert queue._claim_next_pending("slow") == tid
+            assert queue._claim_next_pending("slow") is None
+            assert queue._claim_next_pending() is None
+        finally:
+            _clean_queue(db)
+
+
+class TestFastLaneConcurrency:
+    @pytest.mark.asyncio
+    async def test_fast_tasks_run_concurrently(self, db, monkeypatch):
+        """3 条 fast 任务同时进入处理：串行时第 2 条要等第 1 条 release。"""
+        _clean_queue(db)
+        from types import SimpleNamespace
+        monkeypatch.setattr(queue, "FAST_LANE_TYPES",
+                            queue.FAST_LANE_TYPES | {"fast_conc_test"})
+        monkeypatch.setattr(queue, "settings",
+                            SimpleNamespace(queue_fast_concurrency=20))
+        entered = 0
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(payload):
+            nonlocal entered
+            entered += 1
+            first_entered.set()
+            await release.wait()
+
+        queue.register_handler("fast_conc_test", handler)
+        queue.start_worker()
+        try:
+            for i in range(3):
+                queue.enqueue("fast_conc_test", {"i": i})
+            await asyncio.wait_for(first_entered.wait(), 5)
+            deadline = asyncio.get_running_loop().time() + 3
+            while entered < 3 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            assert entered == 3
+        finally:
+            release.set()
+            await queue.stop_worker()
+            _clean_queue(db)
+
+    @pytest.mark.asyncio
+    async def test_fast_concurrency_limit(self, db, monkeypatch):
+        """并发上限：queue_fast_concurrency=2 时最多 2 条同时在途（背压）。"""
+        _clean_queue(db)
+        from types import SimpleNamespace
+        monkeypatch.setattr(queue, "FAST_LANE_TYPES",
+                            queue.FAST_LANE_TYPES | {"fast_limit_test"})
+        monkeypatch.setattr(queue, "settings",
+                            SimpleNamespace(queue_fast_concurrency=2))
+        entered = 0
+        release = asyncio.Event()
+
+        async def handler(payload):
+            nonlocal entered
+            entered += 1
+            await release.wait()
+
+        queue.register_handler("fast_limit_test", handler)
+        queue.start_worker()
+        try:
+            for i in range(4):
+                queue.enqueue("fast_limit_test", {"i": i})
+            await asyncio.sleep(0.3)
+            assert entered == 2  # 只有 2 个槽位：第 3、4 条在背压等待
+        finally:
+            release.set()
+            await queue.stop_worker()
+            _clean_queue(db)
+
+
+class TestConversationLock:
+    @pytest.mark.asyncio
+    async def test_same_conversation_serialized(self):
+        """同一会话两个任务严格串行：先进入者退出后，后者才进入。"""
+        from app.core import convlock
+
+        order: list[str] = []
+
+        async def worker(tag: str):
+            lock = await convlock.conversation_lock(90001)
+            async with lock:
+                order.append(f"enter{tag}")
+                await asyncio.sleep(0.05)
+                order.append(f"exit{tag}")
+
+        await asyncio.gather(worker("A"), worker("B"))
+        # 无交错：A 先退出 B 才进，或 B 先退出 A 才进
+        assert (order.index("exitA") < order.index("enterB")
+                or order.index("exitB") < order.index("enterA"))
+
+    @pytest.mark.asyncio
+    async def test_different_conversations_not_blocked(self):
+        """不同会话互不阻塞：会话 1 持锁时会话 2 立即拿锁。"""
+        from app.core import convlock
+
+        lock1 = await convlock.conversation_lock(90002)
+        await lock1.acquire()
+        try:
+            lock2 = await convlock.conversation_lock(90003)
+            try:
+                await asyncio.wait_for(lock2.acquire(), 1)
+            finally:
+                lock2.release()
+        finally:
+            lock1.release()

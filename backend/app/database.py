@@ -75,8 +75,11 @@ def init_db():
     # 队列延迟任务（首评等）
     _ensure_column("queue_tasks", "not_before", "not_before DATETIME")
     _ensure_column("agents", "max_concurrent", "max_concurrent INTEGER DEFAULT 20")
+    _ensure_column("agents", "modules", "modules TEXT")
     _ensure_column("quick_replies", "agent_id", "agent_id INTEGER")
     _ensure_column("knowledge_docs", "category", "category VARCHAR(64) DEFAULT '未分类'")
     _ensure_column("knowledge_docs", "similar_questions", "similar_questions TEXT DEFAULT '[]'")
     _ensure_column("knowledge_docs", "hit_count", "hit_count INTEGER DEFAULT 0")
+    _ensure_column("account_bindings", "reopen_requested", "reopen_requested INTEGER DEFAULT 0")
     _ensure_column("missed_questions", "suggested_answer", "suggested_answer TEXT DEFAULT ''")
+    _ensure_column("conversations", "lead_followups", "lead_followups INTEGER DEFAULT 0")

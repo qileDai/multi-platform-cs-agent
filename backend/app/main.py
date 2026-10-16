@@ -5,12 +5,14 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
+from .api import account_bindings, accounts, agents, analytics, auth, comments, contents, conversations, evals, funnel, inspiration, knowledge, leads, messages, publish, queue_ops, quick, rpa, stats, tickets, webhooks, ws, zhinikuaihui
 from .api import settings as settings_api
-from .api.deps import require_admin
+from .api.deps import agent_for_module_check, require_admin
+from .core.modules import agent_can, allowed_modules
 from .wecom import callback as wecom_callback
 from .api.messages import media_router
 from .api.ws import manager
@@ -94,6 +96,11 @@ async def session_sweeper():
             await _sweep_once()
         except Exception:  # noqa: BLE001
             logger.exception("会话超时扫描失败")
+        try:
+            from .services import sweep_lead_followups
+            await sweep_lead_followups()
+        except Exception:  # noqa: BLE001
+            logger.exception("沉默留资跟进失败")
         try:
             _rpa_housekeep_once()
         except Exception:  # noqa: BLE001
@@ -191,16 +198,6 @@ def _rpa_housekeep_once():
 def _ensure_admin(db) -> None:
     """保证有 admin。非生产环境密码不是 admin123 时重置；生产环境只补建缺失账号。"""
     admin = db.query(Agent).filter(Agent.username == "admin").first()
-    # #region agent log
-    try:
-        import json, time
-        _hash = admin.password_hash if admin is not None else ""
-        _ok = bool(admin is not None and verify_password("admin123", _hash))
-        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "startup admin check", "data": {"app_env": settings.app_env, "admin_exists": admin is not None, "hash_len": len(_hash or ""), "hash_prefix": (_hash or "")[:4], "password_ok": _ok, "db": settings.database_url}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
     if admin is None:
         db.add(Agent(username="admin", password_hash=hash_password("admin123"),
                      display_name="管理员", role="admin", status="active"))
@@ -213,14 +210,6 @@ def _ensure_admin(db) -> None:
     admin.password_hash = hash_password("admin123")
     admin.role = "admin"
     logger.warning("非生产环境已将管理员 admin 的密码重置为 admin123")
-    # #region agent log
-    try:
-        import json, time
-        with open(r"D:\projects\multi-platform-cs-agent\debug-aaecc8.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps({"sessionId": "aaecc8", "hypothesisId": "A", "location": "main.py:_ensure_admin", "message": "password reset written", "data": {"verify_after": verify_password("admin123", admin.password_hash)}, "timestamp": int(time.time() * 1000)}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 
 def _warn_insecure_defaults(db) -> None:
@@ -248,7 +237,7 @@ async def lifespan(app: FastAPI):
         # 默认口语化快捷回复
         if db.query(QuickReply).count() == 0:
             db.add_all([
-                QuickReply(title="打招呼", content="在的，我是小赢。香港公司注册、开户都可以问我"),
+                QuickReply(title="打招呼", content="您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"),
                 QuickReply(title="稍等", content="稍等哈，我帮您查一下"),
                 QuickReply(title="转人工", content="这个我让同事来帮您处理哈，马上来"),
                 QuickReply(title="感谢", content="客气啦，有问题随时喊我"),
@@ -257,11 +246,17 @@ async def lifespan(app: FastAPI):
         else:
             stale = (
                 db.query(QuickReply)
-                .filter(QuickReply.title == "打招呼", QuickReply.content == "来啦，想问啥呀")
+                .filter(
+                    QuickReply.title == "打招呼",
+                    QuickReply.content.in_([
+                        "来啦，想问啥呀",
+                        "在的，我是小赢。香港公司注册、开户都可以问我",
+                    ]),
+                )
                 .all()
             )
             for item in stale:
-                item.content = "在的，我是小赢。香港公司注册、开户都可以问我"
+                item.content = "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
         db.commit()
         # 违禁词库加载（含入口/出口方向）
         contentfilter.load_db_words(
@@ -339,9 +334,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def guard_modules(request: Request, call_next):
+    """按路径拦截未授权模块。登录、webhook、RPA worker、签名素材不在此列。"""
+    if request.method != "OPTIONS":
+        needed = allowed_modules(request.method, request.url.path)
+        if needed:
+            try:
+                agent = agent_for_module_check(request)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            if not any(agent_can(agent, key) for key in needed):
+                return JSONResponse({"detail": "无权访问该模块"}, status_code=403)
+    return await call_next(request)
+
 for r in [auth.router, webhooks.router, conversations.router, messages.router,
           account_bindings.router,
-          knowledge.router, agents.router, stats.router, quick.router, tickets.router,
+          knowledge.router, agents.router, stats.router, quick.router, tickets.router, leads.router,
           rpa.router, settings_api.router, evals.router, media_router, ws.router,
           accounts.router, contents.router, publish.router, comments.router,
           funnel.router, wecom_callback.router, analytics.router, inspiration.router,

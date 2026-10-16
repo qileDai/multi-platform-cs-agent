@@ -4,6 +4,7 @@ import re
 _AMOUNT = re.compile(r"(\d+(?:\.\d+)?)\s*(元|块|折|件|%|天|小时|个月|月|年)")
 _LOGISTICS = re.compile(r"中通|圆通|顺丰|韵达|申通|极兔|转运中心|[A-Za-z]{2,}\d{6,}")
 _MODEL = re.compile(r"[A-Za-z]{1,6}-?\d{2,}")
+_TICKET_NO = re.compile(r"T\d{8}-[A-Za-z0-9]{4,}")
 _PAIRS = (
     ("不支持", "支持"),
     ("不包邮", "包邮"),
@@ -67,6 +68,11 @@ def conflicting_units(contexts: list[dict]) -> set[str]:
     return {unit for unit, numbers in found.items() if len(numbers) > 1}
 
 
+def _model_tokens(message: str) -> list[str]:
+    """型号扫描前先剔掉工单号，工单号不算型号。"""
+    return _MODEL.findall(_TICKET_NO.sub(" ", message or ""))
+
+
 def claims_unsupported(messages: list[str], evidence: str) -> bool:
     """回复里的数字、物流专名或相反政策在证据里对不上。"""
     raw = evidence or ""
@@ -82,7 +88,7 @@ def claims_unsupported(messages: list[str], evidence: str) -> bool:
         for token in _LOGISTICS.findall(message or ""):
             if token not in raw:
                 return True
-        for token in _MODEL.findall(message or ""):
+        for token in _model_tokens(message or ""):
             if token not in raw and token not in blob:
                 return True
         if _polarity_conflict(message or "", raw):

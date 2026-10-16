@@ -4,6 +4,7 @@
 协议细节见 docs/rpa-workers.md。
 """
 import hmac
+import json
 import logging
 import os
 import uuid
@@ -223,7 +224,35 @@ def assignment(worker_id: str, db: Session = Depends(get_db), _: None = Depends(
         "platform": spec.get("platform", ""),
         "msg_types": spec.get("msg_types", []),
         "auth_status": row.auth_status,
+        "reopen": bool(getattr(row, "reopen_requested", 0)),
     }
+
+
+@router.get("/fleet")
+def fleet_assignments(db: Session = Depends(get_db), _: None = Depends(rpa_key_dep)):
+    """调度器对账：只返回未停用的绑定。"""
+    rows = (
+        db.query(AccountBinding)
+        .order_by(AccountBinding.id)
+        .all()
+    )
+    cutoff = datetime.utcnow() - timedelta(seconds=settings.rpa_worker_offline_seconds)
+    live_ids = {
+        worker.worker_id
+        for worker in db.query(RpaWorker).filter(RpaWorker.last_heartbeat_at >= cutoff).all()
+        if worker.status != "offline"
+    }
+    return {"bindings": [
+        {
+            "worker_id": row.worker_id or "",
+            "binding_id": row.id,
+            "driver": row.driver,
+            "adspower_profile_id": row.adspower_profile_id or "",
+            "worker_live": bool(row.worker_id) and row.worker_id in live_ids,
+        }
+        for row in rows
+        if is_enabled(row.auth_status)
+    ]}
 
 
 @router.get("/outbox")
@@ -308,6 +337,59 @@ def release_outbox(req: RpaRelease, db: Session = Depends(get_db), _: None = Dep
 
 # ============ outbox 失败处置（工作台侧，JWT 鉴权） ============
 
+_DM_REPLY_TYPES = ("text", "image", "voice")
+_COMMENT_REPLY_TYPES = ("comment_reply", "first_comment")
+
+
+def _reply_body(msg_type: str, content: str) -> str:
+    """评论和首评的 content 是 JSON，表格只展示回复正文。"""
+    text = content or ""
+    if msg_type in _COMMENT_REPLY_TYPES:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+            text = payload["text"]
+    return text[:500]
+
+
+@router.get("/replies")
+def list_replies(kind: str = "", db: Session = Depends(get_db),
+                 _: Agent = Depends(get_current_agent)):
+    """最近的 RPA 私信回复、评论回复和首评。kind=dm|comment 可过滤。"""
+    if kind == "dm":
+        types = _DM_REPLY_TYPES
+    elif kind == "comment":
+        types = _COMMENT_REPLY_TYPES
+    elif kind in ("", "all"):
+        types = _DM_REPLY_TYPES + _COMMENT_REPLY_TYPES
+    else:
+        raise HTTPException(400, "kind 只能是 dm、comment 或空")
+    rows = (
+        db.query(RpaOutbox)
+        .filter(RpaOutbox.msg_type.in_(types))
+        .order_by(RpaOutbox.id.desc())
+        .limit(100)
+        .all()
+    )
+    return {"items": [
+        {
+            "outbox_id": row.id,
+            "account": row.account,
+            "platform": row.platform,
+            "msg_type": row.msg_type,
+            "kind": "comment" if row.msg_type in _COMMENT_REPLY_TYPES else "dm",
+            "content": _reply_body(row.msg_type, row.content),
+            "status": row.status,
+            "error": row.error or "",
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "acked_at": row.acked_at.isoformat() if row.acked_at else None,
+        }
+        for row in rows
+    ]}
+
+
 @router.get("/outbox/failed")
 def list_failed_outbox(account: str = "", db: Session = Depends(get_db),
                        _: Agent = Depends(get_current_agent)):
@@ -390,6 +472,13 @@ def _sync_binding_status(db: Session, worker_id: str, status: str, meta: dict):
         return
     if status == "online":
         binding.auth_status = "authorized"
+        account = db.get(MatrixAccount, binding.account_id)
+        profile_name = ((account.profile_json or {}) if account else {}).get("ads_profile_name") or ""
+        if account is not None and account.account_name == "待确认" and profile_name:
+            account.account_name = str(profile_name)[:64]
+            profile = dict(account.profile_json or {})
+            profile["confirmed"] = True
+            account.profile_json = profile
     elif status == "login_expired":
         binding.auth_status = "login_expired"
 
@@ -411,18 +500,37 @@ def heartbeat(req: RpaHeartbeat, db: Session = Depends(get_db), _: None = Depend
         db.add(worker)
     worker.account = req.account
     worker.platform = req.platform
-    allowed = ("online", "idle", "login_expired", "selector_mismatch", "browser_unavailable")
+    allowed = ("online", "idle", "login_expired", "selector_mismatch", "browser_unavailable", "fleet")
     worker.status = req.status if req.status in allowed else "online"
     meta = dict(req.meta or {})
     profiles = meta.get("browser_profiles")
     if isinstance(profiles, list):
-        meta["browser_profiles"] = profiles[:100]
+        meta["browser_profiles"] = profiles[:500]
     worker.meta = meta
     worker.last_heartbeat_at = datetime.utcnow()
     _sync_binding_status(db, req.worker_id, worker.status, meta)
     db.commit()
-    if worker.status not in ("online", "idle"):
+    if worker.status not in ("online", "idle", "fleet"):
         monitor.record(f"rpa_worker_{worker.status}", f"worker={req.worker_id} account={req.account}")
+    reopen = False
+    raw_id = meta.get("binding_id")
+    if raw_id:
+        try:
+            binding = db.get(AccountBinding, int(raw_id))
+        except (TypeError, ValueError):
+            binding = None
+        if binding is not None and binding.worker_id == req.worker_id:
+            reopen = bool(binding.reopen_requested)
+    return {"ok": True, "reopen": reopen}
+
+
+@router.post("/reopen-ack")
+def reopen_ack(worker_id: str, db: Session = Depends(get_db), _: None = Depends(rpa_key_dep)):
+    """Worker 开始重新打开浏览器后清掉重开标记，避免反复重启。"""
+    rows = db.query(AccountBinding).filter(AccountBinding.worker_id == worker_id).all()
+    for row in rows:
+        row.reopen_requested = 0
+    db.commit()
     return {"ok": True}
 
 
@@ -478,6 +586,8 @@ def list_workers(agent: Agent = Depends(get_current_agent), db: Session = Depend
     workers = db.query(RpaWorker).order_by(RpaWorker.account, RpaWorker.worker_id).all()
     result = []
     for w in workers:
+        if w.status == "fleet":
+            continue
         pending = db.query(RpaOutbox).filter(
             RpaOutbox.account == w.account, RpaOutbox.status.in_(["pending", "leased"])).count()
         failed = db.query(RpaOutbox).filter(

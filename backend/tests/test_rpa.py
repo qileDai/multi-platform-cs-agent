@@ -443,6 +443,75 @@ class TestHeartbeat:
         assert resp["ok"] is True and resp.get("dry_run") is True
         assert db.query(RpaWorker).filter(RpaWorker.worker_id == worker_id).first() is None
 
+    def test_fleet_heartbeat_is_hidden_and_can_go_offline(self, db):
+        from app.core.monitor import count_last_hour
+        from app.main import _rpa_housekeep_once
+        from app.models import Agent
+        from app.core.security import hash_password
+
+        worker_id = f"fleet-test-{uuid.uuid4().hex[:6]}"
+        before = count_last_hour("rpa_worker_fleet")
+        resp = rpa_api.heartbeat(RpaHeartbeat(
+            worker_id=worker_id, account="", platform="fleet", status="fleet",
+            meta={"browser_profiles": [{"id": "p1", "name": "环境"}]},
+        ), db, None)
+        assert resp["ok"] is True
+        assert count_last_hour("rpa_worker_fleet") == before
+        worker = db.query(RpaWorker).filter(RpaWorker.worker_id == worker_id).one()
+        assert worker.status == "fleet"
+        agent = Agent(username=f"admin_{uuid.uuid4().hex[:6]}",
+                      password_hash=hash_password("x"), display_name="管理员", role="admin")
+        db.add(agent)
+        db.commit()
+        listed = rpa_api.list_workers(agent, db)
+        assert all(item.worker_id != worker_id for item in listed)
+
+        worker.last_heartbeat_at = datetime.utcnow() - timedelta(seconds=settings.rpa_worker_offline_seconds + 5)
+        db.commit()
+        _rpa_housekeep_once()
+        db.expire_all()
+        stale = db.query(RpaWorker).filter(RpaWorker.worker_id == worker_id).one()
+        assert stale.status == "offline"
+
+    def test_list_replies_shows_dm_and_comment_not_publish(self, db):
+        import json
+        from app.models import Agent
+        from app.core.security import hash_password
+
+        account = f"reply_{uuid.uuid4().hex[:6]}"
+        db.add(RpaOutbox(
+            account=account, platform="douyin", content="私信你好",
+            msg_type="text", status="acked",
+        ))
+        db.add(RpaOutbox(
+            account=account, platform="douyin", msg_type="comment_reply", status="pending",
+            content=json.dumps({"text": "评论回复呀", "comment_id": "c1"}, ensure_ascii=False),
+        ))
+        db.add(RpaOutbox(
+            account=account, platform="xiaohongshu", content="{}",
+            msg_type="publish_note", status="pending",
+        ))
+        db.commit()
+        agent = Agent(
+            username=f"admin_{uuid.uuid4().hex[:6]}", password_hash=hash_password("x"),
+            display_name="管理员", role="admin",
+        )
+        db.add(agent)
+        db.commit()
+        items = [
+            item for item in rpa_api.list_replies("", db, agent)["items"]
+            if item["account"] == account
+        ]
+        assert {item["msg_type"] for item in items} == {"text", "comment_reply"}
+        by_type = {item["msg_type"]: item for item in items}
+        assert by_type["text"]["content"] == "私信你好"
+        assert by_type["text"]["kind"] == "dm"
+        assert by_type["comment_reply"]["content"] == "评论回复呀"
+        assert by_type["comment_reply"]["kind"] == "comment"
+        comments = rpa_api.list_replies("comment", db, agent)["items"]
+        assert any(item["account"] == account and item["content"] == "评论回复呀" for item in comments)
+        assert all(item["kind"] == "comment" for item in comments if item["account"] == account)
+
     def test_list_workers_with_counts(self, db):
         from app.models import Agent
         from app.core.security import hash_password

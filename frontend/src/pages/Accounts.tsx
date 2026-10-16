@@ -1,12 +1,14 @@
 import clsx from 'clsx'
+import dayjs from 'dayjs'
 import { AlertTriangle, KeyRound, Plus, RefreshCw, Trash2, Users } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { api, AccountBindingOverview, AccountHealth, MatrixAccount } from '../api/client'
+import { api, AccountBindingOverview, AccountHealth, MatrixAccount, RpaReply } from '../api/client'
 import Empty from '../components/ui/Empty'
 import Skeleton from '../components/ui/Skeleton'
 import { confirmDialog, promptDialog } from '../components/ui/dialogs'
 import { toast } from '../components/ui/toast'
 import { useAuth } from '../store'
+import { accountDutyRows, dedupeProfiles, fleetPresence, replyBody, rpaProfileBinding } from '../utils/accountBinding'
 
 const PLATFORM_LABEL: Record<string, string> = {
   douyin: '抖音',
@@ -42,6 +44,21 @@ const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
   disabled: { label: '已停用', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400' },
 }
 
+const REPLY_KIND: Record<string, string> = {
+  text: '私信',
+  image: '私信图片',
+  voice: '私信语音',
+  comment_reply: '评论',
+  first_comment: '首评',
+}
+
+const REPLY_STATUS: Record<string, string> = {
+  pending: '待发送',
+  leased: '发送中',
+  acked: '已发出',
+  failed: '失败',
+}
+
 const HEALTH_DOT: Record<string, string> = {
   good: 'bg-green-500',
   warn: 'bg-amber-500',
@@ -65,36 +82,41 @@ export default function Accounts() {
     platform: 'douyin',
     duty: 'dm',
     profile_id: '',
-    worker_id: '',
     mode: 'rpa' as 'rpa' | 'api',
     account_name: '',
   })
+  const [replies, setReplies] = useState<RpaReply[]>([])
+  const [replyKind, setReplyKind] = useState('')
 
   const load = useCallback(async () => {
     try {
-      const [accs, healthMap, view] = await Promise.all([
+      const [accs, healthMap, view, replyList] = await Promise.all([
         api.listAccounts(),
         api.accountsHealth().catch(() => ({}) as Record<string, AccountHealth>),
         api.accountBindingOverview().catch(() => null),
+        api.listRpaReplies(replyKind).catch(() => ({ items: [] as RpaReply[] })),
       ])
       setAccounts(accs)
       setHealth(healthMap)
       setOverview(view)
+      setReplies(replyList.items || [])
     } catch (e: any) {
       toast.error(e.message || '加载失败')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [replyKind])
 
   useEffect(() => {
     load()
+    const timer = window.setInterval(() => { load() }, 10000)
+    return () => window.clearInterval(timer)
   }, [load])
 
-  const profiles = (overview?.workers || []).flatMap((worker) =>
-    (worker.browser_profiles || []).map((item) => ({ ...item, worker_id: worker.worker_id })),
-  )
-  const idleWorkers = (overview?.workers || []).filter((worker) => worker.status === 'idle')
+  const profiles = dedupeProfiles(overview?.workers || [])
+  const fleet = fleetPresence(overview?.workers || [])
+  const dutyRows = accountDutyRows(accounts, overview?.accounts, profiles)
+  const accountById = new Map(accounts.map((account) => [account.id, account]))
 
   const create = async () => {
     try {
@@ -109,14 +131,13 @@ export default function Accounts() {
         toast.success('账号已创建，请在表格里点「去授权」')
       } else {
         const profile = profiles.find((item) => item.id === form.profile_id)
-        await api.createAccountFromProfile({
+        await api.createAccountFromProfile(rpaProfileBinding({
           platform: form.platform,
           duty: form.duty,
-          adspower_profile_id: form.profile_id,
+          profile_id: form.profile_id,
           profile_name: profile?.name || '',
-          worker_id: idleWorkers.length > 1 ? form.worker_id : '',
-        })
-        toast.success('已绑定环境。打开页面后，账号名会改成登录的抖音或小红书号')
+        }))
+        toast.success('已绑定环境。登录成功后，账号名会显示这个环境的名称')
       }
       setShowCreate(false)
       load()
@@ -146,7 +167,7 @@ export default function Accounts() {
   }
 
   const remove = async (acc: MatrixAccount) => {
-    if (!(await confirmDialog({ title: `删除账号「${acc.account_name}」？`, message: '删除后该账号的发布/评论配置将失效', danger: true }))) return
+    if (!(await confirmDialog({ title: `删除账号「${acc.account_name}」？`, message: '会删掉这个账号的全部职责绑定，发布和评论配置也会失效', danger: true }))) return
     try {
       await api.deleteAccount(acc.id)
       toast.success('已删除')
@@ -211,13 +232,12 @@ export default function Accounts() {
   const badAccounts = accounts.filter((a) => health[String(a.id)]?.level === 'bad')
   // 分组筛选（distinct group_name，含计数）
   const groups = Array.from(new Set(accounts.map((a) => a.group_name).filter(Boolean)))
-  const visibleAccounts = accounts.filter((account) => {
+  const visibleAccountIds = new Set(accounts.filter((account) => {
     if (platformFilter && account.platform !== platformFilter) return false
     if (!groupFilter) return true
     return groupFilter === '__none__' ? !account.group_name : account.group_name === groupFilter
-  })
-  const [selectedId, setSelectedId] = useState<number | null>(null)
-  const selectedView = overview?.accounts.find((item) => item.id === selectedId)
+  }).map((account) => account.id))
+  const visibleRows = dutyRows.filter((row) => visibleAccountIds.has(row.accountId))
 
   return (
     <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-950">
@@ -225,7 +245,7 @@ export default function Accounts() {
         <div>
           <h1 className="text-lg font-medium text-gray-800 dark:text-gray-100">账号矩阵</h1>
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
-            一行一个平台账号。AdsPower 环境打开后，账号名会改成页面上的登录名
+            一行一个职责。私信和评论要各用一个 AdsPower 环境。登录成功后，账号名先用环境名
           </p>
         </div>
         <select
@@ -247,7 +267,7 @@ export default function Accounts() {
               批量导入
             </button>
             <button
-              onClick={() => setShowCreate(true)}
+              onClick={() => { setShowCreate(true); load() }}
               className="flex items-center gap-1.5 text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700"
             >
               <Plus size={15} /> 新建账号
@@ -255,6 +275,30 @@ export default function Accounts() {
           </>
         )}
       </div>
+
+      {overview && fleet === 'running' && (
+        <div className="mx-6 mt-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-900/50 dark:bg-green-900/20 dark:text-green-400">
+          调度器在运行。保存绑定后会自动打开对应环境。
+        </div>
+      )}
+      {overview && fleet === 'offline' && (
+        <div className="mx-6 mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+          调度器已掉线。请在 Worker 电脑重新运行 run_fleet.ps1。
+        </div>
+      )}
+      {overview && fleet === 'missing' && (
+        <div className="mx-6 mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+          请先在 Worker 电脑运行 run_fleet.ps1。环境列表出现后才能从下拉框选择。
+        </div>
+      )}
+
+      {(overview?.workers || []).some((worker) => worker.ads_error) && (
+        <div className="mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
+          AdsPower 环境列表没有拉下来：
+          {(overview?.workers || []).map((worker) => worker.ads_error).filter(Boolean).join('；')}
+          。新建账号时可以手填环境 ID。
+        </div>
+      )}
 
       {badAccounts.length > 0 && (
         <div className="mx-6 mt-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
@@ -315,61 +359,140 @@ export default function Accounts() {
                 </tr>
               </thead>
               <tbody>
-                {visibleAccounts.map((acc) => {
+                {visibleRows.map((row) => {
+                  const acc = accountById.get(row.accountId)
+                  if (!acc) return null
                   const view = overview?.accounts.find((item) => item.id === acc.id)
-                  const duties = Object.values(view?.bindings || {}).filter(Boolean)
+                  const name = acc.account_name === '待确认' ? '待确认' : acc.account_name
                   const dutyText = acc.auth_type === 'api'
                     ? '官方 API'
-                    : (duties.map((item) => DUTY_LABEL[item!.duty] || item!.duty).join('、') || '—')
-                  const envText = duties.map((item) => item!.adspower_profile_id).filter(Boolean).join('、')
-                    || view?.profile_name || '—'
-                  const online = duties.map((item) => item!.worker_status).find(Boolean) || '—'
+                    : (DUTY_LABEL[row.duty] || row.duty || '—')
                   const auth = acc.auth_type === 'api'
                     ? (acc.has_credentials ? '已授权' : '未授权')
-                    : (view?.confirmed ? '已认出账号' : (duties[0] ? (AUTH_LABEL[duties[0]!.auth_status] || duties[0]!.auth_status) : '待确认'))
-                  const name = !view?.confirmed && acc.auth_type === 'rpa' ? '待确认' : acc.account_name
+                    : (row.authStatus
+                      ? (AUTH_LABEL[row.authStatus] || row.authStatus)
+                      : (view?.confirmed ? '已认出账号' : '待确认'))
+                  const online = row.workerStatus ? (ONLINE_LABEL[row.workerStatus] || row.workerStatus) : '—'
                   return (
-                    <tr
-                      key={acc.id}
-                      onClick={() => setSelectedId(acc.id)}
-                      className="border-b dark:border-gray-800 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/60"
-                    >
+                    <tr key={row.key} className="border-b dark:border-gray-800">
                       <td className="px-4 py-3 text-gray-800 dark:text-gray-100">
                         {name}
                         {name === '待确认' && view?.profile_name ? <span className="block text-xs text-gray-400">{view.profile_name}</span> : null}
+                        {row.workerStatus === 'selector_mismatch' && row.debugFile ? (
+                          <span className="block text-xs text-red-500">页面快照 {row.debugFile}</span>
+                        ) : null}
+                        {row.accountTypeMismatch ? (
+                          <span className="block text-xs text-amber-600">驱动和抖音账号类型不一致</span>
+                        ) : null}
                       </td>
                       <td className="px-4 py-3">{PLATFORM_LABEL[acc.platform] || acc.platform}</td>
                       <td className="px-4 py-3">{dutyText}</td>
-                      <td className="px-4 py-3 text-gray-500">{envText}</td>
-                      <td className="px-4 py-3">{ONLINE_LABEL[online] || online}</td>
+                      <td className="px-4 py-3 text-gray-500">{row.envLabel}</td>
+                      <td className="px-4 py-3">{online}</td>
                       <td className="px-4 py-3">{auth}</td>
-                      <td className="px-4 py-3 text-right space-x-2" onClick={(e) => e.stopPropagation()}>
+                      <td className="px-4 py-3 text-right space-x-2">
                         {acc.auth_type === 'api' && acc.platform === 'douyin' && (
                           <button onClick={() => goAuth(acc)} className="text-xs text-blue-600">去授权</button>
                         )}
-                        {isAdmin && <button onClick={() => remove(acc)} className="text-xs text-red-500">删除</button>}
+                        {isAdmin && row.canReopen && row.bindingId != null && (
+                          <button
+                            onClick={() => {
+                              api.reopenAccountBinding(row.bindingId as number).then(() => {
+                                toast.success('已通知重新打开这个环境，请在弹出的窗口里登录')
+                                load()
+                              }).catch((e: Error) => toast.error(e.message))
+                            }}
+                            className="text-xs text-blue-600"
+                          >
+                            重新打开
+                          </button>
+                        )}
+                        {isAdmin && row.canDisable && row.bindingId != null && (
+                          <button
+                            onClick={() => {
+                              api.updateAccountBinding(row.bindingId as number, { auth_status: 'disabled' }).then(() => load())
+                                .catch((e: Error) => toast.error(e.message))
+                            }}
+                            className="text-xs text-red-500"
+                          >
+                            停用
+                          </button>
+                        )}
+                        {isAdmin && row.canEnable && row.bindingId != null && (
+                          <button
+                            onClick={() => {
+                              api.updateAccountBinding(row.bindingId as number, { auth_status: 'pending_login' }).then(() => {
+                                toast.success('已启用，调度器会重新打开这个环境')
+                                load()
+                              }).catch((e: Error) => toast.error(e.message))
+                            }}
+                            className="text-xs text-blue-600"
+                          >
+                            启用
+                          </button>
+                        )}
+                        {isAdmin && row.showDelete && (
+                          <button onClick={() => remove(acc)} className="text-xs text-red-500">删除</button>
+                        )}
                       </td>
                     </tr>
                   )
                 })}
               </tbody>
             </table>
-            {selectedView && (
-              <div className="px-4 py-3 text-xs text-gray-500 border-t dark:border-gray-700 flex flex-wrap gap-3">
-                {Object.values(selectedView.bindings).filter(Boolean).map((item) => (
-                  <span key={item!.id}>
-                    {DUTY_LABEL[item!.duty] || item!.duty} · {AUTH_LABEL[item!.auth_status] || item!.auth_status}
-                    {isAdmin && item!.auth_status !== 'disabled' && (
-                      <button
-                        className="ml-2 text-red-500"
-                        onClick={() => api.updateAccountBinding(item!.id, { auth_status: 'disabled' }).then(() => load())}
-                      >
-                        停用
-                      </button>
-                    )}
-                  </span>
-                ))}
-              </div>
+          </div>
+        )}
+
+        {!loading && (
+          <div className="mt-6 bg-white dark:bg-gray-900 rounded-card shadow-card overflow-x-auto">
+            <div className="px-4 py-3 flex items-center gap-3 border-b dark:border-gray-700">
+              <div className="text-sm font-medium text-gray-800 dark:text-gray-100">RPA 回复记录</div>
+              <select
+                value={replyKind}
+                onChange={(e) => setReplyKind(e.target.value)}
+                className="text-xs border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded px-2 py-1"
+              >
+                <option value="">全部</option>
+                <option value="dm">私信</option>
+                <option value="comment">评论</option>
+              </select>
+            </div>
+            {replies.length === 0 ? (
+              <div className="px-4 py-6 text-xs text-gray-400">还没有 RPA 回复。私信和评论发出后会出现在这里。</div>
+            ) : (
+              <table className="w-full text-sm">
+                <thead className="text-xs text-gray-400 border-b dark:border-gray-700">
+                  <tr>
+                    <th className="text-left font-normal px-4 py-2">时间</th>
+                    <th className="text-left font-normal px-4 py-2">账号</th>
+                    <th className="text-left font-normal px-4 py-2">平台</th>
+                    <th className="text-left font-normal px-4 py-2">类型</th>
+                    <th className="text-left font-normal px-4 py-2">回复内容</th>
+                    <th className="text-left font-normal px-4 py-2">状态</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {replies.map((item) => (
+                    <tr key={item.outbox_id} className="border-b dark:border-gray-800">
+                      <td className="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">
+                        {item.created_at ? dayjs(item.created_at).format('MM-DD HH:mm') : '—'}
+                      </td>
+                      <td className="px-4 py-3 text-gray-700 dark:text-gray-200">{item.account || '—'}</td>
+                      <td className="px-4 py-3">{PLATFORM_LABEL[item.platform] || item.platform || '—'}</td>
+                      <td className="px-4 py-3">{REPLY_KIND[item.msg_type] || item.msg_type}</td>
+                      <td className="px-4 py-3 text-gray-800 dark:text-gray-100 max-w-md">
+                        <div className="truncate">{replyBody(item.msg_type, item.content) || '—'}</div>
+                        {item.status === 'failed' && item.error ? (
+                          <div className="text-xs text-red-500 truncate">{item.error}</div>
+                        ) : null}
+                      </td>
+                      <td className={clsx('px-4 py-3', item.status === 'failed' ? 'text-red-500' : 'text-gray-600 dark:text-gray-300')}>
+                        {REPLY_STATUS[item.status] || item.status}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             )}
           </div>
         )}
@@ -497,7 +620,7 @@ export default function Accounts() {
                   <div>
                     <label className="text-xs text-gray-500 dark:text-gray-400">AdsPower 环境</label>
                     <select
-                      value={form.profile_id}
+                      value={profiles.some((item) => item.id === form.profile_id) ? form.profile_id : ''}
                       onChange={(e) => setForm({ ...form, profile_id: e.target.value })}
                       className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
                     >
@@ -506,22 +629,19 @@ export default function Accounts() {
                         <option key={item.id} value={item.id}>{item.name}（{item.id}）</option>
                       ))}
                     </select>
+                    <input
+                      value={form.profile_id}
+                      onChange={(e) => setForm({ ...form, profile_id: e.target.value.trim() })}
+                      placeholder="或手填环境 ID"
+                      className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-2"
+                    />
+                    <p className="text-xs text-gray-400 mt-2">私信和评论要各用一个 AdsPower 环境，不能同时绑在同一个环境上。</p>
+                    {(overview?.workers || []).some((worker) => worker.ads_error) && (
+                      <p className="text-xs text-red-500 mt-2">
+                        {(overview?.workers || []).map((worker) => worker.ads_error).filter(Boolean).join('；')}
+                      </p>
+                    )}
                   </div>
-                  {idleWorkers.length > 1 && (
-                    <div>
-                      <label className="text-xs text-gray-500 dark:text-gray-400">空闲进程</label>
-                      <select
-                        value={form.worker_id}
-                        onChange={(e) => setForm({ ...form, worker_id: e.target.value })}
-                        className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                      >
-                        <option value="">请选择</option>
-                        {idleWorkers.map((item) => (
-                          <option key={item.worker_id} value={item.worker_id}>{item.worker_id}</option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
                 </>
               )}
             </div>

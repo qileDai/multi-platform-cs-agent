@@ -7,19 +7,18 @@ import json
 import logging
 import re
 
-from openai import AsyncOpenAI
-
 from ..config import settings
+from ..llm import get_llm_client, record_usage
 from . import evidence
 
 logger = logging.getLogger(__name__)
 
 PASS_SCORE = 0.6
-_LIST_LEAD = "清单我按资料发你"
+_LIST_LEAD = "您要的我都列下面啦"
 _HEADING_RE = re.compile(
     r"^(?:#{1,6}\s+\S|[一二三四五六七八九十百]+、\s*\S|（[一二三四五六七八九十百]+）\s*\S|\([一二三四五六七八九十百]+\)\s*\S)"
 )
-_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
 _TOPIC_WORDS = ("开户", "注册", "年审", "面签", "退货", "审计", "报税", "记账")
 _PHRASE_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
 _HIGH_RISK_RE = re.compile(
@@ -133,17 +132,46 @@ def _statements(messages: list[str]) -> list[str]:
     return lines
 
 
-def _chinese_windows(text: str) -> list[str]:
+_SIMILAR_LINE_RE = re.compile(r"^\s*相似[:：]")
+
+
+def _chinese_windows(text: str, min_size: int = 4) -> list[str]:
+    """回复侧至少连续 4 个字。两三个字撞上资料，不能把整句算成有依据。"""
     chars = re.findall(r"[\u4e00-\u9fff]", text or "")
     windows: list[str] = []
-    for size in range(2, min(8, len(chars) + 1)):
+    for size in range(min_size, min(8, len(chars) + 1)):
         for index in range(len(chars) - size + 1):
             windows.append("".join(chars[index:index + size]))
     return windows
 
 
+def _evidence_fact_in_statement(statement: str, blob: str) -> bool:
+    """资料里的三字事实出现在回复中，例如「身份证」。两个字不算。"""
+    compact_statement = _compact(statement)
+    for run in re.findall(r"[\u4e00-\u9fff]+", blob or ""):
+        if len(run) < 3:
+            continue
+        for size in range(3, min(len(run), 8) + 1):
+            for index in range(len(run) - size + 1):
+                if run[index:index + size] in compact_statement:
+                    return True
+    return False
+
+
+def _scoring_blob(contexts: list[dict]) -> str:
+    """相似问只用于检索，不作为忠实度证据。"""
+    parts: list[str] = []
+    for item in contexts or []:
+        kept = [
+            raw for raw in (item.get("content") or "").splitlines()
+            if not _SIMILAR_LINE_RE.match(raw)
+        ]
+        parts.append("\n".join(kept))
+    return "\n".join(parts)
+
+
 def statement_supported(statement: str, blob: str) -> bool:
-    """编号行必须整句落在相关段落里。口语复述只要关键信息或数字对得上。"""
+    """编号行的关键短语都要落在证据里。散文至少要有连续 4 个字对得上。"""
     if evidence.claims_unsupported([statement], blob):
         return False
     compact_statement = _compact(statement)
@@ -156,13 +184,15 @@ def statement_supported(statement: str, blob: str) -> bool:
         return bool(required) and all(item in compact_blob for item in required)
     if any(item in compact_blob for item in _chinese_windows(compact_statement)):
         return True
+    if _evidence_fact_in_statement(statement, blob):
+        return True
     folded = evidence.fold_digits(statement or "")
     return evidence._AMOUNT.search(folded) is not None
 
 
 def faithfulness(messages: list[str], contexts: list[dict]) -> float:
     """能被相关段落推断的陈述占比。没有相关段落或没有陈述时为 0。"""
-    blob = "\n".join((item.get("content") or "") for item in contexts or [])
+    blob = _scoring_blob(contexts)
     statements = _statements(messages)
     if not contexts or not statements or not blob.strip():
         return 0.0
@@ -172,7 +202,7 @@ def faithfulness(messages: list[str], contexts: list[dict]) -> float:
 
 def supported_messages(messages: list[str], contexts: list[dict]) -> list[str]:
     """只留下能从相关段落推断的句子。"""
-    blob = "\n".join((item.get("content") or "") for item in contexts or [])
+    blob = _scoring_blob(contexts)
     kept: list[str] = []
     for message in messages or []:
         lines = []
@@ -257,18 +287,16 @@ async def judge_relevance(user_text: str, contexts: list[dict], *, timeout: floa
         f"用户原话：{user_text}\n\n资料：\n" + "\n\n".join(blocks)
     )
     try:
-        client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-            timeout=max(1.0, timeout),
-        )
+        client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=120,
             response_format={"type": "json_object"},
+            timeout=max(1.0, timeout),
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception:  # noqa: BLE001
         logger.exception("上下文相关性判定失败")

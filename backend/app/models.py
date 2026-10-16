@@ -18,6 +18,8 @@ class Agent(Base):
     password_hash = Column(String(128), nullable=False)
     display_name = Column(String(64), nullable=False)
     role = Column(String(16), default="agent")  # admin | agent
+    # None = 不限制（旧账号）；非空为可见模块 key 列表。管理员忽略此列。
+    modules = Column(JSON, nullable=True)
     status = Column(String(16), default="offline")  # active(接待中) | resting(休息) | offline
     max_concurrent = Column(Integer, default=20)  # 接待上限；0 = 不自动分配，仍可接受转接
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -45,6 +47,24 @@ class Customer(Base):
     conversations = relationship("Conversation", back_populates="customer")
 
 
+class LeadCapture(Base):
+    """一次留资。同一会话同一号码不重复。"""
+    __tablename__ = "lead_captures"
+    __table_args__ = (
+        Index("ix_lead_captures_conv_contact", "conversation_id", "contact", unique=True),
+    )
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    platform = Column(String(16), default="", index=True)
+    contact = Column(String(64), nullable=False)
+    contact_type = Column(String(16), default="phone")  # phone | wechat
+    nickname = Column(String(64), default="")
+    business = Column(String(64), default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Conversation(Base):
     """会话。mode: ai(AI接待) | human(人工接待) | pending(排队待人工)；status: open | closed。"""
     __tablename__ = "conversations"
@@ -60,6 +80,7 @@ class Conversation(Base):
     summary = Column(Text, default="")  # 滚动小结（长上下文压缩）
     summary_upto_message_id = Column(Integer, default=0)
     last_message_at = Column(DateTime, default=datetime.utcnow, index=True)
+    lead_followups = Column(Integer, default=0)  # 沉默留资跟进已发次数，整段会话最多 2
     created_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime, nullable=True)
 
@@ -333,6 +354,7 @@ class AccountBinding(Base):
     platform_url = Column(String(256), default="")
     auth_status = Column(String(24), default="pending_login")
     # unbound | pending_login | authorized | login_expired | disabled
+    reopen_requested = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

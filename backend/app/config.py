@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     humanize_base_delay_ms: int = 800
     humanize_per_char_ms: int = 60
 
+    # 队列并发：fast lane 同时处理的入站消息上限（数十用户同时问答的并发阀门；
+    # 调大前先压测：LLM/embedding 供应商配额 + SQLite 写压力）
+    queue_fast_concurrency: int = 20
+
     # 会话超时自动关闭（仅 AI 接待中的会话）
     session_timeout_minutes: int = 30
     session_close_message: str = "先不打扰您啦，有问题随时喊我哈~"

@@ -541,6 +541,11 @@ function TypingBubble() {
   )
 }
 
+function formatAnswerDuration(totalMs: number): string {
+  if (totalMs >= 1000) return `${(totalMs / 1000).toFixed(1)}秒`
+  return `${Math.round(totalMs)}毫秒`
+}
+
 function citationLabel(item: string | { title?: string; doc_id?: number | null; chunk_id?: string | null }) {
   if (typeof item === 'string') return item
   const title = item.title || '资料'
@@ -622,6 +627,7 @@ function MessageBubble({
   const outbox = msg.extra?.outbox_status ? OUTBOX_STATUS[msg.extra.outbox_status] : null
   const fullTime = new Date(msg.created_at).toLocaleString('zh-CN')
   const isAi = msg.sender_type === 'ai'
+  const answerMs = msg.extra?.timing?.total_ms
 
   const avatar = isUser ? (
     <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-300 flex items-center justify-center shrink-0">
@@ -686,6 +692,9 @@ function MessageBubble({
           </div>
 
           <div className={clsx('flex items-center gap-2 mt-0.5 text-[10px] text-gray-400 dark:text-gray-500', !isUser && 'justify-end')}>
+            {isAi && answerMs != null && (
+              <span title="从开始生成到这条回复入库">{formatAnswerDuration(answerMs)}</span>
+            )}
             {outbox && (
               <span className={clsx('inline-flex items-center gap-0.5', outbox.cls)} title={`RPA 通道：${outbox.label}`}>
                 <outbox.icon size={10} />

@@ -7,6 +7,19 @@ export interface Agent {
   role: string
   status: string
   max_concurrent?: number
+  modules?: string[] | null
+}
+
+export interface LeadCapture {
+  id: number
+  customer_id: number
+  conversation_id: number
+  platform: string
+  contact: string
+  contact_type: string
+  nickname: string
+  business: string
+  created_at: string
 }
 
 export interface Customer {
@@ -40,6 +53,15 @@ export interface Message {
     reflection?: { action?: string; issues?: string[] } | null
     handoff_reason?: string
     reply_ms?: number
+    timing?: {
+      total_ms?: number
+      rewrite_ms?: number
+      embed_ms?: number
+      rerank_ms?: number
+      judge_ms?: number
+      draft_ms?: number
+      fallback_ms?: number
+    }
     filtered_words?: string[]
     media_id?: string
     asr?: boolean
@@ -116,6 +138,30 @@ export interface KnowledgeDoc {
   hit_count?: number
   created_at: string
   updated_at: string
+}
+
+export interface DialogImportResult {
+  imported: number
+  created: number
+  updated: number
+  skipped_invalid: number
+  skipped_missed: number
+  gap_count: number
+  gap_titles: string[]
+}
+
+export interface DocBatchResult {
+  updated: number
+  failed_ids: number[]
+}
+
+export interface FaqPackResult {
+  applied: boolean
+  created: number
+  content_updated: number
+  enabling: number
+  disabling_active: number
+  skipped_ambiguous: string[]
 }
 
 export interface MissedQuestion {
@@ -198,6 +244,19 @@ export interface RpaWorker {
   last_heartbeat_at: string
   pending: number
   failed: number
+}
+
+export interface RpaReply {
+  outbox_id: number
+  account: string
+  platform: string
+  msg_type: string
+  kind: 'dm' | 'comment'
+  content: string
+  status: string
+  error: string
+  created_at: string | null
+  acked_at: string | null
 }
 
 export interface RpaFailedMessage {
@@ -296,6 +355,7 @@ export interface AccountBindingOverview {
     account: string
     platform: string
     browser_profiles: { id: string; name: string }[]
+    ads_error?: string
   }[]
 }
 
@@ -562,6 +622,36 @@ export function setToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY)
 }
 
+/** 下载 FAQ 表。request() 会把成功响应当 JSON 解析，文件要单独走。 */
+export async function downloadFaqPack(): Promise<void> {
+  const token = getToken()
+  const resp = await fetch(`${appBase()}/api/knowledge/faq/export`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (resp.status === 401) {
+    setToken(null)
+    window.location.href = `${appBase()}/login`
+    throw new Error('未登录')
+  }
+  if (!resp.ok) {
+    const text = await resp.text()
+    let detail = text
+    try {
+      detail = JSON.parse(text).detail || text
+    } catch { /* 保留原文 */ }
+    throw new Error(detail)
+  }
+  const blob = await resp.blob()
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'faq.xlsx'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
   const headers: Record<string, string> = {
@@ -642,6 +732,8 @@ export const api = {
 
   // rpa
   listRpaWorkers: () => request<RpaWorker[]>('/api/rpa/workers'),
+  listRpaReplies: (kind = '') =>
+    request<{ items: RpaReply[] }>(`/api/rpa/replies${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
   listRpaFailed: (account = '') =>
     request<{ items: RpaFailedMessage[] }>(`/api/rpa/outbox/failed?account=${encodeURIComponent(account)}`),
   retryRpaOutbox: (id: number) => request(`/api/rpa/outbox/${id}/retry`, { method: 'POST' }),
@@ -649,6 +741,13 @@ export const api = {
 
   // settings（AI 全局熔断开关 + 审计日志）
   getAiSwitch: () => request<{ enabled: boolean }>('/api/settings/ai-switch'),
+  getDouyinAccountType: () =>
+    request<{ account_type: string }>('/api/settings/douyin-account-type'),
+  setDouyinAccountType: (account_type: string) =>
+    request<{ account_type: string }>('/api/settings/douyin-account-type', {
+      method: 'PUT',
+      body: JSON.stringify({ account_type }),
+    }),
   setAiSwitch: (enabled: boolean) =>
     request<{ enabled: boolean }>('/api/settings/ai-switch', {
       method: 'PUT',
@@ -702,12 +801,28 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+  batchDocs: (ids: number[], action: 'active' | 'disabled' | 'delete') =>
+    request<DocBatchResult>('/api/knowledge/docs/batch', {
+      method: 'POST',
+      body: JSON.stringify({ ids, action }),
+    }),
   listChunks: (id: number) => request<KnowledgeChunk[]>(`/api/knowledge/docs/${id}/chunks`),
   deleteDoc: (id: number) => request(`/api/knowledge/docs/${id}`, { method: 'DELETE' }),
   uploadDoc: (file: File) => {
     const form = new FormData()
     form.append('file', file)
     return request<KnowledgeDoc>('/api/knowledge/upload', { method: 'POST', body: form })
+  },
+  importDialogs: (file: File) => {
+    const form = new FormData()
+    form.append('file', file)
+    return request<DialogImportResult>('/api/knowledge/import-dialogs', { method: 'POST', body: form })
+  },
+  importFaqPack: (file: File, apply: boolean) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('apply', apply ? 'true' : 'false')
+    return request<FaqPackResult>('/api/knowledge/faq/import', { method: 'POST', body: form })
   },
   recallTest: (query: string) =>
     request<RecallTestResult>('/api/knowledge/recall-test', {
@@ -756,14 +871,28 @@ export const api = {
 
   // agents
   listAgents: () => request<Agent[]>('/api/agents'),
-  createAgent: (username: string, password: string, displayName: string, role = 'agent', maxConcurrent = 20) =>
+  createAgent: (
+    username: string,
+    password: string,
+    displayName: string,
+    role = 'agent',
+    maxConcurrent = 20,
+    modules?: string[],
+  ) =>
     request<Agent>('/api/agents', {
       method: 'POST',
-      body: JSON.stringify({ username, password, display_name: displayName, role, max_concurrent: maxConcurrent }),
+      body: JSON.stringify({
+        username,
+        password,
+        display_name: displayName,
+        role,
+        max_concurrent: maxConcurrent,
+        ...(modules ? { modules } : {}),
+      }),
     }),
   updateAgent: (
     id: number,
-    data: { max_concurrent?: number; display_name?: string; role?: string; password?: string },
+    data: { max_concurrent?: number; display_name?: string; role?: string; password?: string; modules?: string[] },
   ) => request<Agent>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAgent: (id: number) => request(`/api/agents/${id}`, { method: 'DELETE' }),
   setMyStatus: (status: string) =>
@@ -778,6 +907,10 @@ export const api = {
   // tickets
   listTickets: (status = '', page = 1) =>
     request<{ total: number; items: Ticket[] }>(`/api/tickets?status=${status}&page=${page}`),
+  listLeads: (q = '', platform = '', page = 1) =>
+    request<{ total: number; items: LeadCapture[] }>(
+      `/api/leads?q=${encodeURIComponent(q)}&platform=${encodeURIComponent(platform)}&page=${page}`,
+    ),
   ticketsByConversation: (conversationId: number) =>
     request<Ticket[]>(`/api/tickets/by-conversation/${conversationId}`),
   createTicket: (conversationId: number, type: string, title: string, content: string) =>
@@ -828,6 +961,8 @@ export const api = {
     request<AccountBinding>(`/api/account-bindings/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteAccountBinding: (id: number) =>
     request(`/api/account-bindings/${id}`, { method: 'DELETE' }),
+  reopenAccountBinding: (id: number) =>
+    request(`/api/account-bindings/${id}/reopen`, { method: 'POST' }),
   importAccounts: (lines: string[]) =>
     request<{ imported: number; failed: { line: number; content: string; error: string }[] }>(
       '/api/accounts/import', { method: 'POST', body: JSON.stringify({ lines }) }),

@@ -31,7 +31,7 @@ _SIMILARITY_DROP = 0.1
 _SECTION_HEADING_RE = re.compile(
     r"^(?:#{1,6}\s+\S|[一二三四五六七八九十百]+、\s*\S|（[一二三四五六七八九十百]+）\s*\S|\([一二三四五六七八九十百]+\)\s*\S)"
 )
-_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_LIST_LINE_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？])")
 _MIN_CHUNK_LEN = 10
 
@@ -483,14 +483,132 @@ async def ingest_document(doc_id: int):
         db.close()
 
 
-def _delete_chunks(db, doc_id: int):
-    answer_cache.invalidate_docs([doc_id])
-    db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id == doc_id).delete()
+_EMBED_BATCH = 32
+
+
+@dataclass
+class _VectorPiece:
+    chunk_id: int
+    doc_id: int
+    parent_id: int
+    title: str
+    content: str
+
+
+def _delete_chunk_rows(db, doc_ids: list[int]) -> None:
+    """清掉这些文档的切片、回答缓存和向量。向量删除失败只记日志。"""
+    if not doc_ids:
+        return
+    from . import pipeline  # 延迟导入，避免循环依赖
+    pipeline.invalidate_faq_pins()  # 精确 FAQ 命中缓存随之失效
+    answer_cache.invalidate_docs(doc_ids)
+    db.query(KnowledgeChunk).filter(KnowledgeChunk.doc_id.in_(doc_ids)).delete(synchronize_session=False)
     db.commit()
+    for doc_id in doc_ids:
+        try:
+            vectorstore.delete_by_doc(doc_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("向量库删除 doc_id=%s 失败（可能未启用 embedding）", doc_id)
+
+
+def _delete_chunks(db, doc_id: int):
+    _delete_chunk_rows(db, [doc_id])
+
+
+async def _write_active_chunks(db, doc: KnowledgeDoc) -> list[_VectorPiece]:
+    """按当前正文重写切片。FAQ 一条，文档沿用章节切块。先切块再删旧切片，切块失败时旧索引还在。"""
+    if doc.doc_type == "faq":
+        pending = [KnowledgeChunk(
+            doc_id=doc.id, parent_id=None, chunk_index=0, content=faq_index_text(doc),
+        )]
+    else:
+        pending = []
+        for index, section in enumerate(await build_sections(doc.content or "")):
+            pending.append(KnowledgeChunk(
+                doc_id=doc.id, parent_id=None, chunk_index=index,
+                content=_index_text(doc.title, section.heading, section.text),
+            ))
+    _delete_chunk_rows(db, [doc.id])
+    if pending:
+        db.add_all(pending)
+    db.commit()
+    for chunk in pending:
+        db.refresh(chunk)
+    return [
+        _VectorPiece(
+            chunk_id=chunk.id,
+            doc_id=doc.id,
+            parent_id=chunk.parent_id or 0,
+            title=doc.title,
+            content=chunk.content,
+        )
+        for chunk in pending
+    ]
+
+
+async def _upsert_vectors(pieces: list[_VectorPiece]) -> None:
+    """分批向量化后一次写入。接口失败则保留切片，交给 BM25。"""
+    if not pieces:
+        return
+    ids: list[str] = []
+    vectors_out: list[list[float]] = []
+    documents: list[str] = []
+    metadatas: list[dict] = []
+    for start in range(0, len(pieces), _EMBED_BATCH):
+        batch = pieces[start:start + _EMBED_BATCH]
+        vectors = await embeddings.embed_texts([piece.content for piece in batch])
+        if not vectors or len(vectors) != len(batch):
+            logger.warning("批量向量化失败，这 %d 条只保留关键词索引", len(batch))
+            continue
+        for piece, vector in zip(batch, vectors):
+            ids.append(f"chunk_{piece.chunk_id}")
+            vectors_out.append(vector)
+            documents.append(piece.content)
+            metadatas.append({
+                "doc_id": piece.doc_id,
+                "chunk_id": piece.chunk_id,
+                "parent_id": piece.parent_id,
+                "title": piece.title,
+            })
+    if not ids:
+        return
     try:
-        vectorstore.delete_by_doc(doc_id)
+        vectorstore.upsert_chunks(ids, vectors_out, documents, metadatas)
     except Exception:  # noqa: BLE001
-        logger.warning("向量库删除 doc_id=%s 失败（可能未启用 embedding）", doc_id)
+        logger.warning("向量写入失败，保留切片并使用关键词索引", exc_info=True)
+
+
+async def sync_doc_index(doc_ids: list[int]) -> tuple[int, list[int]]:
+    """按当前状态对齐多篇文档。启用的重建切片，其余清掉。BM25 只重建一次。"""
+    unique_ids = list(dict.fromkeys(doc_ids))
+    if not unique_ids:
+        return 0, []
+    failed: list[int] = []
+    pieces: list[_VectorPiece] = []
+    db = SessionLocal()
+    try:
+        docs = db.query(KnowledgeDoc).filter(KnowledgeDoc.id.in_(unique_ids)).all()
+        by_id = {doc.id: doc for doc in docs}
+        failed.extend(doc_id for doc_id in unique_ids if doc_id not in by_id)
+        inactive = [doc.id for doc in docs if doc.status != "active"]
+        if inactive:
+            _delete_chunk_rows(db, inactive)
+        for doc in docs:
+            if doc.status != "active":
+                continue
+            try:
+                pieces.extend(await _write_active_chunks(db, doc))
+            except Exception:  # noqa: BLE001
+                logger.exception("对齐文档索引失败 doc_id=%s", doc.id)
+                db.rollback()
+                failed.append(doc.id)
+        await _upsert_vectors(pieces)
+    finally:
+        db.close()
+    rebuild_bm25_from_db()
+    failed_set = set(failed)
+    updated = len([doc_id for doc_id in unique_ids if doc_id not in failed_set])
+    return updated, failed
 
 
 async def _index_chunks(chunks: list[KnowledgeChunk], doc: KnowledgeDoc):

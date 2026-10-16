@@ -13,17 +13,18 @@ import re
 import time
 from datetime import datetime
 
-from openai import APITimeoutError, AsyncOpenAI
+from openai import APITimeoutError
 from pydantic import ValidationError
 
 from ..config import settings
 from ..core import monitor
 from ..database import SessionLocal
-from ..models import Conversation, Customer, KnowledgeDoc, LlmUsage, Message
+from ..llm import get_llm_client, record_usage
+from ..models import Conversation, Customer, KnowledgeDoc, Message
 from ..rag import cache as answer_cache, pipeline, rewrite
 from ..schemas import AgentReply
 from ..services import handoff, note_unmatched, record_missed_question, send_outbound
-from . import confidence, context, evidence, humanize, prompt as prompt_mod, tools
+from . import confidence, context, evidence, humanize, lead_flow, prompt as prompt_mod, tools
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ _STAGE_KEYS = ("rewrite_ms", "embed_ms", "rerank_ms", "judge_ms", "draft_ms", "f
 _reply_trace: contextvars.ContextVar[dict | None] = contextvars.ContextVar("reply_trace", default=None)
 
 MAX_TOOL_ROUNDS = 2  # 工具调用上限（防死循环）
+CATCHUP_MAX_MESSAGES = 3  # 一次接待后最多补答几条夹在中间的旧问题（防风暴）
 REPLY_BUDGET_SECONDS = 45
 DRAFT_RESERVE_SECONDS = 15
 MIN_LLM_SECONDS = 4
@@ -38,13 +40,18 @@ FALLBACK_TIMEOUT_SECONDS = 15
 _CONFIRM_REPLY = "我先让同事帮您确认"
 _TASK_RE = re.compile(r"订单|物流|快递|退货|退换|换货|退款")
 _FACT_TOOLS = frozenset({"query_order", "query_logistics"})
-_HELLO_REPLY = "在的，我是小赢。香港公司注册、开户都可以问我"
+_HELLO_REPLY = "您好老板，这边可以提供注册，开户，年审，地址挂靠等服务，您是想咨询什么呢"
 _THANKS_REPLY = "客气啦，有问题随时喊我"
 _LAUGH_REPLY = "哈哈，注册还是开户，您想先看哪块"
 _GREETING_REPLIES = {"谢谢": _THANKS_REPLY, "哈哈": _LAUGH_REPLY}
-_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
-_LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
-_LIST_LEAD = "清单我按资料发你"
+_LIST_ITEM_RE = re.compile(r"^\s*(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*\S")
+_LIST_MARKER_RE = re.compile(r"^(?:\d+\s*[.、．:：)）]|[①②③④⑤⑥⑦⑧⑨⑩])\s*")
+_COLON_ITEM_RE = re.compile(r"^\d+\s*[:：]")
+_LIST_ANNOUNCE_RE = re.compile(r"(?:如下|分别是|主要包括)[：:。．]?$")
+# 条目去重用的标点归一：同一份清单常见「1：公司名称」和「1. 公司名称；」两种风格，
+# 只按原文精确比较会把同一项收两遍，答案里清单就重复了。
+_ITEM_PUNCT_RE = re.compile(r"[\s。；，、,;.:：()（）·…！!?？\"'“”‘’]+")
+_LIST_LEAD = "您要的我都列下面啦"
 _EMPTY_REPLY = "不好意思，我这边没说清楚，先帮您转给同事哈"
 _MISS_REPLY = "这个问题我这边没查到靠谱资料，先帮您转给同事哈"
 _GREETINGS = frozenset({
@@ -52,6 +59,22 @@ _GREETINGS = frozenset({
     "hi", "hello",
 })
 _GREETING_TAILS = "呀啊呢哈哦"
+# 纯应答：整条只是「好的/嗯/ok」。上一条客服消息在要联系方式或安排专员时，应答=等专员。
+_ACKS = frozenset({
+    "好的", "好嘞", "好滴", "好呀", "好", "嗯", "嗯嗯", "哦", "哦哦", "噢",
+    "ok", "okay", "行", "可以", "中",
+})
+_ACK_WAIT_REPLY = "好嘞，请您稍等"
+_ACK_GENERIC_REPLY = "好嘞，有啥想了解的随时问我"
+_ACK_CONTEXT_RE = re.compile(r"联系方式|电话|微信|专员|稍等")
+# 联系意图：问怎么联系/要联系方式。答案固定，走确定性话术，不进 RAG。
+_CONTACT_ASK_RE = re.compile(
+    r"怎么联系|如何联系|怎么沟通|如何沟通|联系方式|联系你们|微信多少|电话多少|号码多少|联系电话|留个电话"
+)
+# 问的是「我们的」联系方式：平台发不了，用留资话术原句解释并请对方留联系方式。
+_OURS_CONTACT_RE = re.compile(
+    r"(微信|电话|号码|联系方式)(是多少|多少)|你们.{0,3}(微信|电话|号码|联系方式)|留个电话"
+)
 
 
 def _greeting_key(text: str) -> str | None:
@@ -74,6 +97,38 @@ def greeting_reply(text: str) -> str:
     return _GREETING_REPLIES.get(_greeting_key(text) or "", _HELLO_REPLY)
 
 
+def is_pure_ack(text: str) -> bool:
+    """整条只是应答（好的/嗯/ok）。后面还带着问题时返回 False，继续走检索。"""
+    cleaned = re.sub(r"[\s，。！？、~～!?,.·…]+", "", text or "")
+    return cleaned.lower() in _ACKS
+
+
+def _ack_reply(recent: list[dict]) -> str:
+    """看最近一条客服消息：在要联系方式或安排专员时，应答=请稍等；否则通用接话。"""
+    for row in reversed(list(recent or [])):
+        if row.get("sender_type") in ("ai", "agent"):
+            if _ACK_CONTEXT_RE.search(row.get("content") or ""):
+                return _ACK_WAIT_REPLY
+            return _ACK_GENERIC_REPLY
+    return _ACK_GENERIC_REPLY
+
+
+def asks_contact(text: str) -> bool:
+    """在问怎么联系/要联系方式。只匹配固定短语，不碰「联系我」这类交代语。"""
+    return bool(_CONTACT_ASK_RE.search(text or ""))
+
+
+def _contact_intent_reply(user_text: str, recent: list[dict]) -> str:
+    """问我们的联系方式：优先留资话术原句。问怎么联系：按业务拼 contact_ask。"""
+    business = lead_flow.business_phrase(user_text, recent)
+    if _OURS_CONTACT_RE.search(user_text or ""):
+        return (
+            lead_flow.library_script("留资话术")
+            or lead_flow.contact_ask(business)
+        )
+    return lead_flow.contact_ask(business)
+
+
 def _activate_trace() -> contextvars.Token:
     stages = {key: 0 for key in _STAGE_KEYS}
     return _reply_trace.set({"started": time.monotonic(), "stages": stages, "logged": False})
@@ -94,24 +149,49 @@ def _add_stage_ms(key: str, elapsed_ms: int) -> None:
 
 
 def _stamp_extra(extra: dict | None) -> dict:
-    """把这一轮各段耗时写进即将发出的消息。没有计时上下文时原样返回。"""
+    """把这一轮各段耗时写进即将发出的消息。总耗时留到入库前再写。"""
     merged = dict(extra or {})
     state = _reply_trace.get()
     if state is None:
         return merged
+    merged["timing"] = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
+    # 本轮正在回答的用户消息 id：补答判定的显式配对依据，随每条 AI 气泡入库
+    if state.get("answer_message_id") is not None and "answers_message_id" not in merged:
+        merged["answers_message_id"] = state["answer_message_id"]
+    return merged
+
+
+def refresh_reply_timing(extra: dict | None) -> dict:
+    """复制 extra，并在本轮计时里写下到此刻的总耗时。没有计时上下文时只复制。"""
+    merged = dict(extra or {})
+    state = _reply_trace.get()
+    if state is None:
+        return merged
+    timing = dict(merged.get("timing") or {})
+    for key in _STAGE_KEYS:
+        timing.setdefault(key, int(state["stages"].get(key, 0)))
     total_ms = int((time.monotonic() - state["started"]) * 1000)
-    timing = {key: int(state["stages"].get(key, 0)) for key in _STAGE_KEYS}
     timing["total_ms"] = total_ms
     merged["timing"] = timing
-    if not state["logged"]:
-        state["logged"] = True
-        logger.info(
-            "客服回复耗时 total_ms=%s rewrite_ms=%s embed_ms=%s rerank_ms=%s "
-            "judge_ms=%s draft_ms=%s fallback_ms=%s",
-            timing["total_ms"], timing["rewrite_ms"], timing["embed_ms"], timing["rerank_ms"],
-            timing["judge_ms"], timing["draft_ms"], timing["fallback_ms"],
-        )
+    merged["reply_ms"] = total_ms
     return merged
+
+
+def _log_reply_timing() -> None:
+    """一条回答结束时打一次总耗时。没入库的尝试也记这一行。"""
+    state = _reply_trace.get()
+    if state is None or state.get("logged"):
+        return
+    state["logged"] = True
+    total_ms = int((time.monotonic() - state["started"]) * 1000)
+    stages = state["stages"]
+    logger.info(
+        "客服回复耗时 total_ms=%s rewrite_ms=%s embed_ms=%s rerank_ms=%s "
+        "judge_ms=%s draft_ms=%s fallback_ms=%s",
+        total_ms, int(stages.get("rewrite_ms", 0)), int(stages.get("embed_ms", 0)),
+        int(stages.get("rerank_ms", 0)), int(stages.get("judge_ms", 0)),
+        int(stages.get("draft_ms", 0)), int(stages.get("fallback_ms", 0)),
+    )
 
 
 def _abandon_draft(task: asyncio.Task | None) -> None:
@@ -166,20 +246,86 @@ async def process_ai_reply(conversation_id: int, *, local: bool = False,
                            allow_owned: bool = False) -> str:
     token = _activate_trace()
     try:
-        return await _process_ai_reply_impl(conversation_id, local=local, allow_owned=allow_owned)
+        text = await _process_ai_reply_impl(conversation_id, local=local, allow_owned=allow_owned)
     finally:
-        state = _reply_trace.get()
-        if state is not None:
-            _abandon_draft(state.get("draft"))
-        _reply_trace.reset(token)
+        _finish_reply_trace(token)
+    if local:
+        return text  # 同步回复接口一次只答一问
+    # 本轮只答了最新一条。用户连发多问时，中间可能还夹着没答上的旧问题：逐条补答（上限防风暴）
+    for _ in range(CATCHUP_MAX_MESSAGES):
+        pending_ids = _unanswered_user_message_ids(conversation_id)
+        if not pending_ids:
+            break
+        pending_id = pending_ids[0]
+        token = _activate_trace()
+        try:
+            await _process_ai_reply_impl(
+                conversation_id, local=False, allow_owned=allow_owned,
+                answer_message_id=pending_id,
+            )
+        finally:
+            _finish_reply_trace(token)
+    return text
+
+
+def _finish_reply_trace(token: contextvars.Token) -> None:
+    """收尾一轮接待：不等作废草稿，恢复计时上下文。"""
+    state = _reply_trace.get()
+    if state is not None:
+        _abandon_draft(state.get("draft"))
+    _reply_trace.reset(token)
+
+
+def _unanswered_user_message_ids(conversation_id: int) -> list[int]:
+    """按时间序返回还没被答上的用户消息 id（补答与防重复作答的判定基础）。
+
+    一条用户消息算已答，满足其一：
+    1) 显式配对：某条回复消息的 extra.answers_message_id 指向它；
+    2) 位置配对（兼容历史无标记数据）：紧跟其后、且在下一条用户消息之前
+       出现了非用户消息（即这条回复答的是它，而不是更新的问题）。
+    """
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Message.id, Message.sender_type, Message.extra)
+            .filter(Message.conversation_id == conversation_id,
+                    Message.is_internal.is_(False))
+            .order_by(Message.id)
+            .all()
+        )
+        linked = {
+            (extra or {}).get("answers_message_id")
+            for _id, sender, extra in rows
+            if sender != "user" and (extra or {}).get("answers_message_id") is not None
+        }
+        unanswered: list[int] = []
+        for index, (msg_id, sender, _extra) in enumerate(rows):
+            if sender != "user":
+                continue
+            if msg_id in linked:
+                continue
+            # 位置配对：看它后面第一条消息是谁
+            if index + 1 < len(rows) and rows[index + 1][1] != "user":
+                continue  # 紧跟回复，已答
+            unanswered.append(msg_id)
+        return unanswered
+    finally:
+        db.close()
+
+
+def _message_answered(conversation_id: int, user_message_id: int) -> bool:
+    """这条用户消息是否已被回复答上（含显式链接与位置配对两种情况）。"""
+    return user_message_id not in _unanswered_user_message_ids(conversation_id)
 
 
 async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
-                                 allow_owned: bool = False) -> str:
+                                 allow_owned: bool = False,
+                                 answer_message_id: int | None = None) -> str:
     """对一条用户消息执行完整 AI 接待流程。
 
     local=True 时只在本系统入库并返回拼成一段的正文，不走平台发送，也不做打字延迟。
     供知你快回同步回复接口使用。默认路径的返回值可忽略。
+    answer_message_id 指定要答的那条用户消息（补答夹在中间的旧问题）；默认答最新一条。
     """
     db = SessionLocal()
     try:
@@ -190,19 +336,39 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         if conversation.mode != "ai" and not owned:
             return ""
         customer = db.get(Customer, conversation.customer_id)
-        last_user_msg = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
-            .order_by(Message.id.desc())
-            .first()
-        )
+        if answer_message_id is not None:
+            # 补答指定旧问题：处理期间可能已被别的执行答上，答上就跳过
+            last_user_msg = (
+                db.query(Message)
+                .filter(Message.conversation_id == conversation_id,
+                        Message.id == answer_message_id,
+                        Message.sender_type == "user")
+                .first()
+            )
+            if last_user_msg is not None and _message_answered(conversation_id, answer_message_id):
+                last_user_msg = None
+        else:
+            last_user_msg = (
+                db.query(Message)
+                .filter(Message.conversation_id == conversation_id, Message.sender_type == "user")
+                .order_by(Message.id.desc())
+                .first()
+            )
+            if last_user_msg is not None and _message_answered(conversation_id, last_user_msg.id):
+                # 同一会话的排队任务可能多次触发接待：最新问题已被答上就不再重复作答
+                last_user_msg = None
         if last_user_msg is None:
             return ""
         user_text = last_user_msg.content
         platform = conversation.platform
         conversation_id_ = conversation.id
         customer_id = customer.id
+        nickname = customer.nickname if customer is not None else ""
         user_message_id = last_user_msg.id
+        # 记入本轮接待上下文：这一轮发出的每条 AI 气泡都会带上 answers_message_id
+        state = _reply_trace.get()
+        if state is not None:
+            state["answer_message_id"] = user_message_id
     finally:
         db.close()
 
@@ -232,9 +398,61 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
 
     started = _trace_started()
     history_text, recent, summary = context.get_history_for_prompt(conversation_id_)
+    if is_pure_ack(user_text):
+        text, _sent = await _deliver_ai(
+            conversation_id_, [_ack_reply(recent)], local=local, allow_owned=owned,
+            extra={"intent": "chitchat", "confidence": 1.0, "citations": []},
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        return text
+    if not lead_flow.must_handoff(user_text):
+        phone = lead_flow.phone_in_message(user_text)
+        wechat = "" if phone else lead_flow.wechat_in_message(user_text)
+        if phone or wechat:
+            lead_flow.save_lead(
+                customer_id=customer_id,
+                conversation_id=conversation_id_,
+                platform=platform,
+                nickname=nickname,
+                contact=phone or wechat,
+                contact_type="phone" if phone else "wechat",
+                business=lead_flow.business_phrase(user_text, recent),
+            )
+            text, _sent = await _deliver_ai(
+                conversation_id_, [lead_flow.ARRANGE], local=local, allow_owned=owned,
+                extra={"intent": "consult_feature", "confidence": 0.95, "citations": [], "grounded": False},
+                anchor_user_message_id=user_message_id if local else None,
+            )
+            return text
+    if asks_contact(user_text) and not lead_flow.must_handoff(user_text):
+        # 联系意图答案固定：走确定性话术，不进 RAG，保证同类问法回复恒一致。
+        text, _sent = await _deliver_ai(
+            conversation_id_, [_contact_intent_reply(user_text, recent)], local=local, allow_owned=owned,
+            extra={"intent": "consult_feature", "confidence": 0.9, "citations": [], "grounded": True},
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        return text
     retrieval = await _retrieve_covering(user_text, recent, summary)
     for key in ("rewrite_ms", "embed_ms", "rerank_ms"):
         _add_stage_ms(key, int(retrieval.stage_ms.get(key, 0)))
+    exact_messages = _exact_faq_messages(user_text, retrieval)
+    if exact_messages:
+        _save_retrieval_trace(user_message_id, retrieval)
+        payload = confidence.answer_confidence_payload(
+            faithfulness_score=1.0, precision=1.0, cause="", retried=False, raw_precision=1.0,
+        )
+        text, sent = await _deliver_ai(
+            conversation_id_, exact_messages, local=local, allow_owned=owned,
+            extra={
+                "intent": "consult_feature", "confidence": 0.95,
+                "citations": _citation_payload(retrieval.contexts),
+                "grounded": True, "answer_confidence": payload,
+            },
+            anchor_user_message_id=user_message_id if local else None,
+        )
+        if sent:
+            _bump_knowledge_hits(retrieval.contexts)
+        return text
     if retrieval.query_vector:
         cached = await answer_cache.lookup(user_text, retrieval.query_vector)
     else:
@@ -399,6 +617,12 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
 
     kept, list_dropped = _without_ungrounded_lists(kept, blob)
     dropped.extend(list_dropped)
+    if not any(line.strip() for line in kept):
+        answer = _single_faq_answer(retrieval.contexts)
+        if answer:
+            kept = [answer]
+            reply.handoff = False
+            reply.handoff_reason = ""
     shop_gap = bool(gaps) or ((not retrieval.passed) and _expects_shop_fact(user_text) and not tool_ok)
     if not kept:
         kept = [_CONFIRM_REPLY]
@@ -411,6 +635,18 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         not reply.handoff or confidence.risk_tier(user_text) == "low"
     ):
         reply.handoff = False
+    if _contact_when_unanswered(
+        user_text, kept, retrieval_passed=retrieval.passed, forced_human=forced_human, tool_ok=tool_ok,
+    ):
+        line = lead_flow.script_for_miss(user_text, recent)
+        if line:
+            kept = [line]
+            dropped = []
+            reply.handoff = False
+            reply.handoff_reason = ""
+            reply.confidence = max(reply.confidence, 0.9)
+            shop_gap = False
+            record_missed_question(user_text, platform, conversation_id_)
     reply_blob = "\n".join(kept)
     if confidence_meta is None and ((reply.confidence < 0.6 and _expects_shop_fact(reply_blob)) or bool(dropped)):
         reply.handoff = True
@@ -475,6 +711,13 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
         messages = ["\n".join(messages)]
     citations = _citation_payload(retrieval.contexts)
     must_handoff = bool(reply.handoff) or shop_gap
+    if not must_handoff and messages and lead_flow.wants_to_proceed(user_text):
+        if lead_flow.phone_in_message(user_text) or lead_flow.wechat_in_message(user_text):
+            line = lead_flow.ARRANGE
+        else:
+            line = lead_flow.library_script("留资话术") or lead_flow.script_for_miss(user_text, recent) or ""
+        if line and all(line not in part for part in messages):
+            messages = [*messages, line][:3]
     extra = {
         "intent": reply.intent,
         "confidence": reply.confidence,
@@ -490,14 +733,16 @@ async def _process_ai_reply_impl(conversation_id: int, *, local: bool = False,
     }
     if tool_names_used:
         extra["tool_calls"] = tool_names_used
-    extra["reply_ms"] = int((time.monotonic() - started) * 1000)
     if messages:
         text, sent = await _deliver_ai(
             conversation_id_, messages, local=local, allow_owned=owned, extra=extra,
             anchor_user_message_id=user_message_id if local else None,
         )
         if sent:
-            _apply_side_effects(customer_id, reply)
+            _apply_side_effects(
+                customer_id, reply, conversation_id=conversation_id_, platform=platform,
+                user_text=user_text, recent=recent,
+            )
         if sent and retrieval.passed and not must_handoff:
             _bump_knowledge_hits(retrieval.contexts)
             if not _FACT_TOOLS.intersection(tool_names_used):
@@ -531,6 +776,28 @@ def _expects_shop_fact(user_text: str) -> bool:
     return bool(_SHOP_FACT.search(user_text or ""))
 
 
+def _contact_when_unanswered(user_text: str, kept: list[str], *, retrieval_passed: bool,
+                             forced_human: bool, tool_ok: bool) -> bool:
+    """知识库没有，模型也没留下能发的句子时，才改用留资原句。"""
+    if retrieval_passed or forced_human or tool_ok or lead_flow.must_handoff(user_text):
+        return False
+    if _TASK_RE.search(user_text or ""):
+        return False
+    return not any(
+        line for line in kept
+        if line and line != _CONFIRM_REPLY and not evidence.is_handoff_guide(line)
+    )
+
+
+def _contact_line(user_text: str, recent: list[dict] | None = None) -> str:
+    """留资话术优先，没有再用按业务拼的原句。"""
+    return (
+        lead_flow.library_script("留资话术")
+        or lead_flow.script_for_miss(user_text, recent)
+        or lead_flow.ASK_FULL
+    )
+
+
 def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str], list[str]]:
     """编号行必须整句出现在证据里。没有证据的清单不能发出。"""
     compact_blob = re.sub(r"\s+", "", blob or "")
@@ -549,6 +816,14 @@ def _without_ungrounded_lists(messages: list[str], blob: str) -> tuple[list[str]
                     dropped.append(line)
                     continue
             lines.append(line)
+        if not any(_LIST_ITEM_RE.match(line) for line in lines if line):
+            announced: list[str] = []
+            for line in lines:
+                if line and _LIST_ANNOUNCE_RE.search(re.sub(r"\s+", "", line)):
+                    dropped.append(line)
+                    continue
+                announced.append(line)
+            lines = announced
         while lines and not lines[0]:
             lines.pop(0)
         while lines and not lines[-1]:
@@ -967,6 +1242,48 @@ async def _reply_from_dialogue(conversation_id: int, user_text: str, recent: lis
     return text
 
 
+def _faq_answer_body(content: str) -> str:
+    """取出 FAQ 切片里「答：」之后的正文。问句和相似问不发出。"""
+    lines = (content or "").splitlines()
+    start = None
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped.startswith("答：") or stripped.startswith("答:"):
+            start = index
+            break
+    if start is None:
+        return ""
+    first = lines[start].strip()
+    first = first.removeprefix("答：").removeprefix("答:").strip()
+    rest = [line.strip() for line in lines[start + 1:] if line.strip()]
+    parts = ([first] if first else []) + rest
+    return "\n".join(parts).strip()
+
+
+def _exact_faq_messages(user_text: str, retrieval) -> list[str] | None:
+    """精确命中单条 FAQ 时用原文。清单仍走现有格式，其余发答正文。"""
+    if not getattr(retrieval, "exact_faq", False) or len(retrieval.contexts) != 1:
+        return None
+    context = retrieval.contexts[0]
+    if context.get("doc_type") not in (None, "", "faq"):
+        return None
+    listed = _reply_with_source_list(user_text, retrieval.contexts, list(retrieval.facets or []))
+    if listed:
+        return listed
+    body = _faq_answer_body(context.get("content") or "")
+    return [body] if body else None
+
+
+def _single_faq_answer(contexts: list[dict]) -> str:
+    """检索结果只剩一条 FAQ 时，用它的答正文兜底。"""
+    if len(contexts or []) != 1:
+        return ""
+    context = contexts[0]
+    if context.get("doc_type") not in (None, "", "faq"):
+        return ""
+    return _faq_answer_body(context.get("content") or "")
+
+
 def _numbered_items(text: str) -> list[str]:
     items = []
     for line in (text or "").splitlines():
@@ -988,6 +1305,11 @@ def _format_list_item(item: str) -> str:
     marker = re.sub(r"\s+", "", match.group(0))
     body = item.strip()[match.end():].strip()
     return f"{marker}{body}"
+
+
+def _colon_marked(items: list[str]) -> bool:
+    """「1：公司名称」这种带冒号的条目，原文自己有导语，不再加清单导语。"""
+    return any(_COLON_ITEM_RE.match((item or "").strip()) for item in items)
 
 
 def _format_source_list(items: list[str]) -> str:
@@ -1019,7 +1341,10 @@ def _reply_with_source_list(user_text: str, contexts: list[dict], facets: list[s
         return [_format_source_list(chosen)]
     if any(not _LIST_ITEM_RE.match(line) for line in lines):
         body = [_format_list_item(line) if _LIST_ITEM_RE.match(line) else line for line in lines]
-        return [f"{_LIST_LEAD}\n\n" + "\n".join(body)]
+        text = "\n".join(body)
+        if _colon_marked(numbered):
+            return [text]
+        return [f"{_LIST_LEAD}\n\n" + text]
     return [_format_source_list(chosen)]
 
 
@@ -1030,6 +1355,11 @@ def _topic_count(contexts: list[dict]) -> int:
         if key and key not in keys:
             keys.append(key)
     return len(keys)
+
+
+def _dedup_key(line: str) -> str:
+    """清单/段落去重键：空白与标点归一后再比较，编号风格的差异不算两条。"""
+    return _ITEM_PUNCT_RE.sub("", line or "")
 
 
 def _section_lines(contexts: list[dict]) -> list[str]:
@@ -1052,9 +1382,11 @@ def _section_lines(contexts: list[dict]) -> list[str]:
                 continue
             if line.startswith("问：") or line.startswith("问:"):
                 continue
+            if line.startswith("相似：") or line.startswith("相似:"):
+                continue
             if heading and line == heading:
                 continue
-            key = re.sub(r"\s+", "", line)
+            key = _dedup_key(line)
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -1068,8 +1400,7 @@ def _collect_numbered_items(contexts: list[dict]) -> list[str]:
     items: list[str] = []
     for item in contexts or []:
         for line in _numbered_items(item.get("content") or ""):
-            body = _LIST_MARKER_RE.sub("", line).strip()
-            key = re.sub(r"\s+", "", body)
+            key = _dedup_key(line)
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -1140,8 +1471,8 @@ def _save_retrieval_trace(message_id: int, retrieval: pipeline.RetrievalResult) 
         db.close()
 
 
-_CHUNK_BUDGET = 500
-_TOTAL_BUDGET = 1200
+_CHUNK_BUDGET = 800
+_TOTAL_BUDGET = 2400
 
 
 def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = None,
@@ -1162,14 +1493,42 @@ def _format_knowledge_context(contexts: list[dict], gaps: list[str] | None = Non
 
 
 def _trim_knowledge(content: str, query: str, budget: int) -> str:
+    """超预算时标题行和编号条目整行保留，散文只留与问句有词面重叠的完整句子。不硬切条目。"""
     text = content or ""
     if len(text) <= budget:
         return text
-    sentences = [part for part in re.split(r"(?<=[。！？\n])", text) if part.strip()]
     needles = _overlap_needles(query)
-    picked = [part for part in sentences if any(needle in part for needle in needles)]
-    trimmed = "".join(picked) if picked else text
-    return trimmed[:budget]
+    kept: list[str] = []
+    used = 0
+
+    def _room_for(part: str) -> bool:
+        nonlocal used
+        if kept and used + len(part) + 1 > budget:
+            return False
+        kept.append(part)
+        used += len(part) + 1
+        return True
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("【") or _LIST_ITEM_RE.match(line):
+            if not _room_for(line):
+                break
+            continue
+        full = True
+        for sentence in (s for s in re.split(r"(?<=[。！？])", line) if s.strip()):
+            if not any(needle in sentence for needle in needles):
+                continue
+            if not _room_for(sentence.strip()):
+                full = False
+                break
+        if not full:
+            break
+    if not kept:
+        return text[:budget]
+    return "\n".join(kept)
 
 
 def _overlap_needles(query: str) -> list[str]:
@@ -1243,6 +1602,18 @@ async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
                       anchor_user_message_id: int | None = None) -> tuple[str, bool]:
     """发出 AI 正文。返回 (给调用方的文本, 是否至少有一条真正发出或入库)。"""
     extra = _stamp_extra(extra)
+    try:
+        return await _deliver_ai_body(
+            conversation_id, messages, extra=extra, local=local, allow_owned=allow_owned,
+            anchor_user_message_id=anchor_user_message_id,
+        )
+    finally:
+        _log_reply_timing()
+
+
+async def _deliver_ai_body(conversation_id: int, messages: list[str], *, extra: dict,
+                           local: bool, allow_owned: bool,
+                           anchor_user_message_id: int | None) -> tuple[str, bool]:
     parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
     if not parts:
         return "", False
@@ -1262,7 +1633,7 @@ async def _deliver_ai(conversation_id: int, messages: list[str], *, local: bool,
         ok = sent is not None and not (sent.extra or {}).get("send_failed")
         shown = parts[0] if allow_owned or ok else ""
         return shown, ok
-    ok = await _send_replies(conversation_id, parts, extra or {}, allow_owned=allow_owned)
+    ok = await _send_replies(conversation_id, parts, extra, allow_owned=allow_owned)
     shown = "\n".join(parts) if allow_owned or ok else ""
     return shown, ok
 
@@ -1281,12 +1652,12 @@ async def _send_replies(conversation_id: int, messages: list[str], extra: dict,
         if i > 0:
             await asyncio.sleep(humanize.typing_delay_ms(chunks[i - 1]) / 1000)
         sent = await send_outbound(
-            conversation_id, chunk, sender_type="ai", extra=extra, allow_owned=allow_owned)
+            conversation_id, chunk, sender_type="ai", extra=dict(extra), allow_owned=allow_owned)
         if sent is None:
             return delivered
         if (sent.extra or {}).get("send_failed"):
             for rest in chunks[i + 1:]:
-                await save_unsent_outbound(conversation_id, rest, extra=extra)
+                await save_unsent_outbound(conversation_id, rest, extra=dict(extra))
             return delivered
         delivered = True
     return delivered
@@ -1324,26 +1695,6 @@ async def _call_llm_with_retry(rendered_prompt: str, *, conversation_id: int = 0
     return reply
 
 
-def _record_usage(conversation_id: int, model: str, usage) -> None:
-    """记录 token 用量（独立短会话写入；失败静默，绝不影响回复主流程）。"""
-    if usage is None:
-        return
-    try:
-        db = SessionLocal()
-        try:
-            db.add(LlmUsage(
-                conversation_id=conversation_id, model=model,
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-                total_tokens=getattr(usage, "total_tokens", 0) or 0,
-            ))
-            db.commit()
-        finally:
-            db.close()
-    except Exception:  # noqa: BLE001
-        logger.warning("token 用量记录失败", exc_info=True)
-
-
 async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
                          model: str, conversation_id: int = 0,
                          timeout: float | None = None) -> tuple[AgentReply | None, bool]:
@@ -1352,22 +1703,22 @@ async def _call_llm_once(rendered_prompt: str, *, base_url: str, api_key: str,
     返回 (reply, hard_failed)：hard_failed=True 表示网络/服务级异常（调用方可用备用模型兜底）。
     timeout 为 None 时沿用 SDK 默认。接待路径传入剩余预算。
     """
-    client_kwargs = {"base_url": base_url, "api_key": api_key}
-    if timeout is not None:
-        client_kwargs["timeout"] = timeout
-    client = AsyncOpenAI(**client_kwargs)
+    client = get_llm_client(base_url, api_key)
     messages = [{"role": "user", "content": rendered_prompt}]
     raw = ""
 
     for attempt in range(2):
         try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
-            _record_usage(conversation_id, model, getattr(resp, "usage", None))
+            create_kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            if timeout is not None:
+                create_kwargs["timeout"] = timeout
+            resp = await client.chat.completions.create(**create_kwargs)
+            record_usage(conversation_id, model, getattr(resp, "usage", None))
             raw = resp.choices[0].message.content or ""
             return _parse_contract(raw), False
         except (ValidationError, json.JSONDecodeError) as exc:
@@ -1408,26 +1759,42 @@ def _parse_contract(raw: str) -> AgentReply:
     return AgentReply.model_validate(data)
 
 
-def _apply_side_effects(customer_id: int, reply: AgentReply):
-    """标签合并 + 留资更新。"""
+def _apply_side_effects(customer_id: int, reply: AgentReply, *, conversation_id: int = 0,
+                        platform: str = "", user_text: str = "", recent: list | None = None):
+    """标签合并 + 留资更新。号码必须出现在当前这条用户消息里。"""
     db = SessionLocal()
+    nickname = ""
     try:
         customer = db.get(Customer, customer_id)
         if customer is None:
             return
+        nickname = customer.nickname or ""
         if reply.tags:
             existing = list(customer.tags or [])
             for tag in reply.tags:
                 if tag and tag not in existing:
                     existing.append(tag)
             customer.tags = existing
-        if reply.lead.phone:
-            customer.lead_phone = reply.lead.phone
-        if reply.lead.wechat:
-            customer.lead_wechat = reply.lead.wechat
-        if reply.lead.note:
-            customer.lead_note = reply.lead.note
         customer.updated_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
+    phone = lead_flow.phone_in_message(user_text)
+    wechat = ""
+    if not phone:
+        mentioned = (reply.lead.wechat or "").strip()
+        if mentioned and mentioned in (user_text or ""):
+            wechat = mentioned
+        else:
+            wechat = lead_flow.wechat_in_message(user_text)
+    contact = phone or wechat
+    if contact and conversation_id:
+        lead_flow.save_lead(
+            customer_id=customer_id,
+            conversation_id=conversation_id,
+            platform=platform,
+            nickname=nickname,
+            contact=contact,
+            contact_type="phone" if phone else "wechat",
+            business=lead_flow.business_phrase(user_text, recent) or (reply.lead.note or ""),
+        )

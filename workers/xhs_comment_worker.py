@@ -13,6 +13,7 @@ from playwright.async_api import Page
 
 from base_worker import (CommentDriver, CommentItem, IncomingItem, WorkerConfig,
                          run_comment_worker)
+from page_markers import is_login_wall, page_text
 
 logger = logging.getLogger("rpa_worker.xhs_comment")
 
@@ -43,11 +44,14 @@ class XhsCommentDriver(CommentDriver):
     url = COMMENT_MANAGE_URL
 
     async def check_status(self, page: Page) -> str:
-        if await page.locator(SELECTORS["login_form"]).first.is_visible():
+        login = page.locator(SELECTORS["login_form"])
+        if await login.count() and await login.first.is_visible():
             return "login_expired"
-        if await page.locator(SELECTORS["comment_list"]).count() == 0:
-            return "selector_mismatch"
-        return "online"
+        if await page.locator(SELECTORS["comment_list"]).count() > 0:
+            return "online"
+        if is_login_wall(await page_text(page)):
+            return "login_expired"
+        return "selector_mismatch"
 
     async def read_incoming(self, page: Page) -> list[IncomingItem]:
         return []  # 评论 Worker 不读私信

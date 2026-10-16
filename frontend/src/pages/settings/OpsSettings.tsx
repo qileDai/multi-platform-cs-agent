@@ -19,6 +19,7 @@ const ACTION_LABELS: Record<string, string> = {
   kb_faq_update: '修改 FAQ',
   kb_doc_delete: '删除文档',
   kb_doc_upload: '上传文档',
+  kb_dialog_import: '导入历史对话',
   ai_switch: 'AI 总开关',
   auto_switches: '自动化开关',
   brand_style_update: '品牌语气更新',

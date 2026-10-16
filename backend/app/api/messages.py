@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from ..core.modules import agent_can
 from ..core.security import decode_access_token
 from ..database import get_db
 from ..models import Agent, Conversation, Message, RpaMedia, RpaOutbox
@@ -109,8 +110,17 @@ def get_media(media_id: str, token: str = "", db: Session = Depends(get_db)):
 
     注意：token 会进访问日志/浏览器历史，生产环境建议短时效 token + HTTPS。
     """
-    if not token or decode_access_token(token) is None:
+    payload = decode_access_token(token) if token else None
+    if payload is None or "sub" not in payload:
         raise HTTPException(401, "未授权")
+    try:
+        agent = db.get(Agent, int(payload["sub"]))
+    except (TypeError, ValueError):
+        agent = None
+    if agent is None:
+        raise HTTPException(401, "未授权")
+    if not agent_can(agent, "workbench"):
+        raise HTTPException(403, "无权访问该模块")
     row = db.get(RpaMedia, media_id)
     if row is None or not os.path.exists(row.path):
         raise HTTPException(404, "媒体不存在")

@@ -11,6 +11,7 @@ venv/
 .env.local
 workers/.worker_id
 workers/.worker_id.*
+workers/.fleet.lock
 workers/.env.local
 
 # Data

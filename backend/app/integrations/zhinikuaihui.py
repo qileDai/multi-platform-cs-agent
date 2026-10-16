@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from ..agent.engine import process_ai_reply
 from ..config import settings
 from ..core import contentfilter, ratelimit
+from ..core.convlock import conversation_lock
 from ..database import SessionLocal
 from ..models import Conversation, Customer, Message
 from ..schemas import InboundMessage
@@ -23,17 +24,10 @@ from ..services import _apply_guide_code_hook, _broadcast_message, handoff
 
 logger = logging.getLogger(__name__)
 
-_reply_locks: dict[int, asyncio.Lock] = {}
-_reply_locks_guard = asyncio.Lock()
-
 
 async def _conversation_lock(conversation_id: int) -> asyncio.Lock:
-    async with _reply_locks_guard:
-        lock = _reply_locks.get(conversation_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _reply_locks[conversation_id] = lock
-        return lock
+    """会话锁统一走 core.convlock：与队列并发消费路径共享，防跨入口同会话并发答题。"""
+    return await conversation_lock(conversation_id)
 
 
 async def _note_skip(conversation_id: int, content: str) -> None:
@@ -61,7 +55,7 @@ async def _note_skip(conversation_id: int, content: str) -> None:
 REPLY_PATH = "/api/integrations/zhinikuaihui/reply"
 CONNECTION_REPLY = "连接成功，可以开始回复。"
 REPLY_CHAR_LIMIT = 500
-_LIST_LEAD = "清单我按资料发你"
+_LIST_LEAD = "您要的我都列下面啦"
 _SHORTEN_TIMEOUT = 8.0
 PLATFORM_MAP = {
     "douyin": "douyin",
@@ -124,6 +118,8 @@ async def _handle_reply(body: dict, started: float) -> dict:
     direction = message.get("direction") or "incoming"
     if direction != "incoming" or not text:
         return _log_outcome(started, _skip("没有需要回复的客户消息"))
+    if not _last_message_needs_reply(body, message):
+        return _log_outcome(started, _skip("没有新的客户消息"))
 
     request_id = str(body.get("request_id") or message.get("id") or "").strip()
     if not request_id:
@@ -209,7 +205,7 @@ def _skip(reason: str) -> dict:
 
 
 def _collapse_leading_leads(text: str) -> str:
-    """开头连续的「清单我按资料发你」只留一句，中间可以没有换行。"""
+    """开头连续的「您要的我都列下面啦」只留一句，中间可以没有换行。"""
     body = (text or "").lstrip()
     lead = _LIST_LEAD
     while body.startswith(lead):
@@ -274,7 +270,7 @@ async def _shorten_written_reply(text: str) -> str:
     """只缩短已经写好的这段，不检索，不补充原文没有的事实。"""
     if not settings.llm_configured:
         return ""
-    from openai import AsyncOpenAI
+    from ..llm import get_llm_client, record_usage
 
     prompt = (
         "把下面这段已经写好的客服回复缩成不超过500字。"
@@ -283,17 +279,15 @@ async def _shorten_written_reply(text: str) -> str:
         "只输出缩短后的正文，不要解释。\n\n"
         + text
     )
-    client = AsyncOpenAI(
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        timeout=_SHORTEN_TIMEOUT,
-    )
+    client = get_llm_client(settings.llm_base_url, settings.llm_api_key)
     try:
         resp = await client.chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
+            timeout=_SHORTEN_TIMEOUT,
         )
+        record_usage(0, settings.llm_model, getattr(resp, "usage", None))
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         logger.warning("知你快回长回复缩短失败", exc_info=True)
@@ -459,6 +453,53 @@ def _persist(body: dict, platform: str, raw_platform: str, request_key: str, tex
     finally:
         db.close()
     return conversation_id, mode, status, trigger
+
+
+_OUR_DIRECTIONS = {"outgoing", "out", "sent"}
+
+
+def _message_timestamp(item: dict) -> int:
+    try:
+        return int(item.get("timestamp") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_customer_message(item: dict, customer_id: str) -> bool:
+    """最后一条要有正文，并且是客户发的，才值得回复。"""
+    if not str(item.get("text") or "").strip():
+        return False
+    direction = str(item.get("direction") or "").strip().lower()
+    if direction in _OUR_DIRECTIONS:
+        return False
+    if direction == "incoming":
+        return True
+    if direction:
+        return False
+    sender = str(item.get("sender_id") or "").strip()
+    customer = (customer_id or "").strip()
+    if sender and customer and sender != customer:
+        return False
+    return True
+
+
+def _ordered_thread(body: dict, trigger: dict) -> list[dict]:
+    """历史加触发消息。有时间戳就按时间排，否则保持插件顺序。"""
+    history = body.get("messages") if isinstance(body.get("messages"), list) else []
+    items = [item for item in history if isinstance(item, dict)]
+    if trigger and not any(_same_trigger(item, trigger) for item in items):
+        items.append(trigger)
+    if any(_message_timestamp(item) for item in items):
+        items = sorted(items, key=_message_timestamp)
+    return items
+
+
+def _last_message_needs_reply(body: dict, trigger: dict) -> bool:
+    items = _ordered_thread(body, trigger)
+    if not items:
+        return False
+    customer_id = str(body.get("customer_id") or trigger.get("sender_id") or "")
+    return _is_customer_message(items[-1], customer_id)
 
 
 def _same_trigger(item: dict, trigger: dict) -> bool:

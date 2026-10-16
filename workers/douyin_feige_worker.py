@@ -16,6 +16,7 @@ from playwright.async_api import Page
 
 from base_worker import (BaseWorker, IncomingItem, PlatformDriver, WorkerConfig,
                          run_worker)
+from page_markers import is_login_wall, page_text
 
 logger = logging.getLogger("rpa_worker.douyin")
 
@@ -37,7 +38,15 @@ SELECTORS = {
     "send_button": ".send-button",                  # 发送按钮
     "file_input": "input[type='file']",             # 附件上传 input
     "bot_enabled_flag": ".platform-bot-enabled",    # 平台自带机器人开启标记（存在即未关闭）
-    "self_name": ".self-account-name",              # 当前登录的店铺/账号名（真实页面需校准）
+    "self_name": ".self-account-name",              # 伪页面用；真实飞鸽顶栏没有店铺名节点
+    # 真实飞鸽（已登录、会话列表为空的页面快照）。class 是哈希，只用稳定 id。
+    "workspace": "#imroot",
+    "conversation_list_real": "#chantListScrollArea",
+    "current_tab": "#qa-active-chat-tab",
+    "history_tab": "#qa-last-chat-tab",
+    "search": "#qa-user-order-search",
+    "chat_input_real": "#imroot [contenteditable='true']",
+    "send_button_real": "[class*='send-btn']",
 }
 
 # 每轮额外扫描会话列表顶部 N 个会话（不依赖未读红点），用于捕捉人工客服在平台后台
@@ -51,17 +60,54 @@ class FeigeDriver(PlatformDriver):
 
     async def check_status(self, page: Page) -> str:
         # 登录表单常驻 DOM、通过显隐切换，必须按「可见性」判断（count 会把隐藏元素也算进去）
-        if await page.locator(SELECTORS["login_form"]).first.is_visible():
+        login = page.locator(SELECTORS["login_form"])
+        if await login.count() and await login.first.is_visible():
             return "login_expired"
-        if await page.locator(SELECTORS["conversation_list"]).count() == 0:
-            return "selector_mismatch"
-        return "online"
+        if await page.locator(SELECTORS["conversation_list"]).count() > 0:
+            return "online"
+        text = await page_text(page)
+        if is_login_wall(text):
+            return "login_expired"
+        # 真实飞鸽：#imroot + 会话列表容器。空列表文案是「暂无会话中用户」。
+        has_workspace = await page.locator(SELECTORS["workspace"]).count() > 0
+        has_list = await page.locator(SELECTORS["conversation_list_real"]).count() > 0
+        title = ""
+        try:
+            title = await page.title()
+        except Exception:  # noqa: BLE001
+            title = ""
+        if has_list or (has_workspace and "飞鸽" in title):
+            if has_list or any(s in text for s in ("当前会话", "请选择会话", "最近联系", "飞鸽客服")):
+                return "online"
+        return "selector_mismatch"
+
+    async def dismiss_blockers(self, page: Page):
+        """关掉挡住会话区的挽单策略弹窗。"""
+        try:
+            close = page.get_by_role("button", name="Close")
+            if await close.count():
+                await close.first.click(timeout=1000)
+        except Exception:  # noqa: BLE001
+            return
 
     async def check_platform_bot_disabled(self, page: Page) -> bool:
-        """飞鸽自带智能客服机器人开启时页面会有对应标记（fixture 契约）。"""
-        return await page.locator(SELECTORS["bot_enabled_flag"]).count() == 0
+        """伪页面用 .platform-bot-enabled。真实飞鸽弹出「AI智能客服」配置时告警。"""
+        if await page.locator(SELECTORS["bot_enabled_flag"]).count() > 0:
+            return False
+        return "AI智能客服" not in await page_text(page)
+
+    async def read_self_name(self, page: Page) -> str:
+        """飞鸽顶栏只有在线状态和「商家后台」，没有店铺名。身份用 AdsPower 环境名。"""
+        return ""
 
     async def read_incoming(self, page: Page) -> list[IncomingItem]:
+        if await page.locator(SELECTORS["conversation_item"]).count() > 0:
+            return await self._read_fixture(page)
+        if await page.locator(SELECTORS["conversation_list_real"]).count() > 0:
+            return await self._read_workspace(page)
+        return []
+
+    async def _read_fixture(self, page: Page) -> list[IncomingItem]:
         """扫描有未读红点的会话 + 列表顶部最近活跃会话，提取新消息（含我方旁路消息）。
 
         旁路场景：人工客服在平台后台直接回复时，该会话通常没有未读红点
@@ -121,10 +167,44 @@ class FeigeDriver(PlatformDriver):
                 content=content, media_url=media_url))
         return items
 
+    async def _read_workspace(self, page: Page) -> list[IncomingItem]:
+        """真实飞鸽：会话行在 #chantListScrollArea 里。没有打开会话时列表只有空态文案。"""
+        await self.dismiss_blockers(page)
+        rows = page.locator(f"{SELECTORS['conversation_list_real']} > div")
+        items: list[IncomingItem] = []
+        total = await rows.count()
+        opened = 0
+        for i in range(total):
+            row = rows.nth(i)
+            nickname = ((await row.inner_text()).splitlines() or [""])[0].strip()[:64]
+            if not nickname or "暂无会话" in nickname:
+                continue
+            if opened >= SCAN_RECENT:
+                break
+            opened += 1
+            await row.click()
+            await page.wait_for_timeout(300)
+            items.extend(await self._read_messages(page, nickname, nickname))
+        return items
+
+    async def _outside_bot_panel(self, page: Page, selector: str):
+        nodes = page.locator(selector)
+        for i in range(await nodes.count()):
+            node = nodes.nth(i)
+            inside = await node.evaluate(
+                "el => !!el.closest('#pigeon-intelligent-light-app')",
+            )
+            if inside or not await node.is_visible():
+                continue
+            return node
+        return None
+
     async def send_message(self, page: Page, conv_key: str, content: str,
                            msg_type: str = "text", media_path: str = "") -> None:
-        # 定位会话
         conv = page.locator(f"{SELECTORS['conversation_item']}[data-conv='{conv_key}']")
+        if await conv.count() == 0 and await page.locator(SELECTORS["conversation_list_real"]).count():
+            await self._send_workspace(page, conv_key, content, msg_type, media_path)
+            return
         if await conv.count() == 0:
             raise RuntimeError(f"会话不存在: {conv_key}")
         await conv.first.click()
@@ -151,6 +231,46 @@ class FeigeDriver(PlatformDriver):
             if await page.locator(self_bubbles).count() > before:
                 return
         raise RuntimeError("发送后未出现新的我方气泡，发送可能失败")
+
+    async def _send_workspace(self, page: Page, conv_key: str, content: str,
+                              msg_type: str, media_path: str) -> None:
+        """真实飞鸽：按会话列表里的文字点开，再写入可见的输入区。"""
+        await self.dismiss_blockers(page)
+        row = page.locator(SELECTORS["conversation_list_real"]).get_by_text(conv_key, exact=False)
+        if await row.count() == 0:
+            search = page.locator(SELECTORS["search"])
+            if await search.count() and await search.is_enabled():
+                await search.fill(conv_key)
+                await page.wait_for_timeout(400)
+                row = page.locator(SELECTORS["conversation_list_real"]).get_by_text(conv_key, exact=False)
+        if await row.count() == 0:
+            raise RuntimeError(f"会话不存在: {conv_key}")
+        await row.first.click()
+        await page.wait_for_timeout(300)
+        if msg_type in ("image", "voice") and media_path:
+            file_input = await self._outside_bot_panel(page, SELECTORS["file_input"])
+            if file_input is None:
+                raise RuntimeError("页面无附件上传入口")
+            await file_input.set_input_files(media_path)
+            await page.wait_for_timeout(800)
+        if not content:
+            return
+        editor = await self._outside_bot_panel(page, SELECTORS["chat_input_real"])
+        if editor is None:
+            raise RuntimeError("飞鸽还没有输入框，先打开一个会话")
+        await editor.click()
+        await page.keyboard.insert_text(content)
+        send = await self._outside_bot_panel(page, SELECTORS["send_button_real"])
+        if send is not None:
+            await send.click()
+        else:
+            await page.keyboard.press("Enter")
+        for _ in range(15):
+            await page.wait_for_timeout(200)
+            left = (await editor.inner_text()).strip()
+            if content not in left:
+                return
+        raise RuntimeError("发送后输入框仍有内容，发送可能失败")
 
 
 if __name__ == "__main__":

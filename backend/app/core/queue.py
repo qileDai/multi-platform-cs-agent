@@ -4,6 +4,9 @@
 - enqueue() 只做持久化（SQLite 队列表）+ 内存事件通知，接口立即返回
 - 双通道 worker 并发消费（Phase 8）：fast（inbound_message/inbound_comment，秒级响应要求）
   与 slow（内容生成/发布/首评等分钟级慢任务）各自独立循环，慢任务不再阻塞私信/评论回复
+- fast lane 并发消费：_claim_next_pending CAS 认领防双取，信号量
+  （QUEUE_FAST_CONCURRENCY，默认 20）限在途数；同会话不并发答题由
+  core.convlock 保证（见 services._route_after_user_message）
 - 失败重试指数退避：复用 not_before 列，第 n 次重试延迟 30s/60s/120s；
   重试用尽置 failed 并 monitor 告警（queue_task_failed）
 - 任务持久化在 queue_tasks 表，进程崩溃重启后自动恢复 pending/processing 任务
@@ -13,6 +16,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import update
+
+from ..config import settings
 from ..database import SessionLocal
 from ..models import QueueTask
 
@@ -31,6 +37,8 @@ RETRY_BASE_SECONDS = 30  # 退避序列：30s / 60s / 120s
 # 每通道一个唤醒事件（asyncio.Event.set 会唤醒全部等待者，不能多循环共用同一个）
 _wakeup: dict[str, asyncio.Event] = {}
 _worker_tasks: list[asyncio.Task] = []
+# fast lane 并发在途任务（stop_worker 收尾用；done 回调自动移除）
+_inflight: set[asyncio.Task] = set()
 
 
 def register_handler(task_type: str, handler: Callable[[dict[str, Any]], Awaitable[None]]):
@@ -68,14 +76,16 @@ def enqueue(task_type: str, payload: dict[str, Any], delay_seconds: int = 0) -> 
     return task_id
 
 
-async def _process_one(task_id: int):
+async def _process_one(task_id: int, *, claimed: bool = False):
+    """执行一条任务。claimed=True 表示调用方已 CAS 认领（status=processing），跳过状态迁移。"""
     db = SessionLocal()
     task = db.get(QueueTask, task_id)
-    if task is None or task.status not in ("pending",):
+    if task is None or (not claimed and task.status not in ("pending",)):
         db.close()
         return
-    task.status = "processing"
-    db.commit()
+    if not claimed:
+        task.status = "processing"
+        db.commit()
     task_type, payload = task.task_type, task.payload
     db.close()
 
@@ -101,7 +111,9 @@ async def _process_one(task_id: int):
             task.error = error
         else:
             task.status = status
-            task.error = error
+            # done 且此前失败过时保留最后一次失败原因，便于排查「重试后才成功」的任务
+            if status == "failed" or not task.error:
+                task.error = error
             if status == "failed":
                 # 重试用尽的最终失败：全类型告警（此前仅 inbound_message 有埋点）
                 from . import monitor
@@ -135,13 +147,60 @@ def _fetch_next_pending(lane: str | None = None) -> int | None:
         db.close()
 
 
+def _claim_next_pending(lane: str | None = None) -> int | None:
+    """认领下一条可消费任务：查询 + CAS 原子置 processing，并发消费防双取。
+
+    候选已被其他协程抢走（rowcount=0）时返回 None，调用方继续取下一条。
+    lane 语义与 _fetch_next_pending 一致。
+    """
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        q = (
+            db.query(QueueTask.id)
+            .filter(QueueTask.status == "pending")
+            .filter((QueueTask.not_before.is_(None)) | (QueueTask.not_before <= now))
+        )
+        if lane == "fast":
+            q = q.filter(QueueTask.task_type.in_(FAST_LANE_TYPES))
+        elif lane == "slow":
+            q = q.filter(QueueTask.task_type.notin_(FAST_LANE_TYPES))
+        row = q.order_by(QueueTask.id).first()
+        if row is None:
+            return None
+        task_id = row[0]
+        claimed = db.execute(
+            update(QueueTask)
+            .where(QueueTask.id == task_id, QueueTask.status == "pending")
+            .values(status="processing", updated_at=datetime.utcnow())
+        )
+        db.commit()
+        return task_id if claimed.rowcount == 1 else None
+    finally:
+        db.close()
+
+
+async def _run_one_fast(task_id: int, sem: asyncio.Semaphore) -> None:
+    """并发执行一条 fast 任务；finally 释放信号量槽位。"""
+    try:
+        await _process_one(task_id, claimed=True)
+    finally:
+        sem.release()
+
+
 async def _lane_worker_loop(lane: str):
-    """单通道 worker 循环：有任务就处理，没任务挂起等待唤醒（5s 轮询兜底延迟任务）。"""
+    """通道 worker 循环：fast 并发派发（信号量限在途数），slow 串行消费。
+
+    fast 满载时在 sem.acquire 背压，不无限堆积在途任务；空闲时挂起等待
+    唤醒（5s 轮询兜底延迟任务）。认领后派发前被 stop 取消的任务停留在
+    processing，由下次 start_worker 的启动恢复重回 pending。
+    """
     ev = asyncio.Event()
     _wakeup[lane] = ev
     logger.info("任务队列 worker 已启动 lane=%s", lane)
+    sem = asyncio.Semaphore(max(1, settings.queue_fast_concurrency)) if lane == "fast" else None
     while True:
-        task_id = _fetch_next_pending(lane)
+        task_id = _claim_next_pending(lane)
         if task_id is None:
             ev.clear()
             try:
@@ -149,7 +208,14 @@ async def _lane_worker_loop(lane: str):
             except asyncio.TimeoutError:
                 pass
             continue
-        await _process_one(task_id)
+        if sem is None:
+            await _process_one(task_id, claimed=True)
+            continue
+        await sem.acquire()  # 满载背压：等一个空槽位再派发
+        t = asyncio.create_task(_run_one_fast(task_id, sem),
+                                 name=f"queue-task-{task_id}")
+        _inflight.add(t)
+        t.add_done_callback(_inflight.discard)
 
 
 def start_worker():
@@ -168,6 +234,7 @@ def start_worker():
 
 async def stop_worker():
     global _worker_tasks
+    # 先停通道循环：不再认领/派发新任务
     for t in _worker_tasks:
         t.cancel()
     for t in _worker_tasks:
@@ -175,5 +242,13 @@ async def stop_worker():
             await t
         except asyncio.CancelledError:
             pass
+    # fast lane 在途任务收尾：取消并等待退出。
+    # 被取消的任务停留在 processing，由下次 start_worker 的启动恢复重回 pending。
+    inflight = [t for t in _inflight if not t.done()]
+    for t in inflight:
+        t.cancel()
+    if inflight:
+        await asyncio.gather(*inflight, return_exceptions=True)
     _worker_tasks = []
+    _inflight.clear()
     _wakeup.clear()

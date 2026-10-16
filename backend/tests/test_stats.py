@@ -57,21 +57,21 @@ class TestReplyWithin3Min:
 
 class TestTokenUsage:
     def test_record_usage_persisted(self, db):
-        """engine._record_usage 落库（usage 为 OpenAI 风格对象）。"""
-        from app.agent.engine import _record_usage
+        """engine 用量记录落库（usage 为 OpenAI 风格对象）。"""
+        from app.llm import record_usage
 
         class U:
             prompt_tokens = 10
             completion_tokens = 5
             total_tokens = 15
 
-        _record_usage(999001, f"test-model-{uuid.uuid4().hex[:6]}", U())
+        record_usage(999001, f"test-model-{uuid.uuid4().hex[:6]}", U())
         row = db.query(LlmUsage).filter(LlmUsage.conversation_id == 999001).first()
         assert row is not None and row.total_tokens == 15
 
     def test_record_usage_none_silent(self):
-        from app.agent.engine import _record_usage
-        _record_usage(0, "m", None)  # 不抛异常
+        from app.llm import record_usage
+        record_usage(0, "m", None)  # 不抛异常
 
     def test_token_usage_endpoint_with_cost(self, db, monkeypatch):
         """日用量聚合 + 按单价估算成本。"""

@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from ..agent.engine import process_ai_reply
 from ..config import settings
 from ..core import contentfilter, ratelimit
+from ..core.convlock import conversation_lock
 from ..database import SessionLocal
 from ..models import Conversation, Customer, Message
 from ..schemas import InboundMessage
@@ -23,17 +24,10 @@ from ..services import _apply_guide_code_hook, _broadcast_message, handoff
 
 logger = logging.getLogger(__name__)
 
-_reply_locks: dict[int, asyncio.Lock] = {}
-_reply_locks_guard = asyncio.Lock()
-
 
 async def _conversation_lock(conversation_id: int) -> asyncio.Lock:
-    async with _reply_locks_guard:
-        lock = _reply_locks.get(conversation_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _reply_locks[conversation_id] = lock
-        return lock
+    """会话锁统一走 core.convlock：与队列并发消费路径共享，防跨入口同会话并发答题。"""
+    return await conversation_lock(conversation_id)
 
 
 async def _note_skip(conversation_id: int, content: str) -> None:

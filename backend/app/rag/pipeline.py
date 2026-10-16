@@ -401,8 +401,25 @@ def _fused_preview(candidates: list[dict]) -> list[dict]:
     return preview
 
 
+def _dense_hits(vec: list[float]) -> list[dict]:
+    """向量路检索 + 阈值过滤（同步，经 to_thread 调用）。"""
+    return [
+        {**hit, "score_kind": "dense"}
+        for hit in _safe_dense_hits(vec)
+        if (hit.get("score") or 0.0) >= settings.rag_dense_min_score
+    ]
+
+
+def _sparse_hits(query: str) -> list[dict]:
+    """BM25 路检索（同步，经 to_thread 调用）。"""
+    return [{**hit, "score_kind": "bm25"} for hit in bm25.query(query, top_k=20)]
+
+
 async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool, list | None]:
-    """每条查询各产出一路向量、一路 BM25。向量不可用时 degraded=True。"""
+    """每条查询各产出一路向量、一路 BM25。向量不可用时 degraded=True。
+
+    Chroma/BM25 均为同步调用，经 to_thread 执行，避免并发答复时阻塞事件循环。
+    """
     vectors = await embeddings.embed_texts(queries)
     degraded = not vectors or len(vectors) != len(queries)
     usable = None if degraded else vectors
@@ -412,17 +429,10 @@ async def _collect_rankings(queries: list[str]) -> tuple[list[list[dict]], bool,
     rankings: list[list[dict]] = []
     for query, vec in zip(queries, vectors):
         if vec is not None:
-            dense = [
-                {**hit, "score_kind": "dense"}
-                for hit in _safe_dense_hits(vec)
-                if (hit.get("score") or 0.0) >= settings.rag_dense_min_score
-            ]
+            dense = await asyncio.to_thread(_dense_hits, vec)
             if dense:
                 rankings.append(dense)
-        sparse = [
-            {**hit, "score_kind": "bm25"}
-            for hit in bm25.query(query, top_k=20)
-        ]
+        sparse = await asyncio.to_thread(_sparse_hits, query)
         if sparse:
             rankings.append(sparse)
     return rankings, degraded, usable

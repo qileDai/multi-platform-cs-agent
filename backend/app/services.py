@@ -13,6 +13,7 @@ from .adapters import get_adapter, get_rpa_fallback_adapter, get_send_adapter, s
 from .api.ws import manager
 from .config import settings
 from .core import contentfilter, idempotency, monitor, ratelimit
+from .core.convlock import conversation_lock
 from .core.queue import enqueue, register_handler
 from .database import SessionLocal
 from .models import Conversation, Customer, HandoffEvent, Message, MissedQuestion
@@ -165,14 +166,19 @@ async def _route_after_user_message(conversation_id: int, *, risk_level: str, mo
         return
 
     # AI 接待直接进引擎。已经排队或人工接待、但这条后面还没人回时，也补答一次。
+    # 会话锁：fast lane 并发消费下，同一会话的两条消息必须按序答题。
     if status == "open" and mode == "ai":
         await manager.broadcast("ai_typing", {"conversation_id": conversation_id})
         from .agent.engine import process_ai_reply  # 延迟导入避免循环依赖
-        await process_ai_reply(conversation_id)
+        lock = await conversation_lock(conversation_id)
+        async with lock:
+            await process_ai_reply(conversation_id)
         return
     if status == "open" and mode in ("pending", "human") and settings.ai_globally_enabled:
         from .agent.engine import process_ai_reply
-        await process_ai_reply(conversation_id, allow_owned=True)
+        lock = await conversation_lock(conversation_id)
+        async with lock:
+            await process_ai_reply(conversation_id, allow_owned=True)
 
 
 async def _resume_if_unanswered(conversation_id: int, user_message_id: int):

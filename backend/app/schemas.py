@@ -260,6 +260,7 @@ class FaqPackOut(BaseModel):
     enabling: int
     disabling_active: int
     skipped_ambiguous: list[str]
+    duplicates_overridden: list[str] = []
 
 
 class RecallTestRequest(BaseModel):

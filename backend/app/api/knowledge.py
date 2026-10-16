@@ -67,6 +67,17 @@ def list_docs(agent: Agent = Depends(get_current_agent), db: Session = Depends(g
 @router.post("/faq", response_model=KnowledgeDocOut)
 async def create_faq(req: FaqCreate, agent: Agent = Depends(get_current_agent),
                      db: Session = Depends(get_db)):
+    exists = (
+        db.query(KnowledgeDoc)
+        .filter(
+            KnowledgeDoc.doc_type == "faq",
+            KnowledgeDoc.title == req.title,
+            KnowledgeDoc.status != "archived",
+        )
+        .first()
+    )
+    if exists is not None:
+        raise HTTPException(409, "该标题已存在")
     doc = KnowledgeDoc(
         title=req.title, doc_type="faq",
         content=f"问：{req.question}\n答：{req.answer}",
@@ -348,7 +359,8 @@ def _cell_text(value) -> str:
     return str(value).strip()
 
 
-def _load_pack_rows(data: bytes) -> list[_PackRow]:
+def _load_pack_rows(data: bytes) -> tuple[list[_PackRow], list[str]]:
+    """解析 FAQ 表。文件内重复标题以后出现的行为准，返回 (rows, duplicates)。"""
     from openpyxl import load_workbook
 
     try:
@@ -376,7 +388,8 @@ def _load_pack_rows(data: bytes) -> list[_PackRow]:
 
         rows: list[_PackRow] = []
         errors: list[str] = []
-        seen: set[str] = set()
+        duplicates: list[str] = []
+        seen: dict[str, int] = {}
         for offset, raw in enumerate(row_iter, start=2):
             if raw is None or all(_cell_text(cell) == "" for cell in raw):
                 continue
@@ -394,18 +407,23 @@ def _load_pack_rows(data: bytes) -> list[_PackRow]:
             else:
                 errors.append(f"第 {offset} 行状态无法识别")
                 continue
-            if title in seen:
-                errors.append(f"标题重复：{title}")
-                continue
-            seen.add(title)
-            rows.append(_PackRow(
+            row = _PackRow(
                 title=title,
                 category=column(raw, "分类") or "未分类",
                 question=question,
                 answer=answer,
                 similars=_similar_lines(column(raw, "相似问")),
                 status=status,
-            ))
+            )
+            pos = seen.get(title)
+            if pos is None:
+                seen[title] = len(rows)
+                rows.append(row)
+            else:
+                # 重复标题：后面的行覆盖前面的行
+                rows[pos] = row
+                if title not in duplicates:
+                    duplicates.append(title)
         if errors:
             shown = errors[:8]
             if len(errors) > 8:
@@ -413,7 +431,7 @@ def _load_pack_rows(data: bytes) -> list[_PackRow]:
             raise HTTPException(400, "；".join(shown))
         if not rows:
             raise HTTPException(400, "表格里没有 FAQ")
-        return rows
+        return rows, duplicates
     finally:
         workbook.close()
 
@@ -491,10 +509,12 @@ def _apply_pack_writes(db: Session, writes: list[_PackWrite]) -> list[int]:
 
 
 def _pack_response(applied: bool, created: int, content_updated: int, enabling: int,
-                   disabling_active: int, skipped: list[str]) -> FaqPackOut:
+                   disabling_active: int, skipped: list[str],
+                   duplicates_overridden: list[str] | None = None) -> FaqPackOut:
     return FaqPackOut(
         applied=applied, created=created, content_updated=content_updated,
         enabling=enabling, disabling_active=disabling_active, skipped_ambiguous=skipped,
+        duplicates_overridden=duplicates_overridden or [],
     )
 
 
@@ -504,7 +524,7 @@ def export_faq_pack(agent: Agent = Depends(get_current_agent), db: Session = Dep
 
     docs = (
         db.query(KnowledgeDoc)
-        .filter(KnowledgeDoc.doc_type == "faq", KnowledgeDoc.status != "archived")
+        .filter(KnowledgeDoc.doc_type == "faq", KnowledgeDoc.status == "active")
         .order_by(KnowledgeDoc.id.asc())
         .all()
     )
@@ -520,7 +540,7 @@ def export_faq_pack(agent: Agent = Depends(get_current_agent), db: Session = Dep
             question,
             "\n".join(load_similar_questions(doc.similar_questions)),
             answer,
-            "启用" if doc.status == "active" else "停用",
+            "启用",
         ])
     buffer = io.BytesIO()
     workbook.save(buffer)
@@ -542,19 +562,22 @@ async def import_faq_pack(file: UploadFile, apply: str = Form("false"),
     data = await file.read()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(400, "文件不能超过 10MB")
-    rows = _load_pack_rows(data)
+    rows, duplicates = _load_pack_rows(data)
     writes, created, content_updated, enabling, disabling_active, skipped = _pack_plan(db, rows)
     do_apply = apply.strip().lower() in {"1", "true", "yes", "on"}
     if not do_apply:
-        return _pack_response(False, created, content_updated, enabling, disabling_active, skipped)
+        return _pack_response(False, created, content_updated, enabling, disabling_active,
+                              skipped, duplicates)
     index_ids = _apply_pack_writes(db, writes)
     if index_ids:
         await ingest.sync_doc_index(index_ids)
     audit.log(
         db, agent, "kb_faq_pack_import", target="knowledge",
-        detail=f"created={created} content_updated={content_updated} enabling={enabling} disabling={disabling_active}",
+        detail=(f"created={created} content_updated={content_updated} enabling={enabling} "
+                f"disabling={disabling_active} duplicates={len(duplicates)}"),
     )
-    return _pack_response(True, created, content_updated, enabling, disabling_active, skipped)
+    return _pack_response(True, created, content_updated, enabling, disabling_active,
+                          skipped, duplicates)
 
 
 # ============ 召回测试台 ============
@@ -593,6 +616,17 @@ async def resolve_missed(missed_id: int, req: FaqCreate,
     missed = db.get(MissedQuestion, missed_id)
     if missed is None:
         raise HTTPException(404, "记录不存在")
+    exists = (
+        db.query(KnowledgeDoc)
+        .filter(
+            KnowledgeDoc.doc_type == "faq",
+            KnowledgeDoc.title == req.title,
+            KnowledgeDoc.status != "archived",
+        )
+        .first()
+    )
+    if exists is not None:
+        raise HTTPException(409, "该标题已存在")
     doc = KnowledgeDoc(
         title=req.title, doc_type="faq",
         content=f"问：{req.question}\n答：{req.answer}",

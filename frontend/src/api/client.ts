@@ -162,6 +162,7 @@ export interface FaqPackResult {
   enabling: number
   disabling_active: number
   skipped_ambiguous: string[]
+  duplicates_overridden?: string[]
 }
 
 export interface MissedQuestion {

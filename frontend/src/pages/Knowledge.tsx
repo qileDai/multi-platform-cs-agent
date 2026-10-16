@@ -308,11 +308,13 @@ export default function Knowledge() {
     setPackImporting(true)
     try {
       const preview = await api.importFaqPack(file, false)
+      const duplicates = preview.duplicates_overridden ?? []
       const unchanged = preview.created === 0
         && preview.content_updated === 0
         && preview.enabling === 0
         && preview.disabling_active === 0
         && preview.skipped_ambiguous.length === 0
+        && duplicates.length === 0
       if (unchanged) {
         toast.info('这张表和当前知识库一致')
         return
@@ -320,15 +322,21 @@ export default function Knowledge() {
       const skip = preview.skipped_ambiguous.length
         ? `同标题有多条、未改动：${preview.skipped_ambiguous.slice(0, 5).join('、')}。`
         : ''
+      const dup = duplicates.length
+        ? `文件内重复标题已按最后一行处理：${duplicates.slice(0, 5).join('、')}。`
+        : ''
       const ok = await confirmDialog({
         title: '按这张表更新知识库？',
-        message: `新建 ${preview.created} 条，覆盖 ${preview.content_updated} 条，将启用 ${preview.enabling} 条，将停用 ${preview.disabling_active} 条当前已启用的。文件里没有的条目保持不变。${skip}`,
+        message: `新建 ${preview.created} 条，覆盖 ${preview.content_updated} 条，将启用 ${preview.enabling} 条，将停用 ${preview.disabling_active} 条当前已启用的。文件里没有的条目保持不变。${skip}${dup}`,
         confirmText: '导入',
         danger: preview.disabling_active > 0,
       })
       if (!ok) return
       const result = await api.importFaqPack(file, true)
-      toast.success(`已导入：新建 ${result.created}，覆盖 ${result.content_updated}，启用 ${result.enabling}`)
+      const resultDup = (result.duplicates_overridden ?? []).length
+        ? `，重复标题按最后一行覆盖 ${(result.duplicates_overridden ?? []).slice(0, 5).join('、')}`
+        : ''
+      toast.success(`已导入：新建 ${result.created}，覆盖 ${result.content_updated}，启用 ${result.enabling}${resultDup}`)
       await refresh()
       setNav('faq')
       setCreating(false)

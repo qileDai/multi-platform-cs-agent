@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Navigate } from 'react-router-dom'
-import { api, AuditLogItem, QueueOpsOverview } from '../../api/client'
+import { Button, Card, Space, Table, Tag } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
+import { api, AuditLogItem, QueueFailedTask, QueueOpsOverview } from '../../api/client'
 import { toast } from '../../components/ui/toast'
 import { useAuth } from '../../store'
 
@@ -60,96 +62,137 @@ export default function OpsSettings() {
     toast.success(message)
   }
 
+  const queueColumns: ColumnsType<QueueFailedTask> = [
+    {
+      title: '任务',
+      dataIndex: 'task_type',
+      width: 140,
+      render: (value: string) => <Tag color="blue">{TASK_TYPE_LABELS[value] || value}</Tag>,
+    },
+    {
+      title: '编号',
+      dataIndex: 'id',
+      width: 160,
+      render: (value: number, row) => `#${value} · 重试 ${row.retries} 次`,
+    },
+    {
+      title: '错误',
+      dataIndex: 'error',
+      ellipsis: true,
+    },
+    {
+      title: '更新时间',
+      dataIndex: 'updated_at',
+      width: 180,
+      render: (value: string | null) => (value ? new Date(value).toLocaleString() : ''),
+    },
+    {
+      key: 'actions',
+      title: '操作',
+      width: 80,
+      align: 'right',
+      render: (_, row) => (
+        <Button
+          type="link"
+          size="small"
+          onClick={async () => {
+            try {
+              await api.retryQueueTask(row.id)
+              toast.success('已重新入队')
+              load()
+            } catch (e: any) {
+              toast.error(e.message || '重试失败')
+            }
+          }}
+        >
+          重试
+        </Button>
+      ),
+    },
+  ]
+
+  const auditColumns: ColumnsType<AuditLogItem> = [
+    {
+      title: '时间',
+      dataIndex: 'created_at',
+      width: 180,
+      render: (value: string) => new Date(value).toLocaleString(),
+    },
+    { title: '操作人', dataIndex: 'agent_name', width: 120 },
+    {
+      title: '动作',
+      dataIndex: 'action',
+      width: 160,
+      render: (value: string) => <Tag color="blue">{ACTION_LABELS[value] || value}</Tag>,
+    },
+    {
+      key: 'detail',
+      title: '详情',
+      ellipsis: true,
+      render: (_, row) => `${row.target} ${row.detail}`,
+    },
+  ]
+
   return (
-    <div className="max-w-5xl space-y-4">
-      <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
-        <div className="flex items-center justify-between mb-1">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200">队列运维（后台任务）</div>
-          {queueOps && (
-            <div className="text-xs text-gray-400">
+    <div className="max-w-5xl">
+      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Card
+          title="队列运维（后台任务）"
+          extra={queueOps ? (
+            <span className="text-xs text-gray-400">
               待处理 {queueOps.pending} ·
               <span className={queueOps.failed > 0 ? 'text-red-500 font-medium' : ''}> 失败 {queueOps.failed}</span>
-            </div>
-          )}
-        </div>
-        <div className="text-xs text-gray-400 mb-3">
-          私信/评论入站走 fast 通道，内容生成/发布走 slow 通道，互不阻塞；失败任务自动退避重试 3 次（30s/60s/120s）后停在这里。
-        </div>
-        {!queueOps || queueOps.items.length === 0 ? (
-          <div className="text-xs text-gray-300 dark:text-gray-600 text-center py-4">暂无失败任务</div>
-        ) : (
-          <div className="space-y-1.5 max-h-56 overflow-y-auto">
-            {queueOps.items.map((t) => (
-              <div key={t.id} className="flex items-center justify-between text-xs border dark:border-gray-700 rounded px-2.5 py-1.5">
-                <div className="min-w-0 flex-1">
-                  <span className="text-blue-600 dark:text-blue-400 font-medium">
-                    {TASK_TYPE_LABELS[t.task_type] || t.task_type}
-                  </span>
-                  <span className="text-gray-400 ml-2">#{t.id} · 重试 {t.retries} 次</span>
-                  <div className="text-gray-400 truncate">{t.error}</div>
-                  <div className="text-gray-300 dark:text-gray-600">
-                    {t.updated_at ? new Date(t.updated_at).toLocaleString() : ''}
-                  </div>
-                </div>
-                <button
-                  onClick={async () => {
-                    try {
-                      await api.retryQueueTask(t.id)
-                      toast.success('已重新入队')
-                      load()
-                    } catch (e: any) {
-                      toast.error(e.message || '重试失败')
-                    }
-                  }}
-                  className="ml-3 shrink-0 text-blue-500 hover:text-blue-700"
-                >
-                  重试
-                </button>
-              </div>
-            ))}
+            </span>
+          ) : null}
+        >
+          <div className="text-xs text-gray-400 mb-3">
+            私信/评论入站走 fast 通道，内容生成/发布走 slow 通道，互不阻塞；失败任务自动退避重试 3 次（30s/60s/120s）后停在这里。
           </div>
-        )}
-      </div>
+          <Table
+            rowKey="id"
+            size="small"
+            pagination={false}
+            columns={queueColumns}
+            dataSource={queueOps?.items ?? []}
+            locale={{ emptyText: '暂无失败任务' }}
+            scroll={{ y: 224 }}
+          />
+        </Card>
 
-      <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
-        <div className="flex items-center justify-between mb-3 gap-3">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200">操作审计日志</div>
-          <div className="flex items-center gap-3">
-            <button
+        <Card title="操作审计日志">
+          <Space wrap style={{ marginBottom: 12 }}>
+            <Button
+              type="link"
+              size="small"
               onClick={async () => {
                 const cases = await api.exportBadCases()
                 downloadJson('badcase-cases.json', cases, `已导出 ${cases.length} 条 badcase`)
               }}
-              className="text-xs text-blue-500 hover:underline"
             >
               导出 badcase（evals 格式，人工审阅后合入 backend/evals/cases.json）
-            </button>
-            <button
+            </Button>
+            <Button
+              type="link"
+              size="small"
               onClick={async () => {
                 const cases = await api.draftEvalCases()
                 downloadJson('eval-drafts.json', cases, `已生成 ${cases.length} 条评测草稿`)
               }}
-              className="text-xs text-blue-500 hover:underline"
             >
               生成评测草稿
-            </button>
-          </div>
-        </div>
-        {auditLogs.length === 0 ? (
-          <div className="text-xs text-gray-300 text-center py-6">暂无操作记录</div>
-        ) : (
-          <div className="space-y-1 max-h-64 overflow-y-auto">
-            {auditLogs.map((l) => (
-              <div key={l.id} className="flex items-center gap-3 text-xs border-b border-gray-50 dark:border-gray-800 py-1.5">
-                <span className="text-gray-400 dark:text-gray-500 shrink-0">{new Date(l.created_at).toLocaleString()}</span>
-                <span className="text-gray-700 dark:text-gray-200 font-medium shrink-0">{l.agent_name}</span>
-                <span className="text-blue-600 dark:text-blue-400 shrink-0">{ACTION_LABELS[l.action] || l.action}</span>
-                <span className="text-gray-400 dark:text-gray-500 truncate">{l.target} {l.detail}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+            </Button>
+          </Space>
+          <Table
+            rowKey="id"
+            size="small"
+            pagination={false}
+            columns={auditColumns}
+            dataSource={auditLogs}
+            locale={{ emptyText: '暂无操作记录' }}
+            scroll={{ y: 256 }}
+          />
+        </Card>
+      </Space>
     </div>
   )
 }

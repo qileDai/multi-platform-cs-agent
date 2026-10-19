@@ -1,3 +1,5 @@
+import { Button, DatePicker, Modal, Select, Space, Table, Tag, Typography } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
 import clsx from 'clsx'
 import dayjs from 'dayjs'
 import { CalendarClock, CalendarDays, ChevronLeft, ChevronRight, Download, List, Plus, RotateCcw, XCircle, Zap } from 'lucide-react'
@@ -5,11 +7,12 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, CalendarDay, MatrixAccount, PublishableVersion, PublishTask } from '../api/client'
 import Empty from '../components/ui/Empty'
-import Skeleton from '../components/ui/Skeleton'
 import { confirmDialog } from '../components/ui/dialogs'
 import { toast } from '../components/ui/toast'
 import { subscribeWs } from '../store'
 import { PLATFORM_LABEL, publishableLabel } from '../utils/labels'
+
+const { Title, Text, Link } = Typography
 
 const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
   pending: { label: '待发布', cls: 'bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400' },
@@ -17,6 +20,14 @@ const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
   success: { label: '已发布', cls: 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400' },
   failed: { label: '失败', cls: 'bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-400' },
   cancelled: { label: '已取消', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400' },
+}
+
+const STATUS_COLOR: Record<string, string> = {
+  pending: 'blue',
+  publishing: 'gold',
+  success: 'green',
+  failed: 'red',
+  cancelled: 'default',
 }
 
 // 平台标签统一从 utils/labels 引入
@@ -229,38 +240,107 @@ export default function PublishCalendar() {
   const selectedPlatform = versionOptions.find((v) => v.id === form.version_id)?.platform || ''
   const candidateAccounts = accounts.filter((a) => !selectedPlatform || a.platform === selectedPlatform)
 
+  const columns: ColumnsType<PublishTask> = [
+    {
+      title: '平台',
+      dataIndex: 'platform',
+      width: 90,
+      render: (value: string) => <Tag>{PLATFORM_LABEL[value] || value}</Tag>,
+    },
+    { title: '账号', dataIndex: 'account_name', width: 140 },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 180,
+      render: (value: PublishTask['status'], row) => (
+        <Space size={4} wrap>
+          <Tag color={STATUS_COLOR[value] || 'default'}>{STATUS_STYLE[value]?.label || value}</Tag>
+          {row.retries > 0 ? <Text type="warning">重试 {row.retries} 次</Text> : null}
+        </Space>
+      ),
+    },
+    {
+      title: '计划时间',
+      dataIndex: 'scheduled_at',
+      width: 120,
+      render: (value: string) => dayjs(value).format('MM-DD HH:mm'),
+    },
+    {
+      title: '发布时间',
+      dataIndex: 'published_at',
+      width: 120,
+      render: (value?: string | null) => (value ? dayjs(value).format('MM-DD HH:mm') : '—'),
+    },
+    {
+      title: '结果',
+      render: (_, task) => {
+        if (!task.error && !task.post_url) return '—'
+        return (
+          <Space direction="vertical" size={4}>
+            {task.error ? <Text type="danger">{task.error}</Text> : null}
+            {task.post_url ? (
+              <Link href={task.post_url} target="_blank" rel="noreferrer">
+                {task.post_url}
+              </Link>
+            ) : null}
+          </Space>
+        )
+      },
+    },
+    {
+      title: '操作',
+      width: 280,
+      render: (_, task) => (
+        <Space wrap>
+          <Button size="small" icon={<Download size={12} />} onClick={() => exportPack(task)}>
+            导出发布包
+          </Button>
+          {task.status === 'failed' && (
+            <Button size="small" icon={<RotateCcw size={12} />} onClick={() => retry(task)}>
+              重试
+            </Button>
+          )}
+          {(task.status === 'pending' || task.status === 'failed') && (
+            <Button size="small" danger icon={<XCircle size={12} />} onClick={() => cancel(task)}>
+              取消
+            </Button>
+          )}
+        </Space>
+      ),
+    },
+  ]
+
   return (
     <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-950">
-      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6 py-4 flex items-center">
-        <div>
-          <h1 className="text-lg font-medium text-gray-800 dark:text-gray-100">发布计划</h1>
-          <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
+      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6 py-4 flex items-center gap-4">
+        <div className="min-w-0">
+          <Title level={4} style={{ margin: 0 }}>发布计划</Title>
+          <Text type="secondary">
             定时发布到矩阵账号；自动发布总开关在「设置」页（默认关闭，可先导出发布包人工发）
-          </p>
+          </Text>
         </div>
         <span className="flex-1" />
-        <div className="flex items-center gap-1 mr-3 bg-gray-100 dark:bg-gray-800 rounded-lg p-0.5">
-          <button
-            onClick={() => setView('list')}
-            className={clsx('flex items-center gap-1 text-xs rounded-md px-3 py-1.5',
-              view === 'list' ? 'bg-white dark:bg-gray-900 shadow text-gray-800 dark:text-gray-100' : 'text-gray-500')}
-          >
-            <List size={13} /> 列表
-          </button>
-          <button
-            onClick={() => setView('calendar')}
-            className={clsx('flex items-center gap-1 text-xs rounded-md px-3 py-1.5',
-              view === 'calendar' ? 'bg-white dark:bg-gray-900 shadow text-gray-800 dark:text-gray-100' : 'text-gray-500')}
-          >
-            <CalendarDays size={13} /> 日历
-          </button>
-        </div>
-        <button
-          onClick={openCreate}
-          className="flex items-center gap-1.5 text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700"
-        >
-          <Plus size={15} /> 新建发布任务
-        </button>
+        <Space>
+          <Space.Compact>
+            <Button
+              type={view === 'list' ? 'primary' : 'default'}
+              icon={<List size={13} />}
+              onClick={() => setView('list')}
+            >
+              列表
+            </Button>
+            <Button
+              type={view === 'calendar' ? 'primary' : 'default'}
+              icon={<CalendarDays size={13} />}
+              onClick={() => setView('calendar')}
+            >
+              日历
+            </Button>
+          </Space.Compact>
+          <Button type="primary" icon={<Plus size={15} />} onClick={openCreate}>
+            新建发布任务
+          </Button>
+        </Space>
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
@@ -272,174 +352,121 @@ export default function PublishCalendar() {
             onMonthChange={setMonth}
             onDropTask={dropToDay}
           />
-        ) : loading ? (
-          <Skeleton rows={4} className="max-w-5xl" />
-        ) : tasks.length === 0 ? (
-          <Empty icon={CalendarClock} title="暂无发布任务" hint="先在「创作」页生成内容并审核通过" />
         ) : (
-          <div className="space-y-3 max-w-5xl">
-            {tasks.map((task) => (
-              <div key={task.id} className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <span className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 rounded px-2 py-0.5">
-                    {PLATFORM_LABEL[task.platform] || task.platform}
-                  </span>
-                  <span className="text-sm text-gray-800 dark:text-gray-100">{task.account_name}</span>
-                  <span className={clsx('text-xs rounded px-2 py-0.5', STATUS_STYLE[task.status]?.cls)}>
-                    {STATUS_STYLE[task.status]?.label || task.status}
-                  </span>
-                  {task.retries > 0 && (
-                    <span className="text-xs text-orange-500">重试 {task.retries} 次</span>
-                  )}
-                  <span className="flex-1" />
-                  <span className="text-xs text-gray-400">
-                    计划 {dayjs(task.scheduled_at).format('MM-DD HH:mm')}
-                  </span>
-                  {task.published_at && (
-                    <span className="text-xs text-gray-400">
-                      发布 {dayjs(task.published_at).format('MM-DD HH:mm')}
-                    </span>
-                  )}
-                </div>
-                {task.error && (
-                  <div className="mt-2 text-xs text-red-500 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded p-2">
-                    {task.error}
-                  </div>
-                )}
-                {task.post_url && (
-                  <div className="mt-2 text-xs">
-                    <a href={task.post_url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline break-all">
-                      {task.post_url}
-                    </a>
-                  </div>
-                )}
-                <div className="mt-3 flex items-center gap-2">
-                  <button
-                    onClick={() => exportPack(task)}
-                    className="flex items-center gap-1 text-xs bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 rounded px-3 py-1.5 hover:bg-gray-200"
-                  >
-                    <Download size={12} /> 导出发布包
-                  </button>
-                  {task.status === 'failed' && (
-                    <button
-                      onClick={() => retry(task)}
-                      className="flex items-center gap-1 text-xs bg-blue-50 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400 rounded px-3 py-1.5 hover:bg-blue-100"
-                    >
-                      <RotateCcw size={12} /> 重试
-                    </button>
-                  )}
-                  {(task.status === 'pending' || task.status === 'failed') && (
-                    <button
-                      onClick={() => cancel(task)}
-                      className="flex items-center gap-1 text-xs bg-red-50 text-red-500 dark:bg-red-900/30 rounded px-3 py-1.5 hover:bg-red-100"
-                    >
-                      <XCircle size={12} /> 取消
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
+          <Table
+            className="max-w-5xl"
+            rowKey="id"
+            size="small"
+            loading={loading}
+            columns={columns}
+            dataSource={tasks}
+            pagination={false}
+            locale={{
+              emptyText: (
+                <Empty icon={CalendarClock} title="暂无发布任务" hint="先在「创作」页生成内容并审核通过" />
+              ),
+            }}
+          />
         )}
       </div>
 
-      {/* 新建任务对话框 */}
-      {showCreate && (
-        <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={() => setShowCreate(false)}>
-          <div
-            className="bg-white dark:bg-gray-800 rounded-2xl shadow-pop w-[460px] p-5 max-h-[80vh] overflow-y-auto"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-sm font-medium text-gray-800 dark:text-gray-100 mb-4">新建发布任务</div>
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">内容版本（仅显示已通过审批且合规通过的版本）</label>
-                {publishable.length === 0 ? (
-                  <div className="mt-1 border border-dashed dark:border-gray-600 rounded-lg p-3 text-xs text-gray-500 dark:text-gray-400 space-y-1.5">
-                    <div className="font-medium text-gray-600 dark:text-gray-300">没有可发布的内容</div>
-                    <div>内容需满足三道闸才能发布：</div>
-                    <div>① AI 生成版本 → ② 全部版本合规通过 → ③ 提交审核并由管理员审批通过</div>
-                    <button
-                      onClick={() => { setShowCreate(false); navigate('/contents') }}
-                      className="text-blue-500 hover:text-blue-600 font-medium"
-                    >
-                      → 去创作台处理
-                    </button>
-                  </div>
-                ) : (
-                  <select
-                    value={form.version_id}
-                    onChange={(e) => setForm({ ...form, version_id: Number(e.target.value), account_ids: [] })}
-                    className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                  >
-                    <option value={0}>请选择</option>
-                    {versionOptions.map((v) => (
-                      <option key={v.id} value={v.id}>{v.label}</option>
-                    ))}
-                  </select>
-                )}
+      <Modal
+        open={showCreate}
+        title="新建发布任务"
+        width={460}
+        onCancel={() => setShowCreate(false)}
+        destroyOnClose
+        footer={
+          <Space>
+            <Button onClick={() => setShowCreate(false)}>取消</Button>
+            <Button
+              icon={<Zap size={12} />}
+              title="按账号时段位自动占坑（账号需开启队列模式）"
+              onClick={() => enqueue()}
+              className="!text-amber-700 !bg-amber-100 !border-transparent dark:!text-amber-400 dark:!bg-amber-900/40"
+            >
+              加入队列
+            </Button>
+            <Button type="primary" onClick={() => create()}>
+              创建
+            </Button>
+          </Space>
+        }
+      >
+        <Space direction="vertical" size={12} className="w-full">
+          <div className="w-full">
+            <Text type="secondary">内容版本（仅显示已通过审批且合规通过的版本）</Text>
+            {publishable.length === 0 ? (
+              <div className="mt-1 border border-dashed dark:border-gray-600 rounded-lg p-3 text-xs text-gray-500 dark:text-gray-400 space-y-1.5">
+                <div className="font-medium text-gray-600 dark:text-gray-300">没有可发布的内容</div>
+                <div>内容需满足三道闸才能发布：</div>
+                <div>① AI 生成版本 → ② 全部版本合规通过 → ③ 提交审核并由管理员审批通过</div>
+                <Button
+                  type="link"
+                  size="small"
+                  className="!px-0"
+                  onClick={() => { setShowCreate(false); navigate('/contents') }}
+                >
+                  → 去创作台处理
+                </Button>
               </div>
-              <div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">
-                  目标账号{selectedPlatform ? `（${PLATFORM_LABEL[selectedPlatform]}）` : ''}（可多选）
-                </label>
-                <div className="mt-1 space-y-1 max-h-40 overflow-y-auto border dark:border-gray-600 rounded-lg p-2">
-                  {candidateAccounts.length === 0 && (
-                    <div className="text-xs text-gray-400 py-2 text-center">无可用账号（需与内容平台匹配且状态正常）</div>
-                  )}
-                  {candidateAccounts.map((a) => (
-                    <label key={a.id} className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300 py-1">
-                      <input
-                        type="checkbox"
-                        checked={form.account_ids.includes(a.id)}
-                        onChange={(e) =>
-                          setForm({
-                            ...form,
-                            account_ids: e.target.checked
-                              ? [...form.account_ids, a.id]
-                              : form.account_ids.filter((x) => x !== a.id),
-                          })
-                        }
-                      />
-                      {a.account_name}（今日 {a.today_published}/{a.daily_publish_limit}）
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">计划时间（留空 = 立即执行）</label>
-                <input
-                  type="datetime-local"
-                  value={form.scheduled_at}
-                  onChange={(e) => setForm({ ...form, scheduled_at: e.target.value })}
-                  className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                />
-                {bestSlotHint && (
-                  <div className="text-xs text-amber-600 dark:text-amber-400 mt-1">{bestSlotHint}</div>
-                )}
-              </div>
-            </div>
-            <div className="flex justify-end gap-2 mt-5">
-              <button
-                onClick={() => setShowCreate(false)}
-                className="text-xs px-4 py-2 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
-              >
-                取消
-              </button>
-              <button
-                onClick={() => enqueue()}
-                title="按账号时段位自动占坑（账号需开启队列模式）"
-                className="flex items-center gap-1 text-xs px-4 py-2 rounded-lg text-amber-700 bg-amber-100 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-400 font-medium"
-              >
-                <Zap size={12} /> 加入队列
-              </button>
-              <button onClick={() => create()} className="text-xs px-4 py-2 rounded-lg text-white bg-blue-600 hover:bg-blue-700 font-medium">
-                创建
-              </button>
-            </div>
+            ) : (
+              <Select
+                className="mt-1"
+                style={{ width: '100%' }}
+                value={form.version_id || undefined}
+                placeholder="请选择"
+                options={versionOptions.map((v) => ({ value: v.id, label: v.label }))}
+                onChange={(value) => setForm({ ...form, version_id: value, account_ids: [] })}
+              />
+            )}
           </div>
-        </div>
-      )}
+          <div className="w-full">
+            <Text type="secondary">
+              目标账号{selectedPlatform ? `（${PLATFORM_LABEL[selectedPlatform]}）` : ''}（可多选）
+            </Text>
+            {candidateAccounts.length === 0 ? (
+              <div className="mt-1 text-xs text-gray-400 py-2 text-center border dark:border-gray-600 rounded-lg">
+                无可用账号（需与内容平台匹配且状态正常）
+              </div>
+            ) : (
+              <Select
+                mode="multiple"
+                allowClear
+                className="mt-1"
+                style={{ width: '100%' }}
+                value={form.account_ids}
+                placeholder="选择账号"
+                options={candidateAccounts.map((a) => ({
+                  value: a.id,
+                  label: `${a.account_name}（今日 ${a.today_published}/${a.daily_publish_limit}）`,
+                }))}
+                onChange={(ids) => setForm({ ...form, account_ids: ids })}
+              />
+            )}
+          </div>
+          <div className="w-full">
+            <Text type="secondary">计划时间（留空 = 立即执行）</Text>
+            <DatePicker
+              className="mt-1"
+              style={{ width: '100%' }}
+              showTime={{ format: 'HH:mm' }}
+              format="YYYY-MM-DD HH:mm"
+              value={form.scheduled_at ? dayjs(form.scheduled_at) : null}
+              placeholder="留空则立即执行"
+              onChange={(value) => {
+                setForm({
+                  ...form,
+                  scheduled_at: value && !Array.isArray(value) ? value.format('YYYY-MM-DDTHH:mm') : '',
+                })
+              }}
+            />
+            {bestSlotHint && (
+              <Text type="warning" className="block mt-1">{bestSlotHint}</Text>
+            )}
+          </div>
+        </Space>
+      </Modal>
     </div>
   )
 }
@@ -463,21 +490,19 @@ function CalendarGrid({
   return (
     <div className="max-w-6xl">
       <div className="flex items-center gap-3 mb-3">
-        <button
+        <Button
+          icon={<ChevronLeft size={15} />}
+          aria-label="上个月"
           onClick={() => onMonthChange(monthStart.subtract(1, 'month').format('YYYY-MM'))}
-          className="p-1.5 rounded-lg bg-white dark:bg-gray-900 shadow-card text-gray-500 hover:text-gray-800"
-        >
-          <ChevronLeft size={15} />
-        </button>
+        />
         <span className="text-sm font-medium text-gray-800 dark:text-gray-100">
           {monthStart.format('YYYY 年 M 月')}
         </span>
-        <button
+        <Button
+          icon={<ChevronRight size={15} />}
+          aria-label="下个月"
           onClick={() => onMonthChange(monthStart.add(1, 'month').format('YYYY-MM'))}
-          className="p-1.5 rounded-lg bg-white dark:bg-gray-900 shadow-card text-gray-500 hover:text-gray-800"
-        >
-          <ChevronRight size={15} />
-        </button>
+        />
         <span className="text-xs text-gray-400 ml-2">拖拽「待发布」任务到其他日期即可改期（保留原时刻）</span>
       </div>
       <div className="grid grid-cols-7 gap-1 text-center text-xs text-gray-400 mb-1">

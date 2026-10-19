@@ -1,6 +1,7 @@
 import clsx from 'clsx'
 import dayjs from 'dayjs'
-import { Bot, User, UserCheck, X } from 'lucide-react'
+import { Alert, Button, Modal, Spin } from 'antd'
+import { Bot, User, UserCheck } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { api, Conversation, LeadCapture, mediaUrl, Message } from '../api/client'
 
@@ -214,72 +215,39 @@ export default function LeadConversationModal({ lead, onClose }: { lead: LeadCap
   const platform = PLATFORM[lead.platform] || lead.platform || '—'
 
   return (
-    <div
-      className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center p-4"
-      onClick={onClose}
+    <Modal
+      open
+      title={`${nickname} · ${platform} · ${lead.contact}`}
+      footer={null}
+      width={720}
+      onCancel={onClose}
+      styles={{ body: { maxHeight: '70vh', overflow: 'auto', paddingTop: 12 } }}
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="查看会话"
-        className="bg-white dark:bg-gray-900 rounded-2xl shadow-pop w-full max-w-2xl h-[min(80vh,720px)] flex flex-col"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b dark:border-gray-700 flex items-center gap-3 shrink-0">
-          <div className="w-8 h-8 rounded-full bg-primary-500 text-white flex items-center justify-center text-sm font-medium shrink-0">
-            {nickname.slice(0, 1)}
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-gray-800 dark:text-gray-100 truncate">{nickname}</div>
-            <div className="text-xs text-gray-400 truncate">
-              {platform} · {lead.contact}
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="关闭"
-            className="p-1.5 rounded-lg text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
-          >
-            <X size={16} />
-          </button>
+      {!loading && !error && !hit && (
+        <Alert type="warning" showIcon className="!mb-3" message="未在消息里定位到该联系方式" />
+      )}
+      {loading ? (
+        <div className="py-10 text-center"><Spin tip="加载会话…" /></div>
+      ) : error ? (
+        <div className="text-center py-10">
+          <Alert type="error" message={error} />
+          <Button className="mt-3" onClick={() => setRetry((n) => n + 1)}>重试</Button>
         </div>
-
-        {!loading && !error && !hit && (
-          <div className="px-4 py-2 text-xs text-amber-700 bg-amber-50 dark:bg-amber-950/40 dark:text-amber-300 shrink-0">
-            未在消息里定位到该联系方式
-          </div>
-        )}
-
-        <div className="flex-1 overflow-auto px-4 py-4 space-y-3 bg-gray-50 dark:bg-gray-950">
-          {loading ? (
-            <div className="text-sm text-gray-400 text-center py-10">加载会话…</div>
-          ) : error ? (
-            <div className="text-center py-10">
-              <div className="text-sm text-red-500">{error}</div>
-              <button
-                type="button"
-                onClick={() => setRetry((n) => n + 1)}
-                className="mt-3 text-xs px-3 py-1.5 rounded-lg border dark:border-gray-700"
-              >
-                重试
-              </button>
-            </div>
-          ) : messages.length === 0 ? (
-            <div className="text-sm text-gray-400 text-center py-10">这条会话还没有消息</div>
-          ) : (
-            messages.map((msg) => (
-              <Bubble
-                key={msg.id}
-                msg={msg}
-                contact={lead.contact}
-                marked={hit?.id === msg.id}
-                markRef={markRef}
-              />
-            ))
-          )}
+      ) : messages.length === 0 ? (
+        <div className="text-center py-10">这条会话还没有消息</div>
+      ) : (
+        <div className="space-y-3">
+          {messages.map((msg) => (
+            <Bubble
+              key={msg.id}
+              msg={msg}
+              contact={lead.contact}
+              marked={hit?.id === msg.id}
+              markRef={markRef}
+            />
+          ))}
         </div>
-      </div>
-    </div>
+      )}
+    </Modal>
   )
 }

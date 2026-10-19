@@ -1,3 +1,4 @@
+import { Button, Card, Dropdown, Input, Modal, Select, Space } from 'antd'
 import clsx from 'clsx'
 import {
   AlertCircle,
@@ -233,8 +234,7 @@ export default function ChatWindow({
       })
     : []
 
-  const iconBtn =
-    'p-1.5 rounded-lg text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800 hover:text-gray-800 dark:hover:text-gray-100'
+  const otherAgents = agents.filter((a) => a.id !== me?.id)
 
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-gray-900">
@@ -257,43 +257,57 @@ export default function ChatWindow({
           </div>
         </div>
         {conversation.status === 'open' && (
-          <div className="flex items-center gap-0.5">
+          <Space size={0}>
             {conversation.mode === 'pending' && (
-              <button onClick={claim} title="接单" className={clsx(iconBtn, 'text-orange-500 hover:bg-orange-50')}>
-                <Handshake size={16} />
-              </button>
+              <Button
+                type="text"
+                size="small"
+                icon={<Handshake size={16} />}
+                title="接单"
+                aria-label="接单"
+                className="!text-orange-500"
+                onClick={claim}
+              />
             )}
             {conversation.mode === 'human' && (
-              <button
+              <Button
+                type="text"
+                size="small"
+                icon={<ArrowLeftRight size={16} />}
+                title="转接"
+                aria-label="转接"
                 onClick={() => {
                   setShowTransfer(true)
                   setTransferId(agents.find((a) => a.id !== me?.id)?.id || 0)
                 }}
-                title="转接"
-                className={iconBtn}
-              >
-                <ArrowLeftRight size={16} />
-              </button>
+              />
             )}
-            <button
-              onClick={toggleMode}
+            <Button
+              type="text"
+              size="small"
+              icon={conversation.mode === 'human' ? <Bot size={16} /> : <UserCheck size={16} />}
               title={conversation.mode === 'human' ? '释放 AI' : '接管会话'}
-              className={iconBtn}
-            >
-              {conversation.mode === 'human' ? <Bot size={16} /> : <UserCheck size={16} />}
-            </button>
-            <button onClick={closeConv} title="结束会话" className={iconBtn}>
-              <PhoneOff size={16} />
-            </button>
-          </div>
+              aria-label={conversation.mode === 'human' ? '释放 AI' : '接管会话'}
+              onClick={toggleMode}
+            />
+            <Button
+              type="text"
+              size="small"
+              icon={<PhoneOff size={16} />}
+              title="结束会话"
+              aria-label="结束会话"
+              onClick={closeConv}
+            />
+          </Space>
         )}
-        <button
-          onClick={onTogglePanel}
+        <Button
+          type="text"
+          size="small"
+          icon={panelCollapsed ? <PanelRightOpen size={16} /> : <PanelRightClose size={16} />}
           title={panelCollapsed ? '展开右侧栏' : '收起右侧栏'}
-          className={iconBtn}
-        >
-          {panelCollapsed ? <PanelRightOpen size={16} /> : <PanelRightClose size={16} />}
-        </button>
+          aria-label={panelCollapsed ? '展开右侧栏' : '收起右侧栏'}
+          onClick={onTogglePanel}
+        />
       </div>
 
       {conversation.status === 'open' && (
@@ -305,46 +319,45 @@ export default function ChatWindow({
         </div>
       )}
 
-      {showTransfer && (
-        <div className="border-b dark:border-gray-700 px-4 py-2.5 bg-primary-50/80 dark:bg-primary-900/20 space-y-2">
-          <div className="text-xs font-medium text-primary-700 dark:text-primary-300">转接给同事</div>
-          <select
-            value={transferId}
-            onChange={(e) => setTransferId(Number(e.target.value))}
-            className="w-full text-xs border dark:border-gray-700 dark:bg-gray-900 rounded px-2 py-1.5"
-          >
-            {agents.filter((a) => a.id !== me?.id).map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.display_name}（{a.status === 'active' ? '接待中' : a.status === 'resting' ? '休息中' : '离线'}）
-              </option>
-            ))}
-          </select>
-          <input
+      <Modal
+        open={showTransfer}
+        title="转接给同事"
+        okText="确认转接"
+        cancelText="取消"
+        okButtonProps={{ disabled: !transferId }}
+        onOk={submitTransfer}
+        onCancel={() => setShowTransfer(false)}
+      >
+        <Space direction="vertical" size={8} className="w-full">
+          <Select
+            value={transferId || undefined}
+            placeholder="选择同事"
+            style={{ width: '100%' }}
+            options={otherAgents.map((a) => ({
+              value: a.id,
+              label: `${a.display_name}（${a.status === 'active' ? '接待中' : a.status === 'resting' ? '休息中' : '离线'}）`,
+            }))}
+            onChange={(value) => setTransferId(value)}
+          />
+          <Input
             value={transferNote}
             onChange={(e) => setTransferNote(e.target.value)}
             placeholder="交接备注（内部可见，可选）"
-            className="w-full text-xs border dark:border-gray-700 dark:bg-gray-900 rounded px-2 py-1.5 outline-none"
           />
-          <div className="flex gap-2">
-            <button onClick={submitTransfer} className="text-xs bg-primary-600 text-white rounded px-3 py-1.5">
-              确认转接
-            </button>
-            <button onClick={() => setShowTransfer(false)} className="text-xs text-gray-500 px-3 py-1.5">
-              取消
-            </button>
-          </div>
-        </div>
-      )}
+        </Space>
+      </Modal>
 
       {conversation.summary && (
         <div className="bg-amber-50/70 dark:bg-amber-950/30 border-b border-amber-100 dark:border-amber-900/50 px-4 py-1.5">
-          <button
+          <Button
+            type="text"
+            size="small"
+            icon={summaryOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
             onClick={() => setSummaryOpen(!summaryOpen)}
-            className="flex items-center gap-1 text-xs text-amber-700 dark:text-amber-400 font-medium"
+            className="!text-amber-700 dark:!text-amber-400 !font-medium"
           >
-            {summaryOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
             会话小结
-          </button>
+          </Button>
           {summaryOpen && (
             <p className="text-xs text-amber-600 dark:text-amber-400/80 mt-1 leading-relaxed whitespace-pre-wrap">
               {conversation.summary}
@@ -403,40 +416,48 @@ export default function ChatWindow({
 
       {conversation.status === 'open' && (
         <div className={clsx('border-t dark:border-gray-700 px-3 pt-1.5 pb-2.5 bg-white dark:bg-gray-900', noteMode && 'bg-amber-50/60 dark:bg-amber-950/20')}>
-          <div className="flex items-center gap-0.5 mb-1 relative">
-            <button
-              onClick={() => setShowEmoji(!showEmoji)}
-              title="表情 / 快捷回复见右侧"
-              className={clsx(
-                'p-1.5 rounded-lg',
-                showEmoji ? 'bg-primary-50 text-primary-600' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800',
+          <Space size={0} className="mb-1">
+            <Dropdown
+              open={showEmoji}
+              onOpenChange={setShowEmoji}
+              trigger={['click']}
+              dropdownRender={() => (
+                <Card size="small" styles={{ body: { padding: 6 } }}>
+                  <Space size={4}>
+                    {EMOJIS.map((em) => (
+                      <Button
+                        key={em}
+                        type="text"
+                        size="small"
+                        onClick={() => {
+                          onDraftChange(draft + em)
+                          setShowEmoji(false)
+                        }}
+                      >
+                        {em}
+                      </Button>
+                    ))}
+                  </Space>
+                </Card>
               )}
             >
-              <Smile size={16} />
-            </button>
-            {showEmoji && (
-              <div className="absolute bottom-8 left-0 z-10 bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg shadow-pop px-2 py-1.5 flex gap-1">
-                {EMOJIS.map((em) => (
-                  <button
-                    key={em}
-                    onClick={() => {
-                      onDraftChange(draft + em)
-                      setShowEmoji(false)
-                    }}
-                    className="w-7 h-7 hover:bg-gray-50 dark:hover:bg-gray-700 rounded text-base"
-                  >
-                    {em}
-                  </button>
-                ))}
-              </div>
-            )}
-            <button
-              onClick={() => fileRef.current?.click()}
+              <Button
+                type="text"
+                size="small"
+                icon={<Smile size={16} />}
+                title="表情 / 快捷回复见右侧"
+                aria-label="表情"
+                className={showEmoji ? '!bg-primary-50 !text-primary-600' : undefined}
+              />
+            </Dropdown>
+            <Button
+              type="text"
+              size="small"
+              icon={<ImagePlus size={16} />}
               title="发送图片"
-              className="p-1.5 rounded-lg text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
-            >
-              <ImagePlus size={16} />
-            </button>
+              aria-label="发送图片"
+              onClick={() => fileRef.current?.click()}
+            />
             <input
               ref={fileRef}
               type="file"
@@ -448,36 +469,44 @@ export default function ChatWindow({
                 e.target.value = ''
               }}
             />
-            <button
-              onClick={() => setNoteMode(!noteMode)}
+            <Button
+              type="text"
+              size="small"
+              icon={<StickyNote size={16} />}
               title="内部备注（仅客服可见，不发给用户）"
-              className={clsx(
-                'p-1.5 rounded-lg flex items-center gap-1',
-                noteMode ? 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800',
-              )}
+              aria-label="内部备注"
+              onClick={() => setNoteMode(!noteMode)}
+              className={noteMode ? '!bg-amber-100 !text-amber-700 dark:!bg-amber-950 dark:!text-amber-400' : undefined}
             >
-              <StickyNote size={16} />
-              {noteMode && <span className="text-[10px] font-medium">备注</span>}
-            </button>
-          </div>
+              {noteMode ? <span className="text-[10px] font-medium">备注</span> : null}
+            </Button>
+          </Space>
 
           <div className="relative">
             {hashHits.length > 0 && (
-              <div className="absolute bottom-full left-0 right-0 mb-1 bg-white dark:bg-gray-800 border dark:border-gray-700 rounded-lg shadow-pop max-h-40 overflow-y-auto z-10">
+              <Card
+                size="small"
+                className="absolute bottom-full left-0 right-0 mb-1 z-10 shadow-pop"
+                styles={{ body: { padding: 4, maxHeight: 160, overflowY: 'auto' } }}
+              >
                 {hashHits.slice(0, 8).map((qr) => (
-                  <button
+                  <Button
                     key={qr.id}
+                    type="text"
+                    block
                     onClick={() => onDraftChange(qr.content)}
-                    className="w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-700"
+                    className="!h-auto !justify-start !whitespace-normal !px-3 !py-1.5"
                   >
-                    <span className="text-primary-600 font-medium">#{qr.title}</span>
-                    <span className="text-gray-400 ml-2">{qr.agent_id ? '我的' : '团队'}</span>
-                    <div className="text-gray-500 truncate">{qr.content}</div>
-                  </button>
+                    <div className="w-full text-left text-xs">
+                      <span className="text-primary-600 font-medium">#{qr.title}</span>
+                      <span className="text-gray-400 ml-2">{qr.agent_id ? '我的' : '团队'}</span>
+                      <div className="text-gray-500 truncate">{qr.content}</div>
+                    </div>
+                  </Button>
                 ))}
-              </div>
+              </Card>
             )}
-            <textarea
+            <Input.TextArea
               value={draft}
               onChange={(e) => onDraftChange(e.target.value)}
               onKeyDown={(e) => {
@@ -500,23 +529,19 @@ export default function ChatWindow({
                     : '输入回复内容…（Enter 发送）'
               }
               rows={2}
-              className={clsx(
-                'w-full border rounded-lg px-3 py-2 text-sm resize-none outline-none dark:text-gray-100 pr-16',
-                noteMode
-                  ? 'border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/40 focus:border-amber-400'
-                  : 'dark:border-gray-700 dark:bg-gray-800 focus:border-primary-500',
-              )}
+              style={{ paddingRight: 64, resize: 'none' }}
+              className={noteMode ? '!border-amber-300 !bg-amber-50 dark:!border-amber-800 dark:!bg-amber-950/40' : undefined}
             />
-            <button
+            <Button
+              type="primary"
+              size="small"
               onClick={() => send()}
               disabled={sending || !draft.trim()}
-              className={clsx(
-                'absolute right-2 bottom-2 text-[12px] px-2.5 py-1 rounded disabled:opacity-40',
-                noteMode ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-primary-600 text-white hover:bg-primary-700',
-              )}
+              className="!absolute right-2 bottom-2"
+              style={noteMode ? { background: '#f59e0b', borderColor: '#f59e0b' } : undefined}
             >
               发送
-            </button>
+            </Button>
           </div>
         </div>
       )}

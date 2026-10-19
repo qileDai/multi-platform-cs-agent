@@ -1,7 +1,9 @@
 import clsx from 'clsx'
 import dayjs from 'dayjs'
 import { CheckCircle2, PenSquare, Plus, ShieldAlert, ShieldCheck, Sparkles, XCircle } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Alert, Button, Checkbox, Input, Modal, Select, Space, Tabs, Tag } from 'antd'
 import { api, ContentItem, ContentVersion, KeywordSuggestion, TitleSuggestion } from '../api/client'
 import Empty from '../components/ui/Empty'
 import Skeleton from '../components/ui/Skeleton'
@@ -18,10 +20,10 @@ const STATUS_LABEL: Record<string, string> = {
   archived: '已归档',
 }
 
-const COMPLIANCE_STYLE: Record<string, { label: string; cls: string; icon: any }> = {
-  pending: { label: '待检测', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400', icon: ShieldAlert },
-  passed: { label: '合规通过', cls: 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400', icon: ShieldCheck },
-  failed: { label: '合规未过', cls: 'bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-400', icon: XCircle },
+const COMPLIANCE_STYLE: Record<string, { label: string; color: string; icon: LucideIcon }> = {
+  pending: { label: '待检测', color: 'default', icon: ShieldAlert },
+  passed: { label: '合规通过', color: 'success', icon: ShieldCheck },
+  failed: { label: '合规未过', color: 'error', icon: XCircle },
 }
 
 // 一稿多版变体风格与平台标签统一从 utils/labels 引入（与后端 creator/nodes.py VARIANT_STYLES 对应）
@@ -30,6 +32,12 @@ const COMPLIANCE_STYLE: Record<string, { label: string; cls: string; icon: any }
 const PLATFORM_SPECS: Record<string, { titleMax: number; bodyMax: number; tagMax: number }> = {
   xiaohongshu: { titleMax: 20, bodyMax: 1000, tagMax: 10 },
   douyin: { titleMax: 55, bodyMax: 300, tagMax: 5 },
+}
+
+function versionTabLabel(version: ContentVersion, versions: ContentVersion[]): string {
+  const hasSibling = versions.some((x) => x.id !== version.id && x.platform === version.platform)
+  const variantTag = hasSibling ? ` ${variantLabel(version.variant_no)}` : ''
+  return `${PLATFORM_LABEL[version.platform] || version.platform} · ${version.content_type === 'video' ? '视频' : '图文'}${variantTag}`
 }
 
 export default function ContentStudio() {
@@ -190,6 +198,7 @@ export default function ContentStudio() {
   }
 
   const version: ContentVersion | undefined = current?.versions?.[activeVersion]
+  const versions = current?.versions || []
 
   return (
     <div className="h-full flex bg-gray-50 dark:bg-gray-950">
@@ -197,9 +206,7 @@ export default function ContentStudio() {
       <div className="w-64 shrink-0 border-r dark:border-gray-700 bg-white dark:bg-gray-900 flex flex-col">
         <div className="px-4 py-3 border-b dark:border-gray-700 flex items-center justify-between">
           <span className="text-sm font-medium text-gray-800 dark:text-gray-100">内容列表</span>
-          <button onClick={createItem} className="text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded p-1">
-            <Plus size={16} />
-          </button>
+          <Button type="text" icon={<Plus size={16} />} onClick={createItem} aria-label="新建内容" />
         </div>
         <div className="flex-1 overflow-y-auto">
           {loading ? (
@@ -217,12 +224,12 @@ export default function ContentStudio() {
                 )}
               >
                 <div className="text-sm text-gray-800 dark:text-gray-100 truncate">{item.title}</div>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-xs text-gray-400">{STATUS_LABEL[item.status] || item.status}</span>
+                <Space size={8} className="mt-1">
+                  <Tag>{STATUS_LABEL[item.status] || item.status}</Tag>
                   <span className="text-xs text-gray-300 dark:text-gray-600">
                     {dayjs(item.updated_at).format('MM-DD HH:mm')}
                   </span>
-                </div>
+                </Space>
               </div>
             ))
           )}
@@ -238,31 +245,20 @@ export default function ContentStudio() {
             <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-5 py-3">
               <div className="text-sm font-medium text-gray-800 dark:text-gray-100">{current.title}</div>
               <div className="text-xs text-gray-400 mt-0.5">主题：{current.topic}</div>
-              {/* 版本 Tab */}
-              <div className="flex gap-1 mt-2 flex-wrap">
-                {(current.versions || []).map((v, i) => {
-                  // 同平台多版本（一稿多版）时显示变体序号与风格
-                  const hasSibling = (current.versions || []).some((x) => x.id !== v.id && x.platform === v.platform)
-                  const variantTag = hasSibling ? ` ${variantLabel(v.variant_no)}` : ''
-                  return (
-                  <button
-                    key={v.id}
-                    onClick={() => setActiveVersion(i)}
-                    className={clsx(
-                      'px-3 py-1.5 text-xs rounded-t border-b-2 -mb-px',
-                      i === activeVersion
-                        ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-medium'
-                        : 'border-transparent text-gray-500 hover:text-gray-700 dark:hover:text-gray-300',
-                    )}
-                  >
-                    {PLATFORM_LABEL[v.platform] || v.platform} · {v.content_type === 'video' ? '视频' : '图文'}{variantTag}
-                  </button>
-                  )
-                })}
-                {(current.versions || []).length === 0 && (
-                  <span className="text-xs text-gray-400 py-1.5">还没有版本，请先在右侧生成</span>
-                )}
-              </div>
+              {versions.length === 0 ? (
+                <span className="text-xs text-gray-400 py-1.5">还没有版本，请先在右侧生成</span>
+              ) : (
+                <Tabs
+                  className="[&_.ant-tabs-content-holder]:hidden"
+                  size="small"
+                  activeKey={String(activeVersion)}
+                  onChange={(key) => setActiveVersion(Number(key))}
+                  items={versions.map((v, i) => ({
+                    key: String(i),
+                    label: versionTabLabel(v, versions),
+                  }))}
+                />
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto p-5">
@@ -272,38 +268,34 @@ export default function ContentStudio() {
             </div>
 
             {/* 审批流操作区：draft→提交审核；reviewing→管理员通过/驳回；驳回原因展示 */}
-            {current.status === 'draft' && (current.versions || []).length > 0 && (
-              <div className="px-5 py-3 border-t dark:border-gray-700 bg-white dark:bg-gray-900 space-y-2">
-                {current.review_note && (
-                  <div className="text-xs text-red-500 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded p-2">
-                    上次驳回原因：{current.review_note}
-                  </div>
-                )}
-                <button
-                  onClick={submit}
-                  className="flex items-center gap-1.5 text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700"
-                >
-                  <CheckCircle2 size={15} /> 提交审核（要求全部版本合规通过）
-                </button>
+            {current.status === 'draft' && versions.length > 0 && (
+              <div className="px-5 py-3 border-t dark:border-gray-700 bg-white dark:bg-gray-900">
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {current.review_note && (
+                    <Alert type="error" message={`上次驳回原因：${current.review_note}`} />
+                  )}
+                  <Button type="primary" icon={<CheckCircle2 size={15} />} onClick={submit}>
+                    提交审核（要求全部版本合规通过）
+                  </Button>
+                </Space>
               </div>
             )}
             {current.status === 'reviewing' && (
               <div className="px-5 py-3 border-t dark:border-gray-700 bg-white dark:bg-gray-900">
                 {isAdmin ? (
-                  <div className="flex items-center gap-2">
-                    <button
+                  <Space>
+                    <Button
+                      type="primary"
+                      icon={<CheckCircle2 size={15} />}
                       onClick={() => review('approve')}
-                      className="flex items-center gap-1.5 text-sm bg-green-600 text-white rounded-lg px-4 py-2 hover:bg-green-700"
+                      style={{ backgroundColor: '#16a34a', borderColor: '#16a34a' }}
                     >
-                      <CheckCircle2 size={15} /> 审批通过
-                    </button>
-                    <button
-                      onClick={() => review('reject')}
-                      className="flex items-center gap-1.5 text-sm bg-red-50 text-red-500 dark:bg-red-900/30 rounded-lg px-4 py-2 hover:bg-red-100"
-                    >
-                      <XCircle size={15} /> 驳回
-                    </button>
-                  </div>
+                      审批通过
+                    </Button>
+                    <Button danger icon={<XCircle size={15} />} onClick={() => review('reject')}>
+                      驳回
+                    </Button>
+                  </Space>
                 ) : (
                   <div className="text-xs text-gray-400">等待管理员审批（审批权限：admin）</div>
                 )}
@@ -319,63 +311,60 @@ export default function ContentStudio() {
           <div className="flex items-center gap-1.5 text-sm font-medium text-gray-800 dark:text-gray-100">
             <Sparkles size={15} className="text-blue-500" /> AI 生成
           </div>
-          <div className="mt-3 space-y-3">
+          <Space direction="vertical" size={12} style={{ width: '100%' }} className="mt-3">
             <div>
               <label className="text-xs text-gray-500 dark:text-gray-400">目标平台</label>
-              <div className="flex gap-2 mt-1">
+              <Space className="mt-1">
                 {['xiaohongshu', 'douyin'].map((p) => (
-                  <label key={p} className="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300">
-                    <input
-                      type="checkbox"
-                      checked={genForm.platforms.includes(p)}
-                      onChange={(e) =>
-                        setGenForm({
-                          ...genForm,
-                          platforms: e.target.checked
-                            ? [...genForm.platforms, p]
-                            : genForm.platforms.filter((x) => x !== p),
-                        })
-                      }
-                    />
+                  <Checkbox
+                    key={p}
+                    checked={genForm.platforms.includes(p)}
+                    onChange={(e) =>
+                      setGenForm({
+                        ...genForm,
+                        platforms: e.target.checked
+                          ? [...genForm.platforms, p]
+                          : genForm.platforms.filter((x) => x !== p),
+                      })
+                    }
+                  >
                     {PLATFORM_LABEL[p]}
-                  </label>
+                  </Checkbox>
                 ))}
-              </div>
+              </Space>
             </div>
             <div>
               <label className="text-xs text-gray-500 dark:text-gray-400">内容形态</label>
-              <select
+              <Select
                 value={genForm.content_type}
-                onChange={(e) => setGenForm({ ...genForm, content_type: e.target.value })}
-                className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-              >
-                <option value="note">图文笔记</option>
-                <option value="video">短视频（口播脚本）</option>
-              </select>
+                onChange={(value) => setGenForm({ ...genForm, content_type: value })}
+                style={{ width: '100%', marginTop: 4 }}
+                options={[
+                  { value: 'note', label: '图文笔记' },
+                  { value: 'video', label: '短视频（口播脚本）' },
+                ]}
+              />
             </div>
             <div>
               <label className="text-xs text-gray-500 dark:text-gray-400">每平台版数（一稿多版 A/B）</label>
-              <select
+              <Select<number>
                 value={genForm.variants}
-                onChange={(e) => setGenForm({ ...genForm, variants: Number(e.target.value) })}
-                className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-              >
-                <option value={1}>1 版（默认风格）</option>
-                <option value={2}>2 版（测评风 + 提问风）</option>
-                <option value={3}>3 版（测评 + 提问 + 清单）</option>
-              </select>
+                onChange={(value) => setGenForm({ ...genForm, variants: value })}
+                style={{ width: '100%', marginTop: 4 }}
+                options={[
+                  { value: 1, label: '1 版（默认风格）' },
+                  { value: 2, label: '2 版（测评风 + 提问风）' },
+                  { value: 3, label: '3 版（测评 + 提问 + 清单）' },
+                ]}
+              />
             </div>
-            <button
-              onClick={generate}
-              disabled={generating}
-              className="w-full text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700 disabled:opacity-50"
-            >
+            <Button type="primary" block disabled={generating} onClick={generate}>
               {generating ? '提交中...' : '开始生成（含合规检测）'}
-            </button>
+            </Button>
             <p className="text-xs text-gray-400 leading-relaxed">
               生成后自动进行合规双审（违禁词库 + AI 审核），未通过会自动改写最多 2 次，仍不合规则转人工修改。
             </p>
-          </div>
+          </Space>
         </div>
       )}
     </div>
@@ -443,214 +432,178 @@ function VersionEditor({
   const suggestions = version.compliance_report?.suggestions || []
 
   return (
-    <div className="max-w-2xl space-y-4">
-      {/* 合规状态 */}
-      <div className="flex items-center gap-2">
-        <span className={clsx('flex items-center gap-1 text-xs rounded px-2 py-1', style.cls)}>
-          <Icon size={13} /> {style.label}
-        </span>
-        {/* 查重 badge：>0.9 红色警告（发布会被软拦截），0.7-0.9 黄色提示 */}
-        {(version.dup_report?.max_similarity ?? 0) > 0.9 ? (
-          <span className="text-xs bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-400 rounded px-2 py-1"
-            title={`与版本 #${version.dup_report.similar_version_id} 相似度过高，发布需确认`}>
-            查重 {(version.dup_report.max_similarity! * 100).toFixed(0)}% 高相似
-          </span>
-        ) : (version.dup_report?.max_similarity ?? 0) > 0.7 ? (
-          <span className="text-xs bg-amber-100 text-amber-600 dark:bg-amber-900/40 dark:text-amber-400 rounded px-2 py-1"
-            title={`与版本 #${version.dup_report.similar_version_id} 较相似，建议差异化改写`}>
-            查重 {(version.dup_report.max_similarity! * 100).toFixed(0)}%
-          </span>
-        ) : (version.dup_report?.checked_at ? (
-          <span className="text-xs bg-gray-100 text-gray-400 dark:bg-gray-800 rounded px-2 py-1">
-            查重通过
-          </span>
-        ) : null)}
-        <button
-          onClick={() => onRecheck(version)}
-          className="text-xs text-blue-600 hover:underline"
-        >
-          重新检测
-        </button>
-      </div>
+    <div className="max-w-2xl">
+      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Space wrap>
+          <Tag color={style.color} icon={<Icon size={13} />}>{style.label}</Tag>
+          {/* 查重 badge：>0.9 红色警告（发布会被软拦截），0.7-0.9 黄色提示 */}
+          {(version.dup_report?.max_similarity ?? 0) > 0.9 ? (
+            <Tag color="error" title={`与版本 #${version.dup_report.similar_version_id} 相似度过高，发布需确认`}>
+              查重 {(version.dup_report.max_similarity! * 100).toFixed(0)}% 高相似
+            </Tag>
+          ) : (version.dup_report?.max_similarity ?? 0) > 0.7 ? (
+            <Tag color="warning" title={`与版本 #${version.dup_report.similar_version_id} 较相似，建议差异化改写`}>
+              查重 {(version.dup_report.max_similarity! * 100).toFixed(0)}%
+            </Tag>
+          ) : (version.dup_report?.checked_at ? (
+            <Tag>查重通过</Tag>
+          ) : null)}
+          <Button type="link" size="small" onClick={() => onRecheck(version)}>重新检测</Button>
+        </Space>
 
-      {/* 合规报告 */}
-      {hits.length > 0 && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3">
-          <div className="text-xs font-medium text-red-600 dark:text-red-400 mb-1">命中问题：</div>
-          {hits.map((h, i) => (
-            <div key={i} className="text-xs text-red-500 dark:text-red-400">
-              · 「{h.word}」{h.reason}（{h.severity}）
-            </div>
-          ))}
-          {suggestions.length > 0 && (
-            <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-              建议：{suggestions.join('；')}
-            </div>
-          )}
-        </div>
-      )}
-
-      <Field label="标题" extra={<SpecCounter current={form.title.length} max={spec?.titleMax} />}>
-        <div className="flex items-center gap-2">
-          <input
-            value={form.title}
-            onChange={(e) => setForm({ ...form, title: e.target.value })}
-            className="flex-1 border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-          />
-          <button
-            onClick={async () => {
-              setTitlesLoading(true)
-              setTitles(null)
-              try {
-                const res = await api.suggestTitles(version.id)
-                setTitles(res.titles)
-              } catch (e: any) {
-                toast.error(e.message || '标题助手失败')
-                setTitles(null)
-              } finally {
-                setTitlesLoading(false)
-              }
-            }}
-            disabled={titlesLoading}
-            className="shrink-0 text-xs bg-purple-50 text-purple-600 dark:bg-purple-900/40 dark:text-purple-400 rounded-lg px-3 py-2 hover:bg-purple-100 disabled:opacity-50"
-          >
-            {titlesLoading ? '生成中...' : '标题助手'}
-          </button>
-        </div>
-      </Field>
-      {/* 标题助手结果：点击应用 */}
-      {titles && (
-        <div className="border dark:border-gray-700 rounded-lg divide-y dark:divide-gray-800 max-h-64 overflow-y-auto">
-          {titles.length === 0 && (
-            <div className="p-3 text-xs text-gray-400">未生成候选标题</div>
-          )}
-          {titles.map((t, i) => (
-            <button
-              key={i}
-              onClick={() => {
-                setForm({ ...form, title: t.text })
-                setTitles(null)
-                toast.success('已应用标题（记得保存）')
-              }}
-              className="w-full text-left px-3 py-2 hover:bg-blue-50 dark:hover:bg-blue-900/20"
-            >
-              <div className="text-sm text-gray-800 dark:text-gray-100">{t.text}</div>
-              <div className="text-xs text-gray-400 mt-0.5">
-                {t.formula} · 潜力 {Math.round(t.score)}
+        {hits.length > 0 && (
+          <Alert
+            type="error"
+            message="命中问题："
+            description={(
+              <div>
+                {hits.map((h, i) => (
+                  <div key={i}>· 「{h.word}」{h.reason}（{h.severity}）</div>
+                ))}
+                {suggestions.length > 0 && (
+                  <div className="mt-2">建议：{suggestions.join('；')}</div>
+                )}
               </div>
-            </button>
-          ))}
-        </div>
-      )}
-      <Field label="正文" extra={<SpecCounter current={form.body.length} max={spec?.bodyMax} />}>
-        <textarea
-          value={form.body}
-          onChange={(e) => setForm({ ...form, body: e.target.value })}
-          rows={8}
-          className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-        />
-      </Field>
-      {version.content_type === 'video' && (
-        <Field label="口播脚本">
-          <textarea
-            value={form.script}
-            onChange={(e) => setForm({ ...form, script: e.target.value })}
-            rows={5}
-            className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
+            )}
+          />
+        )}
+
+        <Field label="标题" extra={<SpecCounter current={form.title.length} max={spec?.titleMax} />}>
+          <Space.Compact style={{ width: '100%' }}>
+            <Input
+              value={form.title}
+              onChange={(e) => setForm({ ...form, title: e.target.value })}
+            />
+            <Button
+              disabled={titlesLoading}
+              onClick={async () => {
+                setTitlesLoading(true)
+                setTitles(null)
+                try {
+                  const res = await api.suggestTitles(version.id)
+                  setTitles(res.titles)
+                } catch (e: any) {
+                  toast.error(e.message || '标题助手失败')
+                  setTitles(null)
+                } finally {
+                  setTitlesLoading(false)
+                }
+              }}
+            >
+              {titlesLoading ? '生成中...' : '标题助手'}
+            </Button>
+          </Space.Compact>
+        </Field>
+        {titles && (
+          <div className="border dark:border-gray-700 rounded-lg divide-y dark:divide-gray-800 max-h-64 overflow-y-auto">
+            {titles.length === 0 && (
+              <div className="p-3 text-xs text-gray-400">未生成候选标题</div>
+            )}
+            {titles.map((t, i) => (
+              <Button
+                key={i}
+                type="text"
+                block
+                style={{ height: 'auto', padding: '8px 12px', textAlign: 'left', whiteSpace: 'normal' }}
+                onClick={() => {
+                  setForm({ ...form, title: t.text })
+                  setTitles(null)
+                  toast.success('已应用标题（记得保存）')
+                }}
+              >
+                <div className="text-sm text-gray-800 dark:text-gray-100">{t.text}</div>
+                <div className="text-xs text-gray-400 mt-0.5">
+                  {t.formula} · 潜力 {Math.round(t.score)}
+                </div>
+              </Button>
+            ))}
+          </div>
+        )}
+        <Field label="正文" extra={<SpecCounter current={form.body.length} max={spec?.bodyMax} />}>
+          <Input.TextArea
+            value={form.body}
+            onChange={(e) => setForm({ ...form, body: e.target.value })}
+            rows={8}
           />
         </Field>
-      )}
-      <Field label="封面文案">
-        <input
-          value={form.cover_text}
-          onChange={(e) => setForm({ ...form, cover_text: e.target.value })}
-          className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-        />
-      </Field>
-      <Field
-        label="话题标签（逗号分隔）"
-        extra={
-          <span className="flex items-center gap-2">
-            <button
-              onClick={loadKeywords}
-              disabled={keywordsLoading}
-              className="text-xs text-emerald-600 hover:underline disabled:opacity-50"
-            >
-              {keywordsLoading ? '分析中...' : '关键词埋词'}
-            </button>
-            <SpecCounter current={tagCount} max={spec?.tagMax} />
-          </span>
-        }
-      >
-        <input
-          value={form.tags}
-          onChange={(e) => setForm({ ...form, tags: e.target.value })}
-          className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-        />
-      </Field>
-      {/* 关键词埋词结果：推荐词 + 覆盖 badge + 一键加入话题标签 */}
-      {keywords && (
-        <div className="border dark:border-gray-700 rounded-lg divide-y dark:divide-gray-800 max-h-56 overflow-y-auto">
-          {keywords.length === 0 && <div className="p-3 text-xs text-gray-400">未生成推荐关键词</div>}
-          {keywords.map((k, i) => (
-            <div key={i} className="flex items-center gap-2 px-3 py-2">
-              <span className="text-sm text-gray-800 dark:text-gray-100">{k.word}</span>
-              <span className={clsx('text-xs rounded px-1.5 py-0.5',
-                k.heat === '高' ? 'bg-red-50 text-red-500 dark:bg-red-900/30'
-                  : k.heat === '中' ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/30'
-                    : 'bg-gray-100 text-gray-400 dark:bg-gray-800')}>
-                {k.heat}
-              </span>
-              <span className="flex-1" />
-              {k.covered ? (
-                <span className="text-xs bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400 rounded px-1.5 py-0.5">已覆盖</span>
-              ) : (
-                <button
-                  onClick={() => appendTag(k.word)}
-                  className="text-xs text-blue-600 hover:underline"
-                >
-                  加入标签
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-      <Field label="首评引流话术（发布成功后 1-3 分钟自动发顶层评论；{code} 自动替换暗号；留空不发）">
-        <input
-          value={form.first_comment}
-          onChange={(e) => setForm({ ...form, first_comment: e.target.value })}
-          placeholder="如：需要报价单的宝子私信我回复【{code}】"
-          className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-        />
-        <div className="text-xs text-gray-400 mt-1">
-          首评禁止出现微信/电话等联系方式（引流词零容忍），只能引导私信 + 暗号
-        </div>
-      </Field>
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() =>
-            onSave(version, {
-              title: form.title,
-              body: form.body,
-              script: form.script,
-              cover_text: form.cover_text,
-              tags: form.tags.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
-              first_comment: form.first_comment,
-            })
+        {version.content_type === 'video' && (
+          <Field label="口播脚本">
+            <Input.TextArea
+              value={form.script}
+              onChange={(e) => setForm({ ...form, script: e.target.value })}
+              rows={5}
+            />
+          </Field>
+        )}
+        <Field label="封面文案">
+          <Input
+            value={form.cover_text}
+            onChange={(e) => setForm({ ...form, cover_text: e.target.value })}
+          />
+        </Field>
+        <Field
+          label="话题标签（逗号分隔）"
+          extra={
+            <Space size={8}>
+              <Button type="link" size="small" disabled={keywordsLoading} onClick={loadKeywords}>
+                {keywordsLoading ? '分析中...' : '关键词埋词'}
+              </Button>
+              <SpecCounter current={tagCount} max={spec?.tagMax} />
+            </Space>
           }
-          className="text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700"
         >
-          保存修改
-        </button>
-        <button
-          onClick={() => setShowPreview(true)}
-          className="text-sm bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 rounded-lg px-4 py-2 hover:bg-gray-200"
-        >
-          预览
-        </button>
-      </div>
-      {showPreview && <PreviewCard version={version} form={form} onClose={() => setShowPreview(false)} />}
+          <Input
+            value={form.tags}
+            onChange={(e) => setForm({ ...form, tags: e.target.value })}
+          />
+        </Field>
+        {keywords && (
+          <div className="border dark:border-gray-700 rounded-lg divide-y dark:divide-gray-800 max-h-56 overflow-y-auto">
+            {keywords.length === 0 && <div className="p-3 text-xs text-gray-400">未生成推荐关键词</div>}
+            {keywords.map((k, i) => (
+              <div key={i} className="flex items-center gap-2 px-3 py-2">
+                <span className="text-sm text-gray-800 dark:text-gray-100">{k.word}</span>
+                <Tag color={k.heat === '高' ? 'red' : k.heat === '中' ? 'gold' : 'default'}>{k.heat}</Tag>
+                <span className="flex-1" />
+                {k.covered ? (
+                  <Tag color="success">已覆盖</Tag>
+                ) : (
+                  <Button type="link" size="small" onClick={() => appendTag(k.word)}>加入标签</Button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <Field label="首评引流话术（发布成功后 1-3 分钟自动发顶层评论；{code} 自动替换暗号；留空不发）">
+          <Input
+            value={form.first_comment}
+            onChange={(e) => setForm({ ...form, first_comment: e.target.value })}
+            placeholder="如：需要报价单的宝子私信我回复【{code}】"
+          />
+          <div className="text-xs text-gray-400 mt-1">
+            首评禁止出现微信/电话等联系方式（引流词零容忍），只能引导私信 + 暗号
+          </div>
+        </Field>
+        <Space>
+          <Button
+            type="primary"
+            onClick={() =>
+              onSave(version, {
+                title: form.title,
+                body: form.body,
+                script: form.script,
+                cover_text: form.cover_text,
+                tags: form.tags.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+                first_comment: form.first_comment,
+              })
+            }
+          >
+            保存修改
+          </Button>
+          <Button onClick={() => setShowPreview(true)}>预览</Button>
+        </Space>
+        {showPreview && <PreviewCard version={version} form={form} onClose={() => setShowPreview(false)} />}
+      </Space>
     </div>
   )
 }
@@ -689,60 +642,57 @@ function PreviewCard({
 }) {
   const tags = form.tags.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
   return (
-    <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center" onClick={onClose}>
-      <div className="rounded-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="w-[320px] max-h-[75vh] overflow-y-auto bg-white dark:bg-gray-900 rounded-xl shadow-pop overflow-hidden">
-          {version.content_type === 'video' ? (
-            <>
-              {/* 视频：封面 + 标题 + 简介 + 口播脚本 */}
-              <div className="aspect-[9/16] max-h-72 bg-gradient-to-br from-gray-800 to-black flex items-center justify-center p-4">
-                <div className="text-white text-center text-lg font-medium leading-relaxed">
-                  {form.cover_text || '封面文案'}
+    <Modal
+      open
+      title="预览"
+      onCancel={onClose}
+      footer={<Button block onClick={onClose}>关闭预览</Button>}
+      width={360}
+      centered
+    >
+      <div className="max-h-[75vh] overflow-y-auto">
+        {version.content_type === 'video' ? (
+          <>
+            <div className="aspect-[9/16] max-h-72 bg-gradient-to-br from-gray-800 to-black flex items-center justify-center p-4">
+              <div className="text-white text-center text-lg font-medium leading-relaxed">
+                {form.cover_text || '封面文案'}
+              </div>
+            </div>
+            <div className="p-3 space-y-2">
+              <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{form.title || '（无标题）'}</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400 whitespace-pre-wrap">{form.body}</div>
+              {form.script && (
+                <div className="border-t dark:border-gray-700 pt-2">
+                  <div className="text-xs font-medium text-gray-400 mb-1">口播脚本</div>
+                  <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap leading-relaxed">{form.script}</div>
                 </div>
+              )}
+              <div className="text-xs text-blue-500">{tags.map((t) => `#${t}`).join(' ')}</div>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="aspect-square bg-gradient-to-br from-rose-100 to-orange-50 dark:from-gray-800 dark:to-gray-700 flex items-center justify-center p-6">
+              <div className="text-xl font-bold text-gray-800 dark:text-gray-100 text-center leading-relaxed">
+                {form.cover_text || '封面文案'}
               </div>
-              <div className="p-3 space-y-2">
-                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{form.title || '（无标题）'}</div>
-                <div className="text-xs text-gray-500 dark:text-gray-400 whitespace-pre-wrap">{form.body}</div>
-                {form.script && (
-                  <div className="border-t dark:border-gray-700 pt-2">
-                    <div className="text-xs font-medium text-gray-400 mb-1">口播脚本</div>
-                    <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap leading-relaxed">{form.script}</div>
+            </div>
+            <div className="p-3 space-y-2">
+              <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{form.title || '（无标题）'}</div>
+              <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap leading-relaxed">{form.body}</div>
+              <div className="text-xs text-blue-500">{tags.map((t) => `#${t}`).join(' ')}</div>
+              {form.first_comment && (
+                <div className="border-t dark:border-gray-700 pt-2">
+                  <div className="text-xs text-gray-400 mb-1">首评预览（发布后暗号自动替换 {'{code}'}）</div>
+                  <div className="text-xs bg-gray-100 dark:bg-gray-800 rounded-lg px-2 py-1.5 text-gray-600 dark:text-gray-300">
+                    {form.first_comment.replace('{code}', '暗号')}
                   </div>
-                )}
-                <div className="text-xs text-blue-500">{tags.map((t) => `#${t}`).join(' ')}</div>
-              </div>
-            </>
-          ) : (
-            <>
-              {/* 图文：小红书笔记样式卡（封面文案块 + 标题 + 正文 + 话题 + 首评气泡） */}
-              <div className="aspect-square bg-gradient-to-br from-rose-100 to-orange-50 dark:from-gray-800 dark:to-gray-700 flex items-center justify-center p-6">
-                <div className="text-xl font-bold text-gray-800 dark:text-gray-100 text-center leading-relaxed">
-                  {form.cover_text || '封面文案'}
                 </div>
-              </div>
-              <div className="p-3 space-y-2">
-                <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">{form.title || '（无标题）'}</div>
-                <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap leading-relaxed">{form.body}</div>
-                <div className="text-xs text-blue-500">{tags.map((t) => `#${t}`).join(' ')}</div>
-                {form.first_comment && (
-                  <div className="border-t dark:border-gray-700 pt-2">
-                    <div className="text-xs text-gray-400 mb-1">首评预览（发布后暗号自动替换 {'{code}'}）</div>
-                    <div className="text-xs bg-gray-100 dark:bg-gray-800 rounded-lg px-2 py-1.5 text-gray-600 dark:text-gray-300">
-                      {form.first_comment.replace('{code}', '暗号')}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-        <button
-          onClick={onClose}
-          className="mt-3 w-full text-xs bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 rounded-lg py-2 hover:bg-gray-100"
-        >
-          关闭预览
-        </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
-    </div>
+    </Modal>
   )
 }

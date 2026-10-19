@@ -9,6 +9,10 @@ html, body, #root {
     'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
 }
 
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

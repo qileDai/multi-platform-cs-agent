@@ -1,20 +1,12 @@
-import clsx from 'clsx'
+import { Button, Card, Pagination, Select, Space, Tabs, Tag, Typography } from 'antd'
 import dayjs from 'dayjs'
-import { ClipboardList } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, Ticket } from '../api/client'
-import Empty from '../components/ui/Empty'
-import Skeleton from '../components/ui/Skeleton'
 import { toast } from '../components/ui/toast'
 import { subscribeWs } from '../store'
 
-const STATUS_TABS = [
-  { key: '', label: '全部' },
-  { key: 'open', label: '待处理' },
-  { key: 'processing', label: '处理中' },
-  { key: 'done', label: '已完成' },
-]
+const { Title, Text, Paragraph } = Typography
 
 const TYPE_LABEL: Record<string, string> = {
   refund: '退款退货',
@@ -22,10 +14,10 @@ const TYPE_LABEL: Record<string, string> = {
   other: '其他',
 }
 
-const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
-  open: { label: '待处理', cls: 'bg-orange-100 text-orange-600' },
-  processing: { label: '处理中', cls: 'bg-blue-100 text-blue-600' },
-  done: { label: '已完成', cls: 'bg-green-100 text-green-600' },
+const STATUS_STYLE: Record<string, { label: string; color: string }> = {
+  open: { label: '待处理', color: 'orange' },
+  processing: { label: '处理中', color: 'blue' },
+  done: { label: '已完成', color: 'green' },
 }
 
 export default function Tickets() {
@@ -38,10 +30,14 @@ export default function Tickets() {
   const navigate = useNavigate()
 
   const load = useCallback(async () => {
-    const data = await api.listTickets(tab, page)
-    setTickets(data.items)
-    setTotal(data.total)
-    setLoading(false)
+    setLoading(true)
+    try {
+      const data = await api.listTickets(tab, page)
+      setTickets(data.items)
+      setTotal(data.total)
+    } finally {
+      setLoading(false)
+    }
   }, [tab, page])
 
   useEffect(() => {
@@ -52,7 +48,6 @@ export default function Tickets() {
     api.listAgents().then(setAgents).catch(() => setAgents([]))
   }, [])
 
-  // AI 工具自动建单时实时刷新
   useEffect(
     () =>
       subscribeWs((event) => {
@@ -67,152 +62,82 @@ export default function Tickets() {
     load()
   }
 
-  const totalPages = Math.max(1, Math.ceil(total / 20))
-
   return (
-    <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-950">
-      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6 py-4">
-        <h1 className="text-lg font-medium text-gray-800 dark:text-gray-100">工单管理</h1>
-        <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">AI 自动创建或客服手动创建的售后/物流工单</p>
-      </div>
-
-      {/* 状态筛选 */}
-      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6 flex gap-1">
-        {STATUS_TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => {
-              setTab(t.key)
-              setPage(1)
-            }}
-            className={clsx(
-              'px-4 py-2.5 text-sm border-b-2 -mb-px transition-colors',
-              tab === t.key
-                ? 'border-blue-600 text-blue-600 dark:text-blue-400 dark:border-blue-400 font-medium'
-                : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200',
-            )}
-          >
-            {t.label}
-          </button>
+    <div className="h-full overflow-auto p-6">
+      <Title level={4} style={{ marginBottom: 4 }}>工单管理</Title>
+      <Text type="secondary">AI 自动创建或客服手动创建的售后/物流工单</Text>
+      <Tabs
+        className="mt-2"
+        activeKey={tab}
+        onChange={(key) => { setTab(key); setPage(1) }}
+        items={[
+          { key: '', label: '全部' },
+          { key: 'open', label: '待处理' },
+          { key: 'processing', label: '处理中' },
+          { key: 'done', label: '已完成' },
+        ]}
+      />
+      {loading ? null : tickets.length === 0 ? (
+        <Text type="secondary">暂无工单。AI 识别到退款/物流等诉求时会自动建单</Text>
+      ) : null}
+      <Space direction="vertical" size={12} style={{ width: '100%', maxWidth: 880 }}>
+        {tickets.map((ticket) => (
+          <Card key={ticket.id} loading={loading} size="small">
+            <Space wrap>
+              <Text type="secondary" code>{ticket.ticket_no}</Text>
+              <Tag>{TYPE_LABEL[ticket.type] || ticket.type}</Tag>
+              <Tag color={STATUS_STYLE[ticket.status]?.color}>{STATUS_STYLE[ticket.status]?.label || ticket.status}</Tag>
+              <Text type="secondary">{dayjs(ticket.updated_at).format('MM-DD HH:mm')}</Text>
+            </Space>
+            <div className="mt-2 font-medium">{ticket.title}</div>
+            {ticket.assignee_name ? <Text type="secondary">负责人：{ticket.assignee_name}</Text> : null}
+            {ticket.content ? <Paragraph type="secondary" style={{ marginBottom: 0 }}>{ticket.content}</Paragraph> : null}
+            <Space className="mt-3" wrap>
+              {ticket.status === 'open' && (
+                <Button size="small" onClick={() => setStatus(ticket, 'processing')}>开始处理</Button>
+              )}
+              {ticket.status === 'processing' && (
+                <Button size="small" type="primary" onClick={() => setStatus(ticket, 'done')}>标记完成</Button>
+              )}
+              {ticket.status === 'done' && (
+                <Button size="small" onClick={() => setStatus(ticket, 'open')}>重新打开</Button>
+              )}
+              {ticket.status !== 'done' && (
+                <Select
+                  size="small"
+                  placeholder="指派给…"
+                  value={ticket.assignee_id || undefined}
+                  style={{ width: 140 }}
+                  options={agents.map((a) => ({ value: a.id, label: a.display_name }))}
+                  onChange={async (id) => {
+                    if (!id) return
+                    await api.assignTicket(ticket.id, id)
+                    toast.success('工单已指派')
+                    load()
+                  }}
+                />
+              )}
+              <Button
+                type="link"
+                size="small"
+                onClick={() => navigate('/', { state: { conversationId: ticket.conversation_id } })}
+              >
+                查看会话
+              </Button>
+            </Space>
+          </Card>
         ))}
-      </div>
-
-      {/* 工单列表 */}
-      <div className="flex-1 overflow-y-auto p-6">
-        {loading ? (
-          <Skeleton rows={4} className="max-w-4xl" />
-        ) : tickets.length === 0 ? (
-          <Empty
-            icon={ClipboardList}
-            title="暂无工单"
-            hint="AI 识别到退款/物流等诉求时会自动建单"
-          />
-        ) : null}
-        <div className="space-y-3 max-w-4xl">
-          {tickets.map((ticket) => (
-            <div key={ticket.id} className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-mono text-gray-400">{ticket.ticket_no}</span>
-                <span className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 rounded px-2 py-0.5">
-                  {TYPE_LABEL[ticket.type] || ticket.type}
-                </span>
-                <span
-                  className={clsx(
-                    'text-xs rounded px-2 py-0.5',
-                    STATUS_STYLE[ticket.status]?.cls,
-                  )}
-                >
-                  {STATUS_STYLE[ticket.status]?.label || ticket.status}
-                </span>
-                <span className="flex-1" />
-                <span className="text-xs text-gray-400">
-                  {dayjs(ticket.updated_at).format('MM-DD HH:mm')}
-                </span>
-              </div>
-              <div className="mt-2 font-medium text-gray-800 dark:text-gray-100 text-sm">{ticket.title}</div>
-              {ticket.assignee_name && (
-                <div className="text-[11px] text-gray-400 mt-0.5">负责人：{ticket.assignee_name}</div>
-              )}
-              {ticket.content && (
-                <div className="mt-1 text-xs text-gray-500 dark:text-gray-400 leading-relaxed">{ticket.content}</div>
-              )}
-              <div className="mt-3 flex items-center gap-2">
-                {ticket.status === 'open' && (
-                  <button
-                    onClick={() => setStatus(ticket, 'processing')}
-                    className="text-xs bg-yellow-500 text-white rounded px-3 py-1.5 hover:bg-yellow-600"
-                  >
-                    开始处理
-                  </button>
-                )}
-                {ticket.status === 'processing' && (
-                  <button
-                    onClick={() => setStatus(ticket, 'done')}
-                    className="text-xs bg-green-500 text-white rounded px-3 py-1.5 hover:bg-green-600"
-                  >
-                    标记完成
-                  </button>
-                )}
-                {ticket.status === 'done' && (
-                  <button
-                    onClick={() => setStatus(ticket, 'open')}
-                    className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 rounded px-3 py-1.5 hover:bg-gray-200 dark:hover:bg-gray-700"
-                  >
-                    重新打开
-                  </button>
-                )}
-                {ticket.status !== 'done' && (
-                  <select
-                    value={ticket.assignee_id || ''}
-                    onChange={async (e) => {
-                      const id = Number(e.target.value)
-                      if (!id) return
-                      await api.assignTicket(ticket.id, id)
-                      toast.success('工单已指派')
-                      load()
-                    }}
-                    className="text-xs border dark:border-gray-700 dark:bg-gray-800 rounded px-2 py-1.5"
-                  >
-                    <option value="">指派给…</option>
-                    {agents.map((a) => (
-                      <option key={a.id} value={a.id}>{a.display_name}</option>
-                    ))}
-                  </select>
-                )}
-                <button
-                  onClick={() => navigate('/', { state: { conversationId: ticket.conversation_id } })}
-                  className="text-xs text-blue-600 hover:underline px-2 py-1.5"
-                >
-                  查看会话 →
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* 分页 */}
-        {totalPages > 1 && (
-          <div className="flex gap-2 mt-6 max-w-4xl justify-center">
-            <button
-              disabled={page <= 1}
-              onClick={() => setPage(page - 1)}
-              className="text-xs border rounded px-3 py-1.5 disabled:opacity-30"
-            >
-              上一页
-            </button>
-            <span className="text-xs text-gray-400 py-1.5">
-              {page} / {totalPages}
-            </span>
-            <button
-              disabled={page >= totalPages}
-              onClick={() => setPage(page + 1)}
-              className="text-xs border rounded px-3 py-1.5 disabled:opacity-30"
-            >
-              下一页
-            </button>
-          </div>
-        )}
-      </div>
+      </Space>
+      {total > 20 && (
+        <Pagination
+          className="mt-6"
+          current={page}
+          pageSize={20}
+          total={total}
+          showSizeChanger={false}
+          onChange={setPage}
+        />
+      )}
     </div>
   )
 }

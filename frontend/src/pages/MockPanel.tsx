@@ -1,4 +1,4 @@
-import { FlaskConical, Send } from 'lucide-react'
+import { Alert, Button, Card, Input, Space, Typography } from 'antd'
 import { FormEvent, useEffect, useState } from 'react'
 import { api, type Message } from '../api/client'
 import { toast } from '../components/ui/toast'
@@ -139,88 +139,48 @@ export default function MockPanel() {
   }
 
   return (
-    <div className="h-full overflow-y-auto bg-gray-50 dark:bg-gray-950 p-6">
-      <div className="max-w-2xl mx-auto mb-4 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded-xl px-4 py-2.5 flex items-center gap-2 text-xs text-amber-700 dark:text-amber-400">
-        <FlaskConical size={14} />
-        <span>
-          <b>演示模式</b>：模拟用户发私信。本页会记下原话、检索结论和回复，刷新后仍从会话读取。
-        </span>
-      </div>
-
+    <div className="h-full overflow-auto p-6">
+      <Alert className="max-w-2xl mx-auto !mb-4" type="warning" showIcon message="演示模式：模拟用户发私信。本页会记下原话、检索结论和回复，刷新后仍从会话读取。" />
       <div className="max-w-2xl mx-auto space-y-4">
-        <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">扮演用户</div>
-          <div className="flex gap-2 mb-3">
+        <Card title="扮演用户">
+          <Space className="mb-3">
             {PLATFORMS.map((p) => (
-              <button
-                key={p.key}
-                onClick={() => setPlatform(p.key)}
-                className={`text-xs px-3.5 py-1.5 rounded-full text-white transition-all ${p.className} ${platform === p.key ? 'ring-2 ring-offset-1 ring-blue-300' : 'opacity-40'}`}
-              >
+              <Button key={p.key} type={platform === p.key ? 'primary' : 'default'} onClick={() => setPlatform(p.key)}>
                 {p.label}
-              </button>
+              </Button>
             ))}
-          </div>
-          <div className="flex gap-2 mb-3">
-            <input
-              className="w-36 border dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-              value={userId}
-              onChange={(e) => setUserId(e.target.value)}
-              placeholder="用户 ID"
-            />
-            <input
-              className="flex-1 border dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-              value={nickname}
-              onChange={(e) => setNickname(e.target.value)}
-              placeholder="昵称"
-            />
-          </div>
-          <form onSubmit={send} className="flex gap-2">
-            <input
-              className="flex-1 border dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500"
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              placeholder="输入用户消息..."
-            />
-            <button
-              disabled={waiting}
-              className="bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-sm rounded-lg px-5 flex items-center gap-1.5"
-            >
-              <Send size={13} />
-              {waiting ? '等待回复' : '发送'}
-            </button>
+          </Space>
+          <Space className="mb-3" style={{ width: '100%' }}>
+            <Input style={{ width: 160 }} value={userId} onChange={(e) => setUserId(e.target.value)} placeholder="用户 ID" />
+            <Input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="昵称" />
+          </Space>
+          <form onSubmit={send}>
+            <Space.Compact style={{ width: '100%' }}>
+              <Input value={content} onChange={(e) => setContent(e.target.value)} placeholder="输入用户消息..." />
+              <Button type="primary" htmlType="submit" loading={waiting}>发送</Button>
+            </Space.Compact>
           </form>
-          <div className="flex flex-wrap gap-1.5 mt-3">
+          <Space wrap className="mt-3">
             {PRESET_MESSAGES.map((m) => (
-              <button
-                key={m}
-                onClick={() => setContent(m)}
-                className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-600 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-300 rounded-full px-2.5 py-1"
-              >
-                {m}
-              </button>
+              <Button key={m} size="small" onClick={() => setContent(m)}>{m}</Button>
             ))}
-          </div>
-        </div>
-
-        <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-5">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">对话记录</div>
-          <div className="space-y-3">
+          </Space>
+        </Card>
+        <Card title="对话记录">
+          <Space direction="vertical" style={{ width: '100%' }}>
             {rounds.map((round) => (
-              <div key={round.id} className="border dark:border-gray-800 rounded-lg px-3 py-2 space-y-1">
-                <div className="text-sm text-gray-800 dark:text-gray-100">{round.userText}</div>
-                <div className="text-xs text-gray-500 dark:text-gray-400">
+              <Card key={round.id} size="small">
+                <div>{round.userText}</div>
+                <Typography.Text type="secondary">
                   {round.reason} · 精排分 {round.score}
                   {round.confidence ? ` · ${round.confidence}` : ''}
-                </div>
-                <div className="text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap">
-                  {round.reply || '等待回复'}
-                </div>
-              </div>
+                </Typography.Text>
+                <div className="whitespace-pre-wrap">{round.reply || '等待回复'}</div>
+              </Card>
             ))}
-            {rounds.length === 0 && <div className="text-xs text-gray-300 dark:text-gray-600">暂无记录</div>}
-          </div>
-        </div>
+            {rounds.length === 0 && <Typography.Text type="secondary">暂无记录</Typography.Text>}
+          </Space>
+        </Card>
       </div>
     </div>
   )

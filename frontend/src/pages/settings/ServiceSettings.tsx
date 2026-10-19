@@ -1,6 +1,7 @@
-import clsx from 'clsx'
 import { ListChecks, MessageSquare, Users } from 'lucide-react'
-import { FormEvent, ReactNode, useEffect, useState } from 'react'
+import { ReactNode, useEffect, useState } from 'react'
+import { Button, Card, Checkbox, Form, Input, Modal, Select, Space, Switch, Table, Tabs, Tag } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
 import { api, Agent, BannedWord, QuickReply } from '../../api/client'
 import { confirmDialog } from '../../components/ui/dialogs'
 import Empty from '../../components/ui/Empty'
@@ -13,8 +14,6 @@ import {
   MODULES,
   moduleSummary,
 } from '../../utils/modules'
-
-const fieldClass = 'w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1 outline-none focus:border-blue-500'
 
 type Tab = 'agents' | 'quick' | 'banned'
 type QuickDraft = { id: number | null; title: string; content: string; personal: boolean }
@@ -29,12 +28,6 @@ type AgentDraft = {
   modules: string[]
   unrestricted: boolean
 }
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'agents', label: '客服账号' },
-  { id: 'quick', label: '快捷回复' },
-  { id: 'banned', label: '违禁词' },
-]
 
 const STATUS_LABEL: Record<string, string> = {
   active: '接待中',
@@ -57,35 +50,21 @@ function FormModal({
   onSubmit: () => void
   children: ReactNode
 }) {
+  const [form] = Form.useForm()
   return (
-    <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={onClose}>
-      <form
-        className={clsx(
-          'bg-white dark:bg-gray-800 rounded-2xl shadow-pop p-5 max-h-[90vh] overflow-y-auto',
-          wide ? 'w-[560px]' : 'w-[420px]',
-        )}
-        onClick={(e) => e.stopPropagation()}
-        onSubmit={(e: FormEvent) => {
-          e.preventDefault()
-          onSubmit()
-        }}
-      >
-        <div className="text-sm font-medium text-gray-800 dark:text-gray-100 mb-4">{title}</div>
-        <div className="space-y-3">{children}</div>
-        <div className="flex justify-end gap-2 mt-5">
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-xs px-4 py-2 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
-          >
-            取消
-          </button>
-          <button type="submit" className="text-xs px-4 py-2 rounded-lg text-white bg-blue-600 hover:bg-blue-700 font-medium">
-            {submitText}
-          </button>
-        </div>
-      </form>
-    </div>
+    <Modal
+      open
+      title={title}
+      onCancel={onClose}
+      onOk={() => form.submit()}
+      okText={submitText}
+      cancelText="取消"
+      width={wide ? 560 : 420}
+    >
+      <Form form={form} layout="vertical" requiredMark={false} onFinish={() => { void onSubmit() }}>
+        <div className="max-h-[70vh] overflow-y-auto pr-1">{children}</div>
+      </Form>
+    </Modal>
   )
 }
 
@@ -276,188 +255,185 @@ export default function ServiceSettings() {
   }
 
   const canAdd = tab === 'quick' || isAdmin
-  const hint = tab === 'agents'
-    ? '状态由客服本人在左下角切换。'
-    : tab === 'quick'
-      ? '团队模板所有客服可见；勾选「仅自己」后只在本人工作台出现。'
-      : '出口词过滤 AI/客服回复中的极限词；入口词用于识别用户风险内容。'
+
+  const agentColumns: ColumnsType<Agent> = [
+    { title: '姓名', dataIndex: 'display_name' },
+    { title: '账号', dataIndex: 'username', render: (value: string) => `@${value}` },
+    {
+      title: '角色',
+      dataIndex: 'role',
+      render: (value: string) => <Tag>{value === 'admin' ? '管理员' : '客服'}</Tag>,
+    },
+    { key: 'modules', title: '可见模块', render: (_, row) => moduleSummary(row) },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      render: (value: string) => (
+        <Tag color={value === 'active' ? 'green' : 'default'}>{STATUS_LABEL[value] || value}</Tag>
+      ),
+    },
+    {
+      title: '接待上限',
+      dataIndex: 'max_concurrent',
+      render: (value: number | undefined) => value ?? 20,
+    },
+  ]
+  if (isAdmin) {
+    agentColumns.push({
+      key: 'actions',
+      title: '操作',
+      width: 140,
+      align: 'right',
+      render: (_, row) => (
+        <Space size={0}>
+          <Button
+            type="link"
+            size="small"
+            onClick={() => setAgentDraft({
+              id: row.id,
+              username: row.username,
+              displayName: row.display_name,
+              password: '',
+              role: row.role === 'admin' ? 'admin' : 'agent',
+              maxConcurrent: row.max_concurrent ?? 20,
+              modules: row.modules ?? [...ALL_MODULE_KEYS],
+              unrestricted: row.role !== 'admin' && row.modules == null,
+            })}
+          >
+            编辑
+          </Button>
+          {row.id !== me?.id && (
+            <Button type="link" size="small" danger onClick={() => removeAgent(row)}>删除</Button>
+          )}
+        </Space>
+      ),
+    })
+  }
+
+  const quickColumns: ColumnsType<QuickReply> = [
+    { title: '标题', dataIndex: 'title', width: 160 },
+    { title: '内容', dataIndex: 'content', ellipsis: true },
+    {
+      title: '范围',
+      dataIndex: 'agent_id',
+      width: 90,
+      render: (value: number | null | undefined) => <Tag>{value ? '我的' : '团队'}</Tag>,
+    },
+    {
+      key: 'actions',
+      title: '操作',
+      width: 140,
+      align: 'right',
+      render: (_, row) => (
+        <Space size={0}>
+          <Button
+            type="link"
+            size="small"
+            onClick={() => setQuickDraft({
+              id: row.id,
+              title: row.title,
+              content: row.content,
+              personal: !!row.agent_id,
+            })}
+          >
+            编辑
+          </Button>
+          <Button type="link" size="small" danger onClick={() => removeQuick(row)}>删除</Button>
+        </Space>
+      ),
+    },
+  ]
+
+  const bannedColumns: ColumnsType<BannedWord> = [
+    { title: '词', dataIndex: 'word' },
+    { title: '分类', dataIndex: 'category' },
+    {
+      title: '方向',
+      dataIndex: 'direction',
+      render: (value: string) => <Tag>{value === 'in' ? '入口' : '出口'}</Tag>,
+    },
+  ]
+  if (isAdmin) {
+    bannedColumns.push({
+      key: 'actions',
+      title: '操作',
+      width: 140,
+      align: 'right',
+      render: (_, row) => (
+        <Space size={0}>
+          <Button
+            type="link"
+            size="small"
+            onClick={() => setBannedDraft({
+              id: row.id,
+              word: row.word,
+              category: row.category,
+              direction: row.direction === 'in' ? 'in' : 'out',
+            })}
+          >
+            编辑
+          </Button>
+          <Button type="link" size="small" danger onClick={() => removeBanned(row)}>删除</Button>
+        </Space>
+      ),
+    })
+  }
 
   return (
     <div className="max-w-5xl">
-      <div className="bg-white dark:bg-gray-900 rounded-card shadow-card overflow-hidden">
-        <div className="border-b dark:border-gray-700 px-2 flex items-center gap-1">
-          {TABS.map((item) => (
-            <button
-              key={item.id}
-              onClick={() => setTab(item.id)}
-              className={clsx(
-                'px-4 py-2.5 text-sm border-b-2 -mb-px',
-                tab === item.id
-                  ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-medium'
-                  : 'border-transparent text-gray-500',
-              )}
-            >
-              {item.label}
-            </button>
-          ))}
-          <span className="flex-1" />
-          {canAdd && (
-            <button
-              onClick={openCreate}
-              className="text-xs px-3 py-1.5 my-1.5 mr-2 rounded-lg text-white bg-blue-600 hover:bg-blue-700"
-            >
-              新增
-            </button>
-          )}
-        </div>
-        <div className="px-4 py-2 text-xs text-gray-400 border-b dark:border-gray-800">{hint}</div>
-
-        {tab === 'agents' && (
-          agents.length === 0 ? (
-            <Empty icon={Users} title="暂无客服账号" />
-          ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-gray-400 text-left border-b dark:border-gray-700">
-                  <th className="px-4 py-2.5 font-normal">姓名</th>
-                  <th className="px-2 py-2.5 font-normal">账号</th>
-                  <th className="px-2 py-2.5 font-normal">角色</th>
-                  <th className="px-2 py-2.5 font-normal">可见模块</th>
-                  <th className="px-2 py-2.5 font-normal">状态</th>
-                  <th className="px-2 py-2.5 font-normal">接待上限</th>
-                  {isAdmin && <th className="px-4 py-2.5 font-normal w-28 text-right">操作</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {agents.map((a) => (
-                  <tr key={a.id} className="border-b border-gray-50 dark:border-gray-800">
-                    <td className="px-4 py-2.5 text-gray-800 dark:text-gray-100">{a.display_name}</td>
-                    <td className="px-2 py-2.5 text-gray-500">@{a.username}</td>
-                    <td className="px-2 py-2.5 text-gray-500">{a.role === 'admin' ? '管理员' : '客服'}</td>
-                    <td className="px-2 py-2.5 text-gray-500">{moduleSummary(a)}</td>
-                    <td className={`px-2 py-2.5 ${a.status === 'active' ? 'text-green-600' : 'text-gray-400'}`}>
-                      {STATUS_LABEL[a.status] || a.status}
-                    </td>
-                    <td className="px-2 py-2.5 text-gray-500">{a.max_concurrent ?? 20}</td>
-                    {isAdmin && (
-                      <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={() => setAgentDraft({
-                            id: a.id,
-                            username: a.username,
-                            displayName: a.display_name,
-                            password: '',
-                            role: a.role === 'admin' ? 'admin' : 'agent',
-                            maxConcurrent: a.max_concurrent ?? 20,
-                            modules: a.modules ?? [...ALL_MODULE_KEYS],
-                            unrestricted: a.role !== 'admin' && a.modules == null,
-                          })}
-                          className="text-blue-500 hover:text-blue-700 mr-3"
-                        >
-                          编辑
-                        </button>
-                        {a.id !== me?.id && (
-                          <button onClick={() => removeAgent(a)} className="text-red-400 hover:text-red-600">
-                            删除
-                          </button>
-                        )}
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )
-        )}
-
-        {tab === 'quick' && (
-          quickReplies.length === 0 ? (
-            <Empty icon={MessageSquare} title="暂无快捷回复" hint="点击新增，写一条像真人说话的模板" />
-          ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-gray-400 text-left border-b dark:border-gray-700">
-                  <th className="px-4 py-2.5 font-normal w-36">标题</th>
-                  <th className="px-2 py-2.5 font-normal">内容</th>
-                  <th className="px-2 py-2.5 font-normal w-20">范围</th>
-                  <th className="px-4 py-2.5 font-normal w-28 text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {quickReplies.map((q) => (
-                  <tr key={q.id} className="border-b border-gray-50 dark:border-gray-800">
-                    <td className="px-4 py-2.5 text-gray-800 dark:text-gray-100">{q.title}</td>
-                    <td className="px-2 py-2.5 text-gray-500 max-w-md">
-                      <div className="truncate" title={q.content}>{q.content}</div>
-                    </td>
-                    <td className="px-2 py-2.5 text-gray-400">{q.agent_id ? '我的' : '团队'}</td>
-                    <td className="px-4 py-2.5 text-right">
-                      <button
-                        onClick={() => setQuickDraft({
-                          id: q.id,
-                          title: q.title,
-                          content: q.content,
-                          personal: !!q.agent_id,
-                        })}
-                        className="text-blue-500 hover:text-blue-700 mr-3"
-                      >
-                        编辑
-                      </button>
-                      <button onClick={() => removeQuick(q)} className="text-red-400 hover:text-red-600">
-                        删除
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )
-        )}
-
-        {tab === 'banned' && (
-          banned.length === 0 ? (
-            <Empty icon={ListChecks} title="暂无自定义违禁词" hint={isAdmin ? '点击新增，写入出口或入口词' : '管理员添加后会显示在这里'} />
-          ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-gray-400 text-left border-b dark:border-gray-700">
-                  <th className="px-4 py-2.5 font-normal">词</th>
-                  <th className="px-2 py-2.5 font-normal">分类</th>
-                  <th className="px-2 py-2.5 font-normal">方向</th>
-                  {isAdmin && <th className="px-4 py-2.5 font-normal w-28 text-right">操作</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {banned.map((w) => (
-                  <tr key={w.id} className="border-b border-gray-50 dark:border-gray-800">
-                    <td className="px-4 py-2.5 text-gray-800 dark:text-gray-100">{w.word}</td>
-                    <td className="px-2 py-2.5 text-gray-500">{w.category}</td>
-                    <td className="px-2 py-2.5 text-gray-400">{w.direction === 'in' ? '入口' : '出口'}</td>
-                    {isAdmin && (
-                      <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={() => setBannedDraft({
-                            id: w.id,
-                            word: w.word,
-                            category: w.category,
-                            direction: w.direction === 'in' ? 'in' : 'out',
-                          })}
-                          className="text-blue-500 hover:text-blue-700 mr-3"
-                        >
-                          编辑
-                        </button>
-                        <button onClick={() => removeBanned(w)} className="text-red-400 hover:text-red-600">
-                          删除
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )
-        )}
-      </div>
+      <Card styles={{ body: { paddingTop: 0 } }}>
+        <Tabs
+          activeKey={tab}
+          onChange={(key) => setTab(key as Tab)}
+          tabBarExtraContent={canAdd ? (
+            <Button type="primary" size="small" onClick={openCreate}>新增</Button>
+          ) : null}
+          items={[
+            {
+              key: 'agents',
+              label: '客服账号',
+              children: (
+                <>
+                  <div className="text-xs text-gray-400 mb-3">状态由客服本人在左下角切换。</div>
+                  {agents.length === 0 ? (
+                    <Empty icon={Users} title="暂无客服账号" />
+                  ) : (
+                    <Table rowKey="id" size="small" pagination={false} columns={agentColumns} dataSource={agents} />
+                  )}
+                </>
+              ),
+            },
+            {
+              key: 'quick',
+              label: '快捷回复',
+              children: (
+                <>
+                  <div className="text-xs text-gray-400 mb-3">团队模板所有客服可见；勾选「仅自己」后只在本人工作台出现。</div>
+                  {quickReplies.length === 0 ? (
+                    <Empty icon={MessageSquare} title="暂无快捷回复" hint="点击新增，写一条像真人说话的模板" />
+                  ) : (
+                    <Table rowKey="id" size="small" pagination={false} columns={quickColumns} dataSource={quickReplies} />
+                  )}
+                </>
+              ),
+            },
+            {
+              key: 'banned',
+              label: '违禁词',
+              children: (
+                <>
+                  <div className="text-xs text-gray-400 mb-3">出口词过滤 AI/客服回复中的极限词；入口词用于识别用户风险内容。</div>
+                  {banned.length === 0 ? (
+                    <Empty icon={ListChecks} title="暂无自定义违禁词" hint={isAdmin ? '点击新增，写入出口或入口词' : '管理员添加后会显示在这里'} />
+                  ) : (
+                    <Table rowKey="id" size="small" pagination={false} columns={bannedColumns} dataSource={banned} />
+                  )}
+                </>
+              ),
+            },
+          ]}
+        />
+      </Card>
 
       {agentDraft && (
         <FormModal
@@ -468,64 +444,54 @@ export default function ServiceSettings() {
           onSubmit={saveAgent}
         >
           {agentDraft.id == null ? (
-            <label className="block text-xs text-gray-500 dark:text-gray-400">
-              账号
-              <input
+            <Form.Item label="账号">
+              <Input
                 value={agentDraft.username}
                 onChange={(e) => setAgentDraft({ ...agentDraft, username: e.target.value })}
-                className={fieldClass}
                 autoFocus
               />
-            </label>
+            </Form.Item>
           ) : (
-            <div className="text-xs text-gray-400">账号 @{agentDraft.username}</div>
+            <div className="text-xs text-gray-400 mb-3">账号 @{agentDraft.username}</div>
           )}
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            姓名
-            <input
+          <Form.Item label="姓名">
+            <Input
               value={agentDraft.displayName}
               onChange={(e) => setAgentDraft({ ...agentDraft, displayName: e.target.value })}
-              className={fieldClass}
               autoFocus={agentDraft.id != null}
             />
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            {agentDraft.id == null ? '密码' : '新密码'}
-            <input
-              type="password"
+          </Form.Item>
+          <Form.Item label={agentDraft.id == null ? '密码' : '新密码'}>
+            <Input.Password
               value={agentDraft.password}
               onChange={(e) => setAgentDraft({ ...agentDraft, password: e.target.value })}
               placeholder={agentDraft.id == null ? '' : '留空则不修改'}
-              className={fieldClass}
             />
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            角色
-            <select
+          </Form.Item>
+          <Form.Item label="角色">
+            <Select
               value={agentDraft.role}
               disabled={agentDraft.id === me?.id}
-              onChange={(e) => setAgentDraft({ ...agentDraft, role: e.target.value === 'admin' ? 'admin' : 'agent' })}
-              className={fieldClass}
-            >
-              <option value="agent">客服</option>
-              <option value="admin">管理员</option>
-            </select>
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            接待上限
-            <input
+              onChange={(value) => setAgentDraft({ ...agentDraft, role: value === 'admin' ? 'admin' : 'agent' })}
+              options={[
+                { value: 'agent', label: '客服' },
+                { value: 'admin', label: '管理员' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item label="接待上限">
+            <Input
               type="number"
               min={0}
               value={agentDraft.maxConcurrent}
               onChange={(e) => setAgentDraft({ ...agentDraft, maxConcurrent: Number(e.target.value) })}
-              className={fieldClass}
             />
-          </label>
+          </Form.Item>
           <div className="text-xs text-gray-500 dark:text-gray-400">
             <div className="flex items-center gap-2 mb-2">
               <span>可见模块</span>
               {agentDraft.role === 'agent' && (
-                <span className="ml-auto flex gap-1">
+                <Space size={4} style={{ marginLeft: 'auto' }}>
                   {(
                     [
                       ['客服组', CS_MODULE_KEYS],
@@ -533,16 +499,16 @@ export default function ServiceSettings() {
                       ['全选', ALL_MODULE_KEYS],
                     ] as const
                   ).map(([label, keys]) => (
-                    <button
+                    <Button
                       key={label}
-                      type="button"
+                      size="small"
+                      htmlType="button"
                       onClick={() => setAgentDraft({ ...agentDraft, modules: [...keys], unrestricted: false })}
-                      className="px-2 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
                     >
                       {label}
-                    </button>
+                    </Button>
                   ))}
-                </span>
+                </Space>
               )}
             </div>
             {agentDraft.role === 'admin' ? (
@@ -566,20 +532,19 @@ export default function ServiceSettings() {
                       <div className="text-[11px] text-gray-400 mb-1">{title}</div>
                       <div className="grid grid-cols-4 gap-1.5">
                         {MODULES.filter((item) => item.group === group).map((item) => (
-                          <label key={item.key} className="flex items-center gap-1.5 text-gray-700 dark:text-gray-200">
-                            <input
-                              type="checkbox"
-                              checked={agentDraft.modules.includes(item.key)}
-                              onChange={() => {
-                                const has = agentDraft.modules.includes(item.key)
-                                const modules = has
-                                  ? agentDraft.modules.filter((key) => key !== item.key)
-                                  : [...agentDraft.modules, item.key]
-                                setAgentDraft({ ...agentDraft, modules, unrestricted: false })
-                              }}
-                            />
+                          <Checkbox
+                            key={item.key}
+                            checked={agentDraft.modules.includes(item.key)}
+                            onChange={() => {
+                              const has = agentDraft.modules.includes(item.key)
+                              const modules = has
+                                ? agentDraft.modules.filter((key) => key !== item.key)
+                                : [...agentDraft.modules, item.key]
+                              setAgentDraft({ ...agentDraft, modules, unrestricted: false })
+                            }}
+                          >
                             {item.label}
-                          </label>
+                          </Checkbox>
                         ))}
                       </div>
                     </div>
@@ -598,33 +563,28 @@ export default function ServiceSettings() {
           onClose={() => setQuickDraft(null)}
           onSubmit={saveQuick}
         >
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            标题
-            <input
+          <Form.Item label="标题">
+            <Input
               value={quickDraft.title}
               onChange={(e) => setQuickDraft({ ...quickDraft, title: e.target.value })}
-              className={fieldClass}
               autoFocus
             />
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            内容
-            <textarea
+          </Form.Item>
+          <Form.Item label="内容">
+            <Input.TextArea
               value={quickDraft.content}
               onChange={(e) => setQuickDraft({ ...quickDraft, content: e.target.value })}
               rows={4}
               placeholder="口语化，像真人说话"
-              className={fieldClass}
             />
-          </label>
-          <label className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-2">
-            <input
-              type="checkbox"
+          </Form.Item>
+          <Space>
+            <Switch
               checked={quickDraft.personal}
-              onChange={(e) => setQuickDraft({ ...quickDraft, personal: e.target.checked })}
+              onChange={(checked) => setQuickDraft({ ...quickDraft, personal: checked })}
             />
-            仅自己
-          </label>
+            <span className="text-xs text-gray-500 dark:text-gray-400">仅自己</span>
+          </Space>
         </FormModal>
       )}
 
@@ -635,35 +595,30 @@ export default function ServiceSettings() {
           onClose={() => setBannedDraft(null)}
           onSubmit={saveBanned}
         >
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            违禁词
-            <input
+          <Form.Item label="违禁词">
+            <Input
               value={bannedDraft.word}
               onChange={(e) => setBannedDraft({ ...bannedDraft, word: e.target.value })}
-              className={fieldClass}
               autoFocus
             />
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            分类
-            <input
+          </Form.Item>
+          <Form.Item label="分类">
+            <Input
               value={bannedDraft.category}
               onChange={(e) => setBannedDraft({ ...bannedDraft, category: e.target.value })}
               placeholder="极限词"
-              className={fieldClass}
             />
-          </label>
-          <label className="block text-xs text-gray-500 dark:text-gray-400">
-            方向
-            <select
+          </Form.Item>
+          <Form.Item label="方向">
+            <Select
               value={bannedDraft.direction}
-              onChange={(e) => setBannedDraft({ ...bannedDraft, direction: e.target.value === 'in' ? 'in' : 'out' })}
-              className={fieldClass}
-            >
-              <option value="out">出口（过滤回复）</option>
-              <option value="in">入口（识别用户风险）</option>
-            </select>
-          </label>
+              onChange={(value) => setBannedDraft({ ...bannedDraft, direction: value === 'in' ? 'in' : 'out' })}
+              options={[
+                { value: 'out', label: '出口（过滤回复）' },
+                { value: 'in', label: '入口（识别用户风险）' },
+              ]}
+            />
+          </Form.Item>
         </FormModal>
       )}
     </div>

@@ -1,5 +1,6 @@
+import { Alert, Button, Form, Input } from 'antd'
 import { Bot, MessageSquare, ShieldCheck, Sparkles, Zap } from 'lucide-react'
-import { FormEvent, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../store'
 
@@ -11,19 +12,16 @@ const FEATURES = [
 ]
 
 export default function Login() {
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const { login } = useAuth()
   const navigate = useNavigate()
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault()
+  const submit = async (values: { username: string; password: string }) => {
     setLoading(true)
     setError('')
     try {
-      await login(username, password)
+      await login(values.username, values.password)
       navigate('/')
     } catch (err) {
       setError(err instanceof Error && err.message ? err.message : '用户名或密码错误')
@@ -34,7 +32,6 @@ export default function Login() {
 
   return (
     <div className="h-full flex">
-      {/* 左侧品牌视觉区 */}
       <div className="hidden lg:flex flex-1 bg-gradient-to-br from-primary-700 via-primary-600 to-teal-700 text-white flex-col justify-center px-14 relative overflow-hidden">
         <div className="absolute -top-24 -right-24 w-72 h-72 rounded-full bg-white/10" />
         <div className="absolute -bottom-32 -left-16 w-96 h-96 rounded-full bg-white/5" />
@@ -63,9 +60,8 @@ export default function Login() {
         </div>
       </div>
 
-      {/* 右侧表单 */}
       <div className="w-full lg:w-[440px] bg-white dark:bg-gray-900 flex items-center justify-center px-8">
-        <form onSubmit={submit} className="w-full max-w-xs">
+        <div className="w-full max-w-xs">
           <div className="lg:hidden flex items-center gap-2 mb-6 justify-center">
             <div className="w-9 h-9 rounded-xl bg-primary-600 flex items-center justify-center text-white">
               <Sparkles size={18} />
@@ -74,31 +70,19 @@ export default function Login() {
           </div>
           <h2 className="text-xl font-semibold text-gray-800 dark:text-gray-100 mb-1">欢迎回来</h2>
           <p className="text-xs text-gray-400 dark:text-gray-500 mb-6">登录客服工作台开始接待</p>
-          <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">用户名</label>
-          <input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="admin"
-            className="w-full border dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-xl px-3 py-2.5 text-sm mb-4 outline-none focus:border-primary-500"
-            autoFocus
-          />
-          <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">密码</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="••••••••"
-            className="w-full border dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded-xl px-3 py-2.5 text-sm mb-5 outline-none focus:border-primary-500"
-          />
-          {error && <div className="text-red-500 text-xs mb-3">{error}</div>}
-          <button
-            type="submit"
-            disabled={loading || !username || !password}
-            className="w-full bg-primary-600 text-white rounded-xl py-2.5 text-sm font-medium hover:bg-primary-700 disabled:opacity-40 transition-colors"
-          >
-            {loading ? '登录中…' : '登 录'}
-          </button>
-        </form>
+          <Form layout="vertical" onFinish={submit} requiredMark={false}>
+            <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
+              <Input placeholder="admin" autoFocus />
+            </Form.Item>
+            <Form.Item label="密码" name="password" rules={[{ required: true, message: '请输入密码' }]}>
+              <Input.Password placeholder="请输入密码" />
+            </Form.Item>
+            {error ? <Alert type="error" message={error} showIcon className="!mb-4" /> : null}
+            <Button type="primary" htmlType="submit" block loading={loading}>
+              登录
+            </Button>
+          </Form>
+        </div>
       </div>
     </div>
   )

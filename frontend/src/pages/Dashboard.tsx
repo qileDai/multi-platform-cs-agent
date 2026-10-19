@@ -1,3 +1,4 @@
+import { Card, Statistic } from 'antd'
 import {
   Activity,
   Coins,
@@ -87,20 +88,12 @@ export default function Dashboard() {
     <div className="h-full overflow-y-auto bg-gray-50 dark:bg-gray-950 p-6">
       <div className="max-w-5xl mx-auto">
         <h1 className="text-lg font-semibold text-gray-800 dark:text-gray-100 mb-4">数据看板</h1>
-
-        {/* 指标卡 */}
         <div className="grid grid-cols-4 gap-3 mb-5">
           {cards.map((card) => (
-            <div key={card.label} className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-              <div className="flex items-center gap-2">
-                <span className={`w-7 h-7 rounded-lg flex items-center justify-center ${card.color}`}>
-                  <card.icon size={14} />
-                </span>
-                <span className="text-xs text-gray-400 dark:text-gray-500">{card.label}</span>
-              </div>
-              <div className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mt-2">{card.value}</div>
-              {card.hint && <div className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">{card.hint}</div>}
-            </div>
+            <Card key={card.label} size="small">
+              <Statistic title={card.label} value={card.value} />
+              {card.hint ? <div className="text-xs text-gray-400 mt-1">{card.hint}</div> : null}
+            </Card>
           ))}
         </div>
 
@@ -112,8 +105,7 @@ export default function Dashboard() {
 
         <div className="grid grid-cols-3 gap-4 mb-4">
           {/* 会话趋势面积图 */}
-          <div className="col-span-2 bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-            <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">近 7 天会话量</div>
+          <Card className="col-span-2" title="近 7 天会话量">
             <ResponsiveContainer width="100%" height={220}>
               <AreaChart data={trend} margin={{ top: 4, right: 8, left: -18, bottom: 0 }}>
                 <defs>
@@ -129,14 +121,10 @@ export default function Dashboard() {
                 <Area type="monotone" dataKey="count" name="会话数" stroke="#3b82f6" strokeWidth={2} fill="url(#convFill)" />
               </AreaChart>
             </ResponsiveContainer>
-          </div>
+          </Card>
 
           {/* 平台分布 */}
-          <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-            <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3 flex items-center gap-1.5">
-              <PieIcon size={14} className="text-gray-400" />
-              今日平台分布
-            </div>
+          <Card title="今日平台分布">
             {platformTotal === 0 ? (
               <div className="text-xs text-gray-300 dark:text-gray-600 text-center py-10">今日暂无会话</div>
             ) : (
@@ -165,12 +153,10 @@ export default function Dashboard() {
                 })}
               </div>
             )}
-          </div>
+          </Card>
         </div>
 
-        {/* Token 用量柱状图 */}
-        <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">近 7 天 Token 用量</div>
+        <Card className="mt-4" title="近 7 天 Token 用量">
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={tokenUsage} margin={{ top: 4, right: 8, left: -12, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
@@ -182,10 +168,9 @@ export default function Dashboard() {
               <Bar dataKey="total_tokens" name="Token" fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={36} />
             </BarChart>
           </ResponsiveContainer>
-        </div>
+        </Card>
 
-        <div className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4 mt-4">
-          <div className="text-sm font-medium text-gray-700 dark:text-gray-200 mb-3">未命中问题 TOP</div>
+        <Card className="mt-4" title="未命中问题 TOP">
           {missedTop.length === 0 ? (
             <div className="text-xs text-gray-300 dark:text-gray-600 text-center py-6">暂无未命中沉淀</div>
           ) : (
@@ -198,7 +183,7 @@ export default function Dashboard() {
               ))}
             </div>
           )}
-        </div>
+        </Card>
       </div>
     </div>
   )

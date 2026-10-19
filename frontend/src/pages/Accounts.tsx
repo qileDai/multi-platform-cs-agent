@@ -1,6 +1,7 @@
-import clsx from 'clsx'
+import { Alert, Button, Card, Form, Input, Modal, Select, Space, Table, Typography } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
 import dayjs from 'dayjs'
-import { AlertTriangle, KeyRound, Plus, RefreshCw, Trash2, Users } from 'lucide-react'
+import { AlertTriangle, Plus, Users } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api, AccountBindingOverview, AccountHealth, MatrixAccount, RpaReply } from '../api/client'
 import Empty from '../components/ui/Empty'
@@ -8,7 +9,9 @@ import Skeleton from '../components/ui/Skeleton'
 import { confirmDialog, promptDialog } from '../components/ui/dialogs'
 import { toast } from '../components/ui/toast'
 import { useAuth } from '../store'
-import { accountDutyRows, dedupeProfiles, fleetPresence, replyBody, rpaProfileBinding } from '../utils/accountBinding'
+import { accountDutyRows, dedupeProfiles, fleetPresence, replyBody, rpaProfileBinding, type DutyRow } from '../utils/accountBinding'
+
+const { Text } = Typography
 
 const PLATFORM_LABEL: Record<string, string> = {
   douyin: '抖音',
@@ -38,12 +41,6 @@ const ONLINE_LABEL: Record<string, string> = {
   browser_unavailable: '浏览器不可用',
 }
 
-const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
-  active: { label: '正常', cls: 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400' },
-  expired: { label: '授权过期', cls: 'bg-orange-100 text-orange-600 dark:bg-orange-900/40 dark:text-orange-400' },
-  disabled: { label: '已停用', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400' },
-}
-
 const REPLY_KIND: Record<string, string> = {
   text: '私信',
   image: '私信图片',
@@ -57,12 +54,6 @@ const REPLY_STATUS: Record<string, string> = {
   leased: '发送中',
   acked: '已发出',
   failed: '失败',
-}
-
-const HEALTH_DOT: Record<string, string> = {
-  good: 'bg-green-500',
-  warn: 'bg-amber-500',
-  bad: 'bg-red-500',
 }
 
 export default function Accounts() {
@@ -229,6 +220,24 @@ export default function Accounts() {
     }
   }
 
+  const runImport = async () => {
+    const lines = importText.split('\n').map((s) => s.trim()).filter(Boolean)
+    if (lines.length === 0) {
+      toast.error('请粘贴账号清单')
+      return
+    }
+    try {
+      const res = await api.importAccounts(lines)
+      setImportResult(res)
+      if (res.imported > 0) {
+        toast.success(`已导入 ${res.imported} 个账号`)
+        load()
+      }
+    } catch (e: any) {
+      toast.error(e.message || '导入失败')
+    }
+  }
+
   const badAccounts = accounts.filter((a) => health[String(a.id)]?.level === 'bad')
   // 分组筛选（distinct group_name，含计数）
   const groups = Array.from(new Set(accounts.map((a) => a.group_name).filter(Boolean)))
@@ -237,7 +246,192 @@ export default function Accounts() {
     if (!groupFilter) return true
     return groupFilter === '__none__' ? !account.group_name : account.group_name === groupFilter
   }).map((account) => account.id))
-  const visibleRows = dutyRows.filter((row) => visibleAccountIds.has(row.accountId))
+  const visibleRows = dutyRows.filter((row) => visibleAccountIds.has(row.accountId) && accountById.has(row.accountId))
+
+  const describeRow = (row: DutyRow) => {
+    const acc = accountById.get(row.accountId)
+    if (!acc) return null
+    const view = overview?.accounts.find((item) => item.id === acc.id)
+    const name = acc.account_name === '待确认' ? '待确认' : acc.account_name
+    const dutyText = acc.auth_type === 'api'
+      ? '官方 API'
+      : (DUTY_LABEL[row.duty] || row.duty || '—')
+    const auth = acc.auth_type === 'api'
+      ? (acc.has_credentials ? '已授权' : '未授权')
+      : (row.authStatus
+        ? (AUTH_LABEL[row.authStatus] || row.authStatus)
+        : (view?.confirmed ? '已认出账号' : '待确认'))
+    const online = row.workerStatus ? (ONLINE_LABEL[row.workerStatus] || row.workerStatus) : '—'
+    return { acc, view, name, dutyText, auth, online }
+  }
+
+  const columns: ColumnsType<DutyRow> = [
+    {
+      title: '登录账号名',
+      key: 'name',
+      render: (_, row) => {
+        const described = describeRow(row)
+        if (!described) return null
+        return (
+          <div>
+            <div>{described.name}</div>
+            {described.name === '待确认' && described.view?.profile_name ? (
+              <div className="text-xs text-gray-400">{described.view.profile_name}</div>
+            ) : null}
+            {row.workerStatus === 'selector_mismatch' && row.debugFile ? (
+              <div className="text-xs text-red-500">页面快照 {row.debugFile}</div>
+            ) : null}
+            {row.accountTypeMismatch ? (
+              <div className="text-xs text-amber-600">驱动和抖音账号类型不一致</div>
+            ) : null}
+          </div>
+        )
+      },
+    },
+    {
+      title: '平台',
+      key: 'platform',
+      width: 90,
+      render: (_, row) => {
+        const described = describeRow(row)
+        if (!described) return null
+        return PLATFORM_LABEL[described.acc.platform] || described.acc.platform
+      },
+    },
+    {
+      title: '职责',
+      key: 'duty',
+      width: 100,
+      render: (_, row) => describeRow(row)?.dutyText,
+    },
+    {
+      title: 'AdsPower 环境',
+      key: 'env',
+      render: (_, row) => row.envLabel,
+    },
+    {
+      title: '在线状态',
+      key: 'online',
+      width: 120,
+      render: (_, row) => describeRow(row)?.online,
+    },
+    {
+      title: '授权状态',
+      key: 'auth',
+      width: 120,
+      render: (_, row) => describeRow(row)?.auth,
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      align: 'right',
+      width: 220,
+      render: (_, row) => {
+        const described = describeRow(row)
+        if (!described) return null
+        const { acc } = described
+        return (
+          <Space size={0} wrap>
+            {acc.auth_type === 'api' && acc.platform === 'douyin' && (
+              <Button type="link" size="small" onClick={() => goAuth(acc)}>去授权</Button>
+            )}
+            {isAdmin && row.canReopen && row.bindingId != null && (
+              <Button
+                type="link"
+                size="small"
+                onClick={() => {
+                  api.reopenAccountBinding(row.bindingId as number).then(() => {
+                    toast.success('已通知重新打开这个环境，请在弹出的窗口里登录')
+                    load()
+                  }).catch((e: Error) => toast.error(e.message))
+                }}
+              >
+                重新打开
+              </Button>
+            )}
+            {isAdmin && row.canDisable && row.bindingId != null && (
+              <Button
+                type="link"
+                size="small"
+                danger
+                onClick={() => {
+                  api.updateAccountBinding(row.bindingId as number, { auth_status: 'disabled' }).then(() => load())
+                    .catch((e: Error) => toast.error(e.message))
+                }}
+              >
+                停用
+              </Button>
+            )}
+            {isAdmin && row.canEnable && row.bindingId != null && (
+              <Button
+                type="link"
+                size="small"
+                onClick={() => {
+                  api.updateAccountBinding(row.bindingId as number, { auth_status: 'pending_login' }).then(() => {
+                    toast.success('已启用，调度器会重新打开这个环境')
+                    load()
+                  }).catch((e: Error) => toast.error(e.message))
+                }}
+              >
+                启用
+              </Button>
+            )}
+            {isAdmin && row.showDelete && (
+              <Button type="link" size="small" danger onClick={() => remove(acc)}>删除</Button>
+            )}
+          </Space>
+        )
+      },
+    },
+  ]
+
+  const replyColumns: ColumnsType<RpaReply> = [
+    {
+      title: '时间',
+      dataIndex: 'created_at',
+      width: 120,
+      render: (value: string | null) => (value ? dayjs(value).format('MM-DD HH:mm') : '—'),
+    },
+    {
+      title: '账号',
+      dataIndex: 'account',
+      render: (value: string) => value || '—',
+    },
+    {
+      title: '平台',
+      dataIndex: 'platform',
+      width: 90,
+      render: (value: string) => PLATFORM_LABEL[value] || value || '—',
+    },
+    {
+      title: '类型',
+      dataIndex: 'msg_type',
+      width: 100,
+      render: (value: string) => REPLY_KIND[value] || value,
+    },
+    {
+      title: '回复内容',
+      key: 'content',
+      render: (_, item) => (
+        <div style={{ maxWidth: 448 }}>
+          <div className="truncate">{replyBody(item.msg_type, item.content) || '—'}</div>
+          {item.status === 'failed' && item.error ? (
+            <div className="truncate text-xs text-red-500">{item.error}</div>
+          ) : null}
+        </div>
+      ),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 90,
+      render: (value: string) => (
+        <Text type={value === 'failed' ? 'danger' : undefined}>{REPLY_STATUS[value] || value}</Text>
+      ),
+    },
+  ]
+
+  const adsErrors = (overview?.workers || []).map((worker) => worker.ads_error).filter(Boolean)
 
   return (
     <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-950">
@@ -248,95 +442,87 @@ export default function Accounts() {
             一行一个职责。私信和评论要各用一个 AdsPower 环境。登录成功后，账号名先用环境名
           </p>
         </div>
-        <select
+        <Select
+          size="small"
+          className="ml-4"
           value={platformFilter}
-          onChange={(e) => setPlatformFilter(e.target.value)}
-          className="ml-4 border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-2 py-1 text-xs"
-        >
-          <option value="">全部平台</option>
-          <option value="douyin">抖音</option>
-          <option value="xiaohongshu">小红书</option>
-        </select>
+          onChange={setPlatformFilter}
+          style={{ width: 120 }}
+          options={[
+            { value: '', label: '全部平台' },
+            { value: 'douyin', label: '抖音' },
+            { value: 'xiaohongshu', label: '小红书' },
+          ]}
+        />
         <span className="flex-1" />
         {isAdmin && (
-          <>
-            <button
-              onClick={() => { setShowImport(true); setImportResult(null) }}
-              className="flex items-center gap-1.5 text-sm bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 rounded-lg px-4 py-2 hover:bg-gray-200"
-            >
-              批量导入
-            </button>
-            <button
-              onClick={() => { setShowCreate(true); load() }}
-              className="flex items-center gap-1.5 text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700"
-            >
-              <Plus size={15} /> 新建账号
-            </button>
-          </>
+          <Space>
+            <Button onClick={() => { setShowImport(true); setImportResult(null) }}>批量导入</Button>
+            <Button type="primary" icon={<Plus size={15} />} onClick={() => { setShowCreate(true); load() }}>
+              新建账号
+            </Button>
+          </Space>
         )}
       </div>
 
       {overview && fleet === 'running' && (
-        <div className="mx-6 mt-4 rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700 dark:border-green-900/50 dark:bg-green-900/20 dark:text-green-400">
-          调度器在运行。保存绑定后会自动打开对应环境。
-        </div>
+        <Alert className="mx-6 mt-4" type="success" message="调度器在运行。保存绑定后会自动打开对应环境。" />
       )}
       {overview && fleet === 'offline' && (
-        <div className="mx-6 mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
-          调度器已掉线。请在 Worker 电脑重新运行 run_fleet.ps1。
-        </div>
+        <Alert className="mx-6 mt-4" type="warning" message="调度器已掉线。请在 Worker 电脑重新运行 run_fleet.ps1。" />
       )}
       {overview && fleet === 'missing' && (
-        <div className="mx-6 mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
-          请先在 Worker 电脑运行 run_fleet.ps1。环境列表出现后才能从下拉框选择。
-        </div>
+        <Alert className="mx-6 mt-4" type="warning" message="请先在 Worker 电脑运行 run_fleet.ps1。环境列表出现后才能从下拉框选择。" />
       )}
 
-      {(overview?.workers || []).some((worker) => worker.ads_error) && (
-        <div className="mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
-          AdsPower 环境列表没有拉下来：
-          {(overview?.workers || []).map((worker) => worker.ads_error).filter(Boolean).join('；')}
-          。新建账号时可以手填环境 ID。
-        </div>
+      {adsErrors.length > 0 && (
+        <Alert
+          className="mx-6 mt-4"
+          type="error"
+          message={`AdsPower 环境列表没有拉下来：${adsErrors.join('；')}。新建账号时可以手填环境 ID。`}
+        />
       )}
 
       {badAccounts.length > 0 && (
-        <div className="mx-6 mt-4 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
-          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
-          <div>
-            <span className="font-medium">{badAccounts.length} 个账号健康异常：</span>
-            {badAccounts.map((a) => `${a.account_name}（${health[String(a.id)]?.issues[0]?.message || '异常'}）`).join('；')}
-          </div>
-        </div>
+        <Alert
+          className="mx-6 mt-4"
+          type="error"
+          showIcon
+          icon={<AlertTriangle size={16} />}
+          message={(
+            <span>
+              <span className="font-medium">{badAccounts.length} 个账号健康异常：</span>
+              {badAccounts.map((a) => `${a.account_name}（${health[String(a.id)]?.issues[0]?.message || '异常'}）`).join('；')}
+            </span>
+          )}
+        />
       )}
 
       {groups.length > 0 && (
-        <div className="mx-6 mt-4 flex items-center gap-2 flex-wrap">
-          <button
-            onClick={() => setGroupFilter('')}
-            className={clsx('text-xs rounded-full px-3 py-1',
-              !groupFilter ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400')}
-          >
+        <Space className="mx-6 mt-4" wrap>
+          <Button size="small" shape="round" type={!groupFilter ? 'primary' : 'default'} onClick={() => setGroupFilter('')}>
             全部（{accounts.length}）
-          </button>
+          </Button>
           {groups.map((g) => (
-            <button
+            <Button
               key={g}
+              size="small"
+              shape="round"
+              type={groupFilter === g ? 'primary' : 'default'}
               onClick={() => setGroupFilter(g)}
-              className={clsx('text-xs rounded-full px-3 py-1',
-                groupFilter === g ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400')}
             >
               {g}（{accounts.filter((a) => a.group_name === g).length}）
-            </button>
+            </Button>
           ))}
-          <button
+          <Button
+            size="small"
+            shape="round"
+            type={groupFilter === '__none__' ? 'primary' : 'default'}
             onClick={() => setGroupFilter('__none__')}
-            className={clsx('text-xs rounded-full px-3 py-1',
-              groupFilter === '__none__' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400')}
           >
             未分组（{accounts.filter((a) => !a.group_name).length}）
-          </button>
-        </div>
+          </Button>
+        </Space>
       )}
 
       <div className="flex-1 overflow-y-auto p-6">
@@ -345,320 +531,167 @@ export default function Accounts() {
         ) : accounts.length === 0 ? (
           <Empty icon={Users} title="暂无账号" hint="点击右上角「新建账号」添加第一个矩阵账号" />
         ) : (
-          <div className="bg-white dark:bg-gray-900 rounded-card shadow-card overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-xs text-gray-400 border-b dark:border-gray-700">
-                <tr>
-                  <th className="text-left font-normal px-4 py-2">登录账号名</th>
-                  <th className="text-left font-normal px-4 py-2">平台</th>
-                  <th className="text-left font-normal px-4 py-2">职责</th>
-                  <th className="text-left font-normal px-4 py-2">AdsPower 环境</th>
-                  <th className="text-left font-normal px-4 py-2">在线状态</th>
-                  <th className="text-left font-normal px-4 py-2">授权状态</th>
-                  <th className="text-right font-normal px-4 py-2">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleRows.map((row) => {
-                  const acc = accountById.get(row.accountId)
-                  if (!acc) return null
-                  const view = overview?.accounts.find((item) => item.id === acc.id)
-                  const name = acc.account_name === '待确认' ? '待确认' : acc.account_name
-                  const dutyText = acc.auth_type === 'api'
-                    ? '官方 API'
-                    : (DUTY_LABEL[row.duty] || row.duty || '—')
-                  const auth = acc.auth_type === 'api'
-                    ? (acc.has_credentials ? '已授权' : '未授权')
-                    : (row.authStatus
-                      ? (AUTH_LABEL[row.authStatus] || row.authStatus)
-                      : (view?.confirmed ? '已认出账号' : '待确认'))
-                  const online = row.workerStatus ? (ONLINE_LABEL[row.workerStatus] || row.workerStatus) : '—'
-                  return (
-                    <tr key={row.key} className="border-b dark:border-gray-800">
-                      <td className="px-4 py-3 text-gray-800 dark:text-gray-100">
-                        {name}
-                        {name === '待确认' && view?.profile_name ? <span className="block text-xs text-gray-400">{view.profile_name}</span> : null}
-                        {row.workerStatus === 'selector_mismatch' && row.debugFile ? (
-                          <span className="block text-xs text-red-500">页面快照 {row.debugFile}</span>
-                        ) : null}
-                        {row.accountTypeMismatch ? (
-                          <span className="block text-xs text-amber-600">驱动和抖音账号类型不一致</span>
-                        ) : null}
-                      </td>
-                      <td className="px-4 py-3">{PLATFORM_LABEL[acc.platform] || acc.platform}</td>
-                      <td className="px-4 py-3">{dutyText}</td>
-                      <td className="px-4 py-3 text-gray-500">{row.envLabel}</td>
-                      <td className="px-4 py-3">{online}</td>
-                      <td className="px-4 py-3">{auth}</td>
-                      <td className="px-4 py-3 text-right space-x-2">
-                        {acc.auth_type === 'api' && acc.platform === 'douyin' && (
-                          <button onClick={() => goAuth(acc)} className="text-xs text-blue-600">去授权</button>
-                        )}
-                        {isAdmin && row.canReopen && row.bindingId != null && (
-                          <button
-                            onClick={() => {
-                              api.reopenAccountBinding(row.bindingId as number).then(() => {
-                                toast.success('已通知重新打开这个环境，请在弹出的窗口里登录')
-                                load()
-                              }).catch((e: Error) => toast.error(e.message))
-                            }}
-                            className="text-xs text-blue-600"
-                          >
-                            重新打开
-                          </button>
-                        )}
-                        {isAdmin && row.canDisable && row.bindingId != null && (
-                          <button
-                            onClick={() => {
-                              api.updateAccountBinding(row.bindingId as number, { auth_status: 'disabled' }).then(() => load())
-                                .catch((e: Error) => toast.error(e.message))
-                            }}
-                            className="text-xs text-red-500"
-                          >
-                            停用
-                          </button>
-                        )}
-                        {isAdmin && row.canEnable && row.bindingId != null && (
-                          <button
-                            onClick={() => {
-                              api.updateAccountBinding(row.bindingId as number, { auth_status: 'pending_login' }).then(() => {
-                                toast.success('已启用，调度器会重新打开这个环境')
-                                load()
-                              }).catch((e: Error) => toast.error(e.message))
-                            }}
-                            className="text-xs text-blue-600"
-                          >
-                            启用
-                          </button>
-                        )}
-                        {isAdmin && row.showDelete && (
-                          <button onClick={() => remove(acc)} className="text-xs text-red-500">删除</button>
-                        )}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Card styles={{ body: { padding: 0 } }}>
+            <Table<DutyRow>
+              rowKey="key"
+              size="small"
+              columns={columns}
+              dataSource={visibleRows}
+              pagination={false}
+              scroll={{ x: true }}
+            />
+          </Card>
         )}
 
         {!loading && (
-          <div className="mt-6 bg-white dark:bg-gray-900 rounded-card shadow-card overflow-x-auto">
-            <div className="px-4 py-3 flex items-center gap-3 border-b dark:border-gray-700">
-              <div className="text-sm font-medium text-gray-800 dark:text-gray-100">RPA 回复记录</div>
-              <select
+          <Card
+            className="mt-6"
+            title="RPA 回复记录"
+            extra={(
+              <Select
+                size="small"
                 value={replyKind}
-                onChange={(e) => setReplyKind(e.target.value)}
-                className="text-xs border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded px-2 py-1"
-              >
-                <option value="">全部</option>
-                <option value="dm">私信</option>
-                <option value="comment">评论</option>
-              </select>
-            </div>
-            {replies.length === 0 ? (
-              <div className="px-4 py-6 text-xs text-gray-400">还没有 RPA 回复。私信和评论发出后会出现在这里。</div>
-            ) : (
-              <table className="w-full text-sm">
-                <thead className="text-xs text-gray-400 border-b dark:border-gray-700">
-                  <tr>
-                    <th className="text-left font-normal px-4 py-2">时间</th>
-                    <th className="text-left font-normal px-4 py-2">账号</th>
-                    <th className="text-left font-normal px-4 py-2">平台</th>
-                    <th className="text-left font-normal px-4 py-2">类型</th>
-                    <th className="text-left font-normal px-4 py-2">回复内容</th>
-                    <th className="text-left font-normal px-4 py-2">状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {replies.map((item) => (
-                    <tr key={item.outbox_id} className="border-b dark:border-gray-800">
-                      <td className="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">
-                        {item.created_at ? dayjs(item.created_at).format('MM-DD HH:mm') : '—'}
-                      </td>
-                      <td className="px-4 py-3 text-gray-700 dark:text-gray-200">{item.account || '—'}</td>
-                      <td className="px-4 py-3">{PLATFORM_LABEL[item.platform] || item.platform || '—'}</td>
-                      <td className="px-4 py-3">{REPLY_KIND[item.msg_type] || item.msg_type}</td>
-                      <td className="px-4 py-3 text-gray-800 dark:text-gray-100 max-w-md">
-                        <div className="truncate">{replyBody(item.msg_type, item.content) || '—'}</div>
-                        {item.status === 'failed' && item.error ? (
-                          <div className="text-xs text-red-500 truncate">{item.error}</div>
-                        ) : null}
-                      </td>
-                      <td className={clsx('px-4 py-3', item.status === 'failed' ? 'text-red-500' : 'text-gray-600 dark:text-gray-300')}>
-                        {REPLY_STATUS[item.status] || item.status}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                onChange={setReplyKind}
+                style={{ width: 120 }}
+                options={[
+                  { value: '', label: '全部' },
+                  { value: 'dm', label: '私信' },
+                  { value: 'comment', label: '评论' },
+                ]}
+              />
             )}
-          </div>
+            styles={{ body: { padding: replies.length === 0 ? 16 : 0 } }}
+          >
+            {replies.length === 0 ? (
+              <Text type="secondary">还没有 RPA 回复。私信和评论发出后会出现在这里。</Text>
+            ) : (
+              <Table<RpaReply>
+                rowKey="outbox_id"
+                size="small"
+                columns={replyColumns}
+                dataSource={replies}
+                pagination={false}
+                scroll={{ x: true }}
+              />
+            )}
+          </Card>
         )}
       </div>
 
-      {/* 批量导入对话框 */}
-      {showImport && (
-        <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={() => setShowImport(false)}>
-          <div
-            className="bg-white dark:bg-gray-800 rounded-2xl shadow-pop w-[520px] p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-sm font-medium text-gray-800 dark:text-gray-100 mb-2">批量导入账号</div>
-            <p className="text-xs text-gray-400 mb-3">
-              每行一个账号，逗号分隔：<code className="text-gray-500 dark:text-gray-300">平台,名称,接入方式,Worker标识,分组</code>
-              <br />平台为 douyin/xiaohongshu；接入方式 api/rpa（留空默认 api）；RPA 必须填 Worker 标识。示例：
-              <br /><code className="text-gray-500 dark:text-gray-300">douyin,主号-阿茶优选,api,,美妆线</code>
-              <br /><code className="text-gray-500 dark:text-gray-300">xiaohongshu,小号-测评号,rpa,xhs_worker_1,美妆线</code>
-            </p>
-            <textarea
-              value={importText}
-              onChange={(e) => setImportText(e.target.value)}
-              rows={6}
-              placeholder="粘贴账号清单，每行一个"
-              className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 font-mono"
-            />
-            {importResult && (
-              <div className="mt-3 text-xs space-y-1 max-h-32 overflow-y-auto">
-                <div className="text-green-600 dark:text-green-400">成功导入 {importResult.imported} 个</div>
-                {importResult.failed.map((f) => (
-                  <div key={f.line} className="text-red-500">
-                    第 {f.line} 行：{f.error}（{f.content}）
-                  </div>
-                ))}
+      <Modal
+        title="批量导入账号"
+        open={showImport}
+        onCancel={() => setShowImport(false)}
+        onOk={runImport}
+        okText="开始导入"
+        cancelText="关闭"
+        width={520}
+        centered
+      >
+        <Text type="secondary">
+          每行一个账号，逗号分隔：<Text code>平台,名称,接入方式,Worker标识,分组</Text>
+          <br />平台为 douyin/xiaohongshu；接入方式 api/rpa（留空默认 api）；RPA 必须填 Worker 标识。示例：
+          <br /><Text code>douyin,主号-阿茶优选,api,,美妆线</Text>
+          <br /><Text code>xiaohongshu,小号-测评号,rpa,xhs_worker_1,美妆线</Text>
+        </Text>
+        <Input.TextArea
+          className="mt-3"
+          value={importText}
+          onChange={(e) => setImportText(e.target.value)}
+          rows={6}
+          placeholder="粘贴账号清单，每行一个"
+        />
+        {importResult && (
+          <div className="mt-3 max-h-32 overflow-y-auto">
+            <div><Text type="success">成功导入 {importResult.imported} 个</Text></div>
+            {importResult.failed.map((f) => (
+              <div key={f.line}>
+                <Text type="danger">第 {f.line} 行：{f.error}（{f.content}）</Text>
               </div>
-            )}
-            <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => setShowImport(false)}
-                className="text-xs px-4 py-2 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
-              >
-                关闭
-              </button>
-              <button
-                onClick={async () => {
-                  const lines = importText.split('\n').map((s) => s.trim()).filter(Boolean)
-                  if (lines.length === 0) {
-                    toast.error('请粘贴账号清单')
-                    return
-                  }
-                  try {
-                    const res = await api.importAccounts(lines)
-                    setImportResult(res)
-                    if (res.imported > 0) {
-                      toast.success(`已导入 ${res.imported} 个账号`)
-                      load()
-                    }
-                  } catch (e: any) {
-                    toast.error(e.message || '导入失败')
-                  }
-                }}
-                className="text-xs px-4 py-2 rounded-lg text-white bg-blue-600 hover:bg-blue-700 font-medium"
-              >
-                开始导入
-              </button>
-            </div>
+            ))}
           </div>
-        </div>
-      )}
+        )}
+      </Modal>
 
-      {/* 新建账号对话框 */}
-      {showCreate && (
-        <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={() => setShowCreate(false)}>
-          <div
-            className="bg-white dark:bg-gray-800 rounded-2xl shadow-pop w-[420px] p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-sm font-medium text-gray-800 dark:text-gray-100 mb-4">新建账号</div>
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">接入</label>
-                <select
-                  value={form.mode}
-                  onChange={(e) => setForm({ ...form, mode: e.target.value as 'rpa' | 'api' })}
-                  className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                >
-                  <option value="rpa">AdsPower 环境</option>
-                  <option value="api">官方 API</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">平台</label>
-                <select
-                  value={form.platform}
-                  onChange={(e) => setForm({ ...form, platform: e.target.value })}
-                  className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                >
-                  <option value="douyin">抖音</option>
-                  <option value="xiaohongshu">小红书</option>
-                </select>
-              </div>
-              {form.mode === 'api' ? (
-                <div>
-                  <label className="text-xs text-gray-500 dark:text-gray-400">账号名称</label>
-                  <input
-                    value={form.account_name}
-                    onChange={(e) => setForm({ ...form, account_name: e.target.value })}
-                    className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                  />
-                </div>
-              ) : (
-                <>
-                  <div>
-                    <label className="text-xs text-gray-500 dark:text-gray-400">职责</label>
-                    <select
-                      value={form.duty}
-                      onChange={(e) => setForm({ ...form, duty: e.target.value })}
-                      className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                    >
-                      <option value="dm">私信</option>
-                      <option value="comment">评论</option>
-                      {form.platform === 'xiaohongshu' && <option value="publish">发布</option>}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-500 dark:text-gray-400">AdsPower 环境</label>
-                    <select
-                      value={profiles.some((item) => item.id === form.profile_id) ? form.profile_id : ''}
-                      onChange={(e) => setForm({ ...form, profile_id: e.target.value })}
-                      className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-1"
-                    >
-                      <option value="">请选择已上报的环境</option>
-                      {profiles.map((item) => (
-                        <option key={item.id} value={item.id}>{item.name}（{item.id}）</option>
-                      ))}
-                    </select>
-                    <input
-                      value={form.profile_id}
-                      onChange={(e) => setForm({ ...form, profile_id: e.target.value.trim() })}
-                      placeholder="或手填环境 ID"
-                      className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-2"
-                    />
-                    <p className="text-xs text-gray-400 mt-2">私信和评论要各用一个 AdsPower 环境，不能同时绑在同一个环境上。</p>
-                    {(overview?.workers || []).some((worker) => worker.ads_error) && (
-                      <p className="text-xs text-red-500 mt-2">
-                        {(overview?.workers || []).map((worker) => worker.ads_error).filter(Boolean).join('；')}
-                      </p>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-            <div className="flex justify-end gap-2 mt-5">
-              <button
-                onClick={() => setShowCreate(false)}
-                className="text-xs px-4 py-2 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300"
-              >
-                取消
-              </button>
-              <button onClick={create} className="text-xs px-4 py-2 rounded-lg text-white bg-blue-600 hover:bg-blue-700 font-medium">
-                创建
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <Modal
+        title="新建账号"
+        open={showCreate}
+        onCancel={() => setShowCreate(false)}
+        onOk={create}
+        okText="创建"
+        cancelText="取消"
+        width={420}
+        centered
+      >
+        <Form layout="vertical" colon={false} requiredMark={false} component="div">
+          <Form.Item label="接入" style={{ marginBottom: 12 }}>
+            <Select
+              style={{ width: '100%' }}
+              value={form.mode}
+              onChange={(value) => setForm({ ...form, mode: value as 'rpa' | 'api' })}
+              options={[
+                { value: 'rpa', label: 'AdsPower 环境' },
+                { value: 'api', label: '官方 API' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item label="平台" style={{ marginBottom: 12 }}>
+            <Select
+              style={{ width: '100%' }}
+              value={form.platform}
+              onChange={(value) => setForm({ ...form, platform: value })}
+              options={[
+                { value: 'douyin', label: '抖音' },
+                { value: 'xiaohongshu', label: '小红书' },
+              ]}
+            />
+          </Form.Item>
+          {form.mode === 'api' ? (
+            <Form.Item label="账号名称" style={{ marginBottom: 0 }}>
+              <Input
+                value={form.account_name}
+                onChange={(e) => setForm({ ...form, account_name: e.target.value })}
+              />
+            </Form.Item>
+          ) : (
+            <>
+              <Form.Item label="职责" style={{ marginBottom: 12 }}>
+                <Select
+                  style={{ width: '100%' }}
+                  value={form.duty}
+                  onChange={(value) => setForm({ ...form, duty: value })}
+                  options={[
+                    { value: 'dm', label: '私信' },
+                    { value: 'comment', label: '评论' },
+                    ...(form.platform === 'xiaohongshu' ? [{ value: 'publish', label: '发布' }] : []),
+                  ]}
+                />
+              </Form.Item>
+              <Form.Item label="AdsPower 环境" style={{ marginBottom: 0 }}>
+                <Select
+                  style={{ width: '100%' }}
+                  value={profiles.some((item) => item.id === form.profile_id) ? form.profile_id : ''}
+                  onChange={(value) => setForm({ ...form, profile_id: value })}
+                  options={[
+                    { value: '', label: '请选择已上报的环境' },
+                    ...profiles.map((item) => ({ value: item.id, label: `${item.name}（${item.id}）` })),
+                  ]}
+                />
+                <Input
+                  className="mt-2"
+                  value={form.profile_id}
+                  onChange={(e) => setForm({ ...form, profile_id: e.target.value.trim() })}
+                  placeholder="或手填环境 ID"
+                />
+                <p className="text-xs text-gray-400 mt-2">私信和评论要各用一个 AdsPower 环境，不能同时绑在同一个环境上。</p>
+                {adsErrors.length > 0 && (
+                  <p className="text-xs text-red-500 mt-2">{adsErrors.join('；')}</p>
+                )}
+              </Form.Item>
+            </>
+          )}
+        </Form>
+      </Modal>
     </div>
   )
 }

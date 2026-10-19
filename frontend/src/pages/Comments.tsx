@@ -1,4 +1,4 @@
-import clsx from 'clsx'
+import { Button, Card, Input, Select, Space, Switch, Tabs, Tag, Typography } from 'antd'
 import dayjs from 'dayjs'
 import { MessageCircle, Plus, Settings2, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
@@ -9,20 +9,22 @@ import { confirmDialog, promptDialog } from '../components/ui/dialogs'
 import { toast } from '../components/ui/toast'
 import { subscribeWs, useAuth } from '../store'
 
-const INTENT_STYLE: Record<string, { label: string; cls: string }> = {
-  consult: { label: '咨询', cls: 'bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400' },
-  price: { label: '问价', cls: 'bg-purple-100 text-purple-600 dark:bg-purple-900/40 dark:text-purple-400' },
-  praise: { label: '好评', cls: 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400' },
-  complaint: { label: '差评', cls: 'bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-400' },
-  spam: { label: '广告', cls: 'bg-orange-100 text-orange-600 dark:bg-orange-900/40 dark:text-orange-400' },
-  irrelevant: { label: '无关', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400' },
+const { Text } = Typography
+
+const INTENT_STYLE: Record<string, { label: string; color: string }> = {
+  consult: { label: '咨询', color: 'blue' },
+  price: { label: '问价', color: 'purple' },
+  praise: { label: '好评', color: 'green' },
+  complaint: { label: '差评', color: 'red' },
+  spam: { label: '广告', color: 'orange' },
+  irrelevant: { label: '无关', color: 'default' },
 }
 
-const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
-  pending: { label: '待处理', cls: 'bg-yellow-100 text-yellow-600 dark:bg-yellow-900/40 dark:text-yellow-400' },
-  replied: { label: '已自动回复', cls: 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400' },
-  manual: { label: '已人工回复', cls: 'bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400' },
-  skipped: { label: '已跳过', cls: 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400' },
+const STATUS_STYLE: Record<string, { label: string; color: string }> = {
+  pending: { label: '待处理', color: 'gold' },
+  replied: { label: '已自动回复', color: 'green' },
+  manual: { label: '已人工回复', color: 'blue' },
+  skipped: { label: '已跳过', color: 'default' },
 }
 
 const PLATFORM_LABEL: Record<string, string> = { douyin: '抖音', xiaohongshu: '小红书' }
@@ -165,54 +167,51 @@ export default function Comments() {
         </div>
         <span className="flex-1" />
         {isAdmin && switches && (
-          <button
-            onClick={toggleAuto}
-            className={clsx(
-              'text-xs rounded-lg px-4 py-2 font-medium',
-              switches.comment_auto_reply_enabled
-                ? 'bg-green-600 text-white hover:bg-green-700'
-                : 'bg-gray-200 text-gray-600 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300',
-            )}
-          >
-            自动回复：{switches.comment_auto_reply_enabled ? '已开启' : '已关闭'}
-          </button>
+          <Space>
+            <span className="text-xs text-gray-600 dark:text-gray-300">
+              自动回复：{switches.comment_auto_reply_enabled ? '已开启' : '已关闭'}
+            </span>
+            <Switch checked={switches.comment_auto_reply_enabled} onChange={() => { toggleAuto() }} />
+          </Space>
         )}
       </div>
 
-      {/* Tab + 筛选 */}
-      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6 flex items-center gap-1">
-        <button
-          onClick={() => setTab('list')}
-          className={clsx(
-            'px-4 py-2.5 text-sm border-b-2 -mb-px',
-            tab === 'list' ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-medium' : 'border-transparent text-gray-500',
-          )}
-        >
-          评论列表
-        </button>
-        <button
-          onClick={() => setTab('rules')}
-          className={clsx(
-            'px-4 py-2.5 text-sm border-b-2 -mb-px flex items-center gap-1',
-            tab === 'rules' ? 'border-blue-600 text-blue-600 dark:text-blue-400 font-medium' : 'border-transparent text-gray-500',
-          )}
-        >
-          <Settings2 size={13} /> 回复规则
-        </button>
-        <span className="flex-1" />
-        {tab === 'list' && (
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="text-xs border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded px-2 py-1.5 my-1.5"
-          >
-            <option value="">全部状态</option>
-            <option value="pending">待处理</option>
-            <option value="replied">已自动回复</option>
-            <option value="manual">已人工回复</option>
-            <option value="skipped">已跳过</option>
-          </select>
-        )}
+      <div className="bg-white dark:bg-gray-900 border-b dark:border-gray-700 px-6">
+        <Tabs
+          className="[&_.ant-tabs-content-holder]:hidden"
+          activeKey={tab}
+          onChange={(key) => {
+            if (key === 'list' || key === 'rules') setTab(key)
+          }}
+          tabBarStyle={{ marginBottom: 0 }}
+          tabBarExtraContent={tab === 'list' ? (
+            <Select
+              size="small"
+              value={statusFilter}
+              onChange={setStatusFilter}
+              style={{ width: 140 }}
+              options={[
+                { value: '', label: '全部状态' },
+                { value: 'pending', label: '待处理' },
+                { value: 'replied', label: '已自动回复' },
+                { value: 'manual', label: '已人工回复' },
+                { value: 'skipped', label: '已跳过' },
+              ]}
+            />
+          ) : null}
+          items={[
+            { key: 'list', label: '评论列表' },
+            {
+              key: 'rules',
+              label: (
+                <span className="inline-flex items-center gap-1">
+                  <Settings2 size={13} />
+                  回复规则
+                </span>
+              ),
+            },
+          ]}
+        />
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
@@ -222,150 +221,113 @@ export default function Comments() {
           ) : comments.length === 0 ? (
             <Empty icon={MessageCircle} title="暂无评论" hint="发布内容后，评论会自动采集到这里" />
           ) : (
-            <div className="space-y-3 max-w-4xl">
+            <Space direction="vertical" size={12} style={{ width: '100%', maxWidth: 896 }}>
               {comments.map((c) => (
-                <div key={c.id} className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
+                <Card key={c.id} size="small" style={{ width: '100%' }}>
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 rounded px-2 py-0.5">
-                      {PLATFORM_LABEL[c.platform] || c.platform}
-                    </span>
-                    <span className="text-xs text-gray-500 dark:text-gray-400">{c.author_nickname}</span>
-                    {c.intent && (
-                      <span className={clsx('text-xs rounded px-2 py-0.5', INTENT_STYLE[c.intent]?.cls)}>
+                    <Tag>{PLATFORM_LABEL[c.platform] || c.platform}</Tag>
+                    <Text type="secondary">{c.author_nickname}</Text>
+                    {c.intent ? (
+                      <Tag color={INTENT_STYLE[c.intent]?.color}>
                         {INTENT_STYLE[c.intent]?.label || c.intent}
-                      </span>
-                    )}
-                    <span className={clsx('text-xs rounded px-2 py-0.5', STATUS_STYLE[c.status]?.cls)}>
+                      </Tag>
+                    ) : null}
+                    <Tag color={STATUS_STYLE[c.status]?.color}>
                       {STATUS_STYLE[c.status]?.label || c.status}
-                    </span>
+                    </Tag>
                     <span className="flex-1" />
-                    <span className="text-xs text-gray-400">{dayjs(c.created_at).format('MM-DD HH:mm')}</span>
+                    <Text type="secondary">{dayjs(c.created_at).format('MM-DD HH:mm')}</Text>
                   </div>
                   <div className="mt-2 text-sm text-gray-800 dark:text-gray-100">{c.content}</div>
-                  {c.post_title && (
-                    <div className="mt-1 text-xs text-gray-400">作品：{c.post_title}</div>
-                  )}
-                  {c.reply_content && (
+                  {c.post_title ? (
+                    <div className="mt-1"><Text type="secondary">作品：{c.post_title}</Text></div>
+                  ) : null}
+                  {c.reply_content ? (
                     <div className="mt-2 text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 rounded p-2">
                       回复：{c.reply_content}
                     </div>
-                  )}
+                  ) : null}
                   {(c.status === 'pending' || c.status === 'skipped') && (
-                    <div className="mt-3">
-                      {replyingId === c.id ? (
-                        <div className="flex gap-2">
-                          <input
-                            autoFocus
-                            value={replyText}
-                            onChange={(e) => setReplyText(e.target.value)}
-                            placeholder="输入回复（禁止联系方式，违规将被拦截）"
-                            className="flex-1 border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-blue-500"
-                            onKeyDown={(e) => e.key === 'Enter' && reply(c.id)}
-                          />
-                          <button
-                            onClick={() => reply(c.id)}
-                            className="text-xs bg-blue-600 text-white rounded-lg px-3 py-1.5 hover:bg-blue-700"
-                          >
-                            发送
-                          </button>
-                          <button
-                            onClick={() => { setReplyingId(0); setReplyText('') }}
-                            className="text-xs bg-gray-100 text-gray-500 rounded-lg px-3 py-1.5"
-                          >
-                            取消
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => { setReplyingId(c.id); setReplyText('') }}
-                            className="text-xs bg-blue-50 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400 rounded px-3 py-1.5 hover:bg-blue-100"
-                          >
-                            人工回复
-                          </button>
-                          {c.status === 'pending' && (
-                            <button
-                              onClick={() => skip(c.id)}
-                              className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 rounded px-3 py-1.5 hover:bg-gray-200"
-                            >
-                              跳过
-                            </button>
-                          )}
-                        </div>
-                      )}
-                    </div>
+                    replyingId === c.id ? (
+                      <div className="mt-3 flex gap-2">
+                        <Input
+                          autoFocus
+                          style={{ flex: 1, minWidth: 0 }}
+                          value={replyText}
+                          onChange={(e) => setReplyText(e.target.value)}
+                          placeholder="输入回复（禁止联系方式，违规将被拦截）"
+                          onPressEnter={() => reply(c.id)}
+                        />
+                        <Button type="primary" onClick={() => reply(c.id)}>发送</Button>
+                        <Button onClick={() => { setReplyingId(0); setReplyText('') }}>取消</Button>
+                      </div>
+                    ) : (
+                      <Space className="mt-3" wrap>
+                        <Button size="small" type="primary" ghost onClick={() => { setReplyingId(c.id); setReplyText('') }}>
+                          人工回复
+                        </Button>
+                        {c.status === 'pending' && (
+                          <Button size="small" onClick={() => skip(c.id)}>跳过</Button>
+                        )}
+                      </Space>
+                    )
                   )}
-                </div>
+                </Card>
               ))}
-            </div>
+            </Space>
           )
         ) : (
-          /* 规则配置 Tab */
           <div className="max-w-4xl">
             {isAdmin && (
-              <button
-                onClick={addRule}
-                className="flex items-center gap-1.5 text-sm bg-blue-600 text-white rounded-lg px-4 py-2 hover:bg-blue-700 mb-4"
-              >
-                <Plus size={15} /> 新建规则
-              </button>
+              <Button type="primary" icon={<Plus size={15} />} onClick={addRule} className="mb-4">
+                新建规则
+              </Button>
             )}
-            <div className="space-y-3">
+            <Space direction="vertical" size={12} style={{ width: '100%' }}>
               {rules.map((rule) => (
-                <div key={rule.id} className="bg-white dark:bg-gray-900 rounded-card shadow-card p-4">
+                <Card key={rule.id} size="small" style={{ width: '100%' }}>
                   <div className="flex items-center gap-2 flex-wrap">
-                    {rule.intent && (
-                      <span className={clsx('text-xs rounded px-2 py-0.5', INTENT_STYLE[rule.intent]?.cls || 'bg-gray-100 text-gray-500')}>
+                    {rule.intent ? (
+                      <Tag color={INTENT_STYLE[rule.intent]?.color}>
                         意图:{INTENT_STYLE[rule.intent]?.label || rule.intent}
-                      </span>
-                    )}
+                      </Tag>
+                    ) : null}
                     {(rule.keywords || []).map((k) => (
-                      <span key={k} className="text-xs bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 rounded px-2 py-0.5">
-                        {k}
-                      </span>
+                      <Tag key={k}>{k}</Tag>
                     ))}
-                    {rule.guide_code && (
-                      <span className="text-xs bg-purple-100 text-purple-600 dark:bg-purple-900/40 dark:text-purple-400 rounded px-2 py-0.5">
-                        暗号:{rule.guide_code}
-                      </span>
-                    )}
-                    <span className="text-xs text-gray-400">优先级 {rule.priority}</span>
+                    {rule.guide_code ? (
+                      <Tag color="purple">暗号:{rule.guide_code}</Tag>
+                    ) : null}
+                    <Text type="secondary">优先级 {rule.priority}</Text>
                     <span className="flex-1" />
                     {isAdmin && (
-                      <>
-                        <button
-                          onClick={() => toggleRule(rule)}
-                          className={clsx(
-                            'text-xs rounded px-2.5 py-1',
-                            rule.enabled
-                              ? 'bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400'
-                              : 'bg-gray-100 text-gray-400 dark:bg-gray-800',
-                          )}
-                        >
-                          {rule.enabled ? '已启用' : '已停用'}
-                        </button>
-                        <button
+                      <Space size={4}>
+                        <Switch size="small" checked={rule.enabled} onChange={() => { toggleRule(rule) }} />
+                        <span className="text-xs">{rule.enabled ? '已启用' : '已停用'}</span>
+                        <Button
+                          type="text"
+                          danger
+                          size="small"
+                          aria-label="删除"
+                          icon={<Trash2 size={12} />}
                           onClick={() => removeRule(rule)}
-                          className="text-xs bg-red-50 text-red-500 rounded px-2.5 py-1 hover:bg-red-100"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </>
+                        />
+                      </Space>
                     )}
                   </div>
-                  <div className="mt-2 space-y-1">
+                  <div className="mt-2">
                     {(rule.reply_templates || []).map((t, i) => (
                       <div key={i} className="text-xs text-gray-600 dark:text-gray-300">
                         模板{i + 1}：{t}
                       </div>
                     ))}
                   </div>
-                </div>
+                </Card>
               ))}
-              {rules.length === 0 && (
-                <Empty icon={Settings2} title="暂无规则" hint="规则命中评论后自动回复模板并引导私信暗号" />
-              )}
-            </div>
+            </Space>
+            {rules.length === 0 && (
+              <Empty icon={Settings2} title="暂无规则" hint="规则命中评论后自动回复模板并引导私信暗号" />
+            )}
           </div>
         )}
       </div>

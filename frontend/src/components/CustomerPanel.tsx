@@ -1,13 +1,13 @@
-import clsx from 'clsx'
-import { BookOpen, ClipboardList, PanelLeftOpen, Phone, Plus, Tag, UserPlus, X, Zap } from 'lucide-react'
+import { Button, Card, Input, Select, Space, Tabs, Tag } from 'antd'
+import { BookOpen, ClipboardList, PanelLeftOpen, Phone, Plus, Tag as TagIcon, UserPlus, X, Zap } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { api, Conversation, Message, QuickReply, RecallTestResult, Ticket } from '../api/client'
 import { toast } from './ui/toast'
 
-const TICKET_STATUS: Record<string, { label: string; cls: string }> = {
-  open: { label: '待处理', cls: 'bg-orange-100 text-orange-600 dark:bg-orange-950 dark:text-orange-400' },
-  processing: { label: '处理中', cls: 'bg-blue-100 text-blue-600 dark:bg-blue-950 dark:text-blue-400' },
-  done: { label: '已完成', cls: 'bg-green-100 text-green-600 dark:bg-green-950 dark:text-green-400' },
+const TICKET_STATUS: Record<string, { label: string; color: string }> = {
+  open: { label: '待处理', color: 'orange' },
+  processing: { label: '处理中', color: 'blue' },
+  done: { label: '已完成', color: 'green' },
 }
 
 const MODE_LABEL: Record<string, string> = {
@@ -22,6 +22,12 @@ const DOCK_TABS: { key: DockTab; label: string }[] = [
   { key: 'customer', label: '客户' },
   { key: 'quick', label: '快捷' },
   { key: 'knowledge', label: '知识' },
+]
+
+const TICKET_TYPES = [
+  { value: 'refund', label: '退款退货' },
+  { value: 'logistics', label: '物流异常' },
+  { value: 'other', label: '其他' },
 ]
 
 interface Props {
@@ -96,13 +102,14 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
   if (collapsed) {
     return (
       <div className="w-9 border-l dark:border-gray-700 bg-white dark:bg-gray-900 shrink-0 flex flex-col items-center pt-3">
-        <button
-          onClick={onExpand}
+        <Button
+          type="text"
+          size="small"
+          icon={<PanelLeftOpen size={16} />}
           title="展开右侧栏"
-          className="p-1.5 rounded-lg text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
-        >
-          <PanelLeftOpen size={16} />
-        </button>
+          aria-label="展开右侧栏"
+          onClick={onExpand}
+        />
       </div>
     )
   }
@@ -145,25 +152,14 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
 
   return (
     <div className="w-[280px] border-l dark:border-gray-700 bg-white dark:bg-gray-900 flex flex-col shrink-0">
-      <div className="flex border-b dark:border-gray-800">
-        {DOCK_TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setDockTab(t.key)}
-            className={clsx(
-              'flex-1 py-2.5 text-[13px] font-medium relative',
-              dockTab === t.key
-                ? 'text-primary-600'
-                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700',
-            )}
-          >
-            {t.label}
-            {dockTab === t.key && (
-              <span className="absolute bottom-0 left-3 right-3 h-0.5 bg-primary-600 rounded-full" />
-            )}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        size="small"
+        activeKey={dockTab}
+        onChange={(key) => setDockTab(key as DockTab)}
+        tabBarStyle={{ marginBottom: 0 }}
+        className="[&_.ant-tabs-content-holder]:hidden [&_.ant-tabs-nav-list]:w-full [&_.ant-tabs-tab]:flex-1 [&_.ant-tabs-tab]:justify-center"
+        items={DOCK_TABS.map((t) => ({ key: t.key, label: t.label }))}
+      />
 
       <div className="flex-1 overflow-y-auto">
         {dockTab === 'customer' && (
@@ -188,58 +184,65 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
               </div>
               <div className="mt-3 flex flex-wrap gap-1.5">
                 {tags.map((t) => (
-                  <span
+                  <Tag
                     key={t}
-                    className="inline-flex items-center gap-0.5 text-[10px] bg-primary-50 text-primary-700 dark:bg-primary-950 dark:text-primary-300 rounded-full px-2 py-0.5"
+                    color="cyan"
+                    icon={<TagIcon size={9} />}
+                    closable
+                    closeIcon={<X size={9} />}
+                    onClose={(e) => {
+                      e.preventDefault()
+                      void saveTags(tags.filter((x) => x !== t))
+                    }}
                   >
-                    <Tag size={9} />
                     {t}
-                    <button
-                      title="删除标签"
-                      onClick={() => saveTags(tags.filter((x) => x !== t))}
-                      className="ml-0.5 hover:text-red-500"
-                    >
-                      <X size={9} />
-                    </button>
-                  </span>
+                  </Tag>
                 ))}
               </div>
-              <div className="mt-2 flex gap-1">
-                <input
+              <Space.Compact className="mt-2" style={{ width: '100%' }}>
+                <Input
+                  size="small"
+                  style={{ flex: 1 }}
                   value={tagInput}
                   onChange={(e) => setTagInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), addTag())}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      void addTag()
+                    }
+                  }}
                   placeholder="添加标签"
-                  className="flex-1 border dark:border-gray-700 dark:bg-gray-800 rounded-lg px-2 py-1 text-xs outline-none focus:border-primary-500"
                 />
-                <button onClick={addTag} className="text-xs px-2 rounded-lg bg-primary-50 text-primary-600">
+                <Button size="small" onClick={() => void addTag()}>
                   添加
-                </button>
-              </div>
+                </Button>
+              </Space.Compact>
             </div>
 
             <div className="p-4 border-b dark:border-gray-700">
               <SectionTitle>留资信息</SectionTitle>
               {hasLead ? (
-                <div className="bg-green-50 dark:bg-green-950/40 border border-green-200 dark:border-green-900 rounded-xl p-3 space-y-1.5">
-                  {customer.lead_phone && (
-                    <div className="flex items-center gap-2 text-sm">
-                      <Phone size={13} className="text-green-600 dark:text-green-400" />
-                      <span className="font-medium text-green-700 dark:text-green-300">{customer.lead_phone}</span>
-                    </div>
-                  )}
-                  {customer.lead_wechat && (
-                    <div className="flex items-center gap-2 text-sm">
-                      <UserPlus size={13} className="text-green-600 dark:text-green-400" />
-                      <span className="font-medium text-green-700 dark:text-green-300">{customer.lead_wechat}</span>
-                    </div>
-                  )}
-                  {customer.lead_note && (
-                    <div className="text-xs text-green-600/80 dark:text-green-400/70 pt-1 border-t border-green-100 dark:border-green-900">
-                      {customer.lead_note}
-                    </div>
-                  )}
-                </div>
+                <Card size="small" className="!bg-green-50 dark:!bg-green-950/40 !border-green-200 dark:!border-green-900">
+                  <Space direction="vertical" size={6} className="w-full">
+                    {customer.lead_phone && (
+                      <div className="flex items-center gap-2 text-sm">
+                        <Phone size={13} className="text-green-600 dark:text-green-400" />
+                        <span className="font-medium text-green-700 dark:text-green-300">{customer.lead_phone}</span>
+                      </div>
+                    )}
+                    {customer.lead_wechat && (
+                      <div className="flex items-center gap-2 text-sm">
+                        <UserPlus size={13} className="text-green-600 dark:text-green-400" />
+                        <span className="font-medium text-green-700 dark:text-green-300">{customer.lead_wechat}</span>
+                      </div>
+                    )}
+                    {customer.lead_note && (
+                      <div className="text-xs text-green-600/80 dark:text-green-400/70 pt-1 border-t border-green-100 dark:border-green-900">
+                        {customer.lead_note}
+                      </div>
+                    )}
+                  </Space>
+                </Card>
               ) : (
                 <div className="text-xs text-gray-300 dark:text-gray-600 bg-gray-50 dark:bg-gray-800 rounded-xl p-3 text-center">
                   暂未留资
@@ -260,41 +263,41 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
                     关联工单
                   </span>
                 </SectionTitle>
-                <button
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<Plus size={11} />}
+                  className="!-mt-2"
                   onClick={() => setShowTicket(!showTicket)}
-                  className="text-[11px] text-primary-600 inline-flex items-center gap-0.5 -mt-2"
                 >
-                  <Plus size={11} /> 创建工单
-                </button>
+                  创建工单
+                </Button>
               </div>
               {showTicket && (
-                <div className="mb-3 space-y-1.5 bg-gray-50 dark:bg-gray-800 rounded-xl p-2.5">
-                  <select
+                <Space direction="vertical" size={6} className="mb-3 bg-gray-50 dark:bg-gray-800 rounded-xl p-2.5" style={{ width: '100%' }}>
+                  <Select
+                    size="small"
                     value={ticketType}
-                    onChange={(e) => setTicketType(e.target.value)}
-                    className="w-full text-xs border dark:border-gray-700 dark:bg-gray-900 rounded px-2 py-1"
-                  >
-                    <option value="refund">退款退货</option>
-                    <option value="logistics">物流异常</option>
-                    <option value="other">其他</option>
-                  </select>
-                  <input
+                    onChange={setTicketType}
+                    options={TICKET_TYPES}
+                    style={{ width: '100%' }}
+                  />
+                  <Input
+                    size="small"
                     value={ticketTitle}
                     onChange={(e) => setTicketTitle(e.target.value)}
                     placeholder="工单标题"
-                    className="w-full text-xs border dark:border-gray-700 dark:bg-gray-900 rounded px-2 py-1 outline-none"
                   />
-                  <textarea
+                  <Input.TextArea
                     value={ticketContent}
                     onChange={(e) => setTicketContent(e.target.value)}
                     placeholder="补充说明（可选）"
                     rows={2}
-                    className="w-full text-xs border dark:border-gray-700 dark:bg-gray-900 rounded px-2 py-1 outline-none"
                   />
-                  <button onClick={createTicket} className="w-full text-xs bg-primary-600 text-white rounded py-1.5">
+                  <Button size="small" type="primary" block onClick={() => void createTicket()}>
                     保存工单
-                  </button>
-                </div>
+                  </Button>
+                </Space>
               )}
               {tickets.length === 0 && !showTicket ? (
                 <div className="text-xs text-gray-300 dark:text-gray-600 bg-gray-50 dark:bg-gray-800 rounded-xl p-3 text-center">
@@ -304,15 +307,15 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
                 tickets.map((t) => {
                   const st = TICKET_STATUS[t.status] || TICKET_STATUS.open
                   return (
-                    <div key={t.id} className="bg-gray-50 dark:bg-gray-800 rounded-xl p-3 mb-2">
+                    <Card key={t.id} size="small" className="!mb-2 !bg-gray-50 dark:!bg-gray-800">
                       <div className="text-sm font-medium text-gray-800 dark:text-gray-100">{t.title}</div>
-                      <div className="flex items-center gap-2 mt-1.5">
-                        <span className={clsx('text-[10px] px-1.5 py-0.5 rounded', st.cls)}>{st.label}</span>
+                      <Space className="mt-1.5" size={8}>
+                        <Tag color={st.color}>{st.label}</Tag>
                         <span className="text-xs text-gray-400 dark:text-gray-500">
                           {new Date(t.created_at).toLocaleDateString('zh-CN')}
                         </span>
-                      </div>
-                    </div>
+                      </Space>
+                    </Card>
                   )
                 })
               )}
@@ -368,17 +371,21 @@ export default function CustomerPanel({ conversation, onRefresh, collapsed, onEx
                   <div className="text-[12px] text-orange-500 px-0.5">无可靠知识，请人工作答</div>
                 )}
                 {suggest.hits.map((hit, i) => (
-                  <button
+                  <Button
                     key={i}
+                    type="text"
+                    block
                     onClick={() => onInsert(hit.content)}
-                    className="w-full text-left text-xs bg-gray-50 dark:bg-gray-800 border dark:border-gray-700 rounded-lg px-2 py-1.5 hover:border-primary-400"
+                    className="!h-auto !justify-start !whitespace-normal !px-2 !py-1.5 !border !border-solid dark:!border-gray-700 hover:!border-primary-400"
                   >
-                    <div className="text-[10px] text-gray-400 mb-0.5">
-                      {hit.source}
-                      {hit.score != null && <span className="ml-2 font-mono">{hit.score.toFixed(2)}</span>}
+                    <div className="w-full text-left text-xs">
+                      <div className="text-[10px] text-gray-400 mb-0.5">
+                        {hit.source}
+                        {hit.score != null && <span className="ml-2 font-mono">{hit.score.toFixed(2)}</span>}
+                      </div>
+                      <div className="text-gray-700 dark:text-gray-200 line-clamp-3">{hit.content}</div>
                     </div>
-                    <div className="text-gray-700 dark:text-gray-200 line-clamp-3">{hit.content}</div>
-                  </button>
+                  </Button>
                 ))}
                 {!suggest.passed && suggest.hits.length === 0 && (
                   <div className="text-[11px] text-orange-500">未过阈值，不要把不确定的知识发给用户。</div>
@@ -413,14 +420,18 @@ function QuickGroup({
         <div className="text-xs text-gray-300 dark:text-gray-600 px-1 py-2">暂无模板</div>
       ) : (
         items.map((qr) => (
-          <button
+          <Button
             key={qr.id}
+            type="text"
+            block
             onClick={() => onInsert(qr.content)}
-            className="w-full text-left px-2 py-2 rounded-lg hover:bg-primary-50 dark:hover:bg-primary-900/20 mb-0.5"
+            className="!h-auto !justify-start !whitespace-normal !px-2 !py-2 !mb-0.5"
           >
-            <div className="text-[12px] font-medium text-primary-700 dark:text-primary-300">{qr.title}</div>
-            <div className="text-[11px] text-gray-500 dark:text-gray-400 line-clamp-2 mt-0.5">{qr.content}</div>
-          </button>
+            <div className="w-full text-left">
+              <div className="text-[12px] font-medium text-primary-700 dark:text-primary-300">{qr.title}</div>
+              <div className="text-[11px] text-gray-500 dark:text-gray-400 line-clamp-2 mt-0.5">{qr.content}</div>
+            </div>
+          </Button>
         ))
       )}
     </div>

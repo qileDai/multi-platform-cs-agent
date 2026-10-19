@@ -1,4 +1,4 @@
-import clsx from 'clsx'
+import { Badge, Button, Dropdown, Layout as AntLayout, Menu, theme as antdTheme } from 'antd'
 import {
   BarChart3,
   BookOpen,
@@ -19,12 +19,14 @@ import {
   UserCheck,
   Users,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { NavLink, Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { api } from '../api/client'
 import { useTheme } from '../hooks/useTheme'
 import { useAuth } from '../store'
 import { canSee, firstVisiblePath, moduleForPath } from '../utils/modules'
+
+const { Sider, Content } = AntLayout
 
 const CS_NAV = [
   { path: '/', label: '对话', icon: MessageSquare, module: 'workbench' },
@@ -46,48 +48,28 @@ const MATRIX_NAV = [
 ]
 
 const STATUS_MAP: Record<string, { label: string; color: string }> = {
-  active: { label: '接待中', color: 'bg-green-500' },
-  resting: { label: '休息中', color: 'bg-yellow-500' },
-  offline: { label: '离线', color: 'bg-gray-400' },
+  active: { label: '接待中', color: '#22c55e' },
+  resting: { label: '休息中', color: '#eab308' },
+  offline: { label: '离线', color: '#9ca3af' },
 }
 
-function NavItem({
-  path,
-  label,
-  icon: Icon,
-  unread,
-  csActive,
-}: {
-  path: string
-  label: string
-  icon: typeof MessageSquare
-  unread?: number
-  csActive?: boolean
-}) {
-  return (
-    <NavLink
-      to={path}
-      end={path === '/'}
-      className={({ isActive }) =>
-        clsx(
-          'w-12 py-1.5 rounded-lg flex flex-col items-center gap-0.5 transition-colors relative',
-          isActive
-            ? csActive
-              ? 'bg-primary-600 text-white'
-              : 'bg-gray-700 text-white'
-            : 'text-gray-400 hover:bg-gray-700/70 hover:text-gray-200',
-        )
-      }
-    >
-      <Icon size={18} />
-      <span className="text-[10px]">{label}</span>
-      {unread ? (
-        <span className="absolute top-0.5 right-1 bg-red-500 text-white text-[9px] rounded-full min-w-[16px] h-4 flex items-center justify-center px-1">
-          {unread > 99 ? '99+' : unread}
+function menuItems(
+  items: { path: string; label: string; icon: typeof MessageSquare }[],
+  unread?: number,
+) {
+  return items.map((item) => ({
+    key: item.path,
+    icon: <item.icon size={16} />,
+    label:
+      item.path === '/' && unread ? (
+        <span className="inline-flex items-center gap-2">
+          {item.label}
+          <Badge count={unread} size="small" />
         </span>
-      ) : null}
-    </NavLink>
-  )
+      ) : (
+        item.label
+      ),
+  }))
 }
 
 export default function Layout() {
@@ -95,8 +77,7 @@ export default function Layout() {
   const navigate = useNavigate()
   const location = useLocation()
   const [unread, setUnread] = useState(0)
-  const [statusOpen, setStatusOpen] = useState(false)
-  const statusRef = useRef<HTMLDivElement>(null)
+  const { token } = antdTheme.useToken()
   const seeWorkbench = canSee(agent, 'workbench')
   const seeSettings = canSee(agent, 'settings')
   const csNav = CS_NAV.filter((item) => canSee(agent, item.module))
@@ -104,6 +85,7 @@ export default function Layout() {
   const required = moduleForPath(location.pathname)
   const allowed = !required || canSee(agent, required)
   const fallback = firstVisiblePath(agent)
+  const { theme, toggle: toggleTheme } = useTheme()
 
   useEffect(() => {
     if (!seeWorkbench) return
@@ -118,111 +100,110 @@ export default function Layout() {
     }
   }, [seeWorkbench])
 
-  useEffect(() => {
-    const onClick = (e: MouseEvent) => {
-      if (statusRef.current && !statusRef.current.contains(e.target as Node)) setStatusOpen(false)
-    }
-    document.addEventListener('mousedown', onClick)
-    return () => document.removeEventListener('mousedown', onClick)
-  }, [])
+  const selected = location.pathname.startsWith('/settings')
+    ? '/settings'
+    : location.pathname
+
+  const groups = [
+    csNav.length
+      ? { type: 'group' as const, label: '客服', children: menuItems(csNav, unread) }
+      : null,
+    matrixNav.length
+      ? { type: 'group' as const, label: '矩阵', children: menuItems(matrixNav) }
+      : null,
+    seeSettings
+      ? {
+          type: 'group' as const,
+          label: '系统',
+          children: menuItems([{ path: '/settings', label: '设置', icon: SettingsIcon }]),
+        }
+      : null,
+  ].filter((item) => item != null)
 
   const curStatus = STATUS_MAP[agent?.status || 'offline']
-  const { theme, toggle: toggleTheme } = useTheme()
-  const onWorkbench = location.pathname === '/'
 
   return (
-    <div className="h-full flex">
-      <nav className="w-[64px] bg-gray-900 dark:bg-gray-950 dark:border-r dark:border-gray-800 flex flex-col items-center py-3 gap-0.5 shrink-0">
-        <div
-          className="w-10 h-10 rounded-xl bg-primary-600 flex items-center justify-center text-white mb-2"
-          title="智能客服"
-        >
-          <Sparkles size={20} />
-        </div>
-
-        {csNav.map((item) => (
-          <NavItem
-            key={item.path}
-            {...item}
-            unread={item.path === '/' ? unread : undefined}
-            csActive
-          />
-        ))}
-
-        {csNav.length > 0 && matrixNav.length > 0 ? <div className="w-8 border-t border-gray-700 my-1.5" /> : null}
-
-        {matrixNav.map((item) => (
-          <NavItem key={item.path} {...item} />
-        ))}
-
-        {seeSettings ? <NavItem path="/settings" label="设置" icon={SettingsIcon} csActive={onWorkbench} /> : null}
-
-        <div className="flex-1" />
-
-        <button
-          onClick={toggleTheme}
-          title={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
-          className="text-gray-500 hover:text-white mb-1"
-        >
-          {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-        </button>
-
-        <div ref={statusRef} className="relative">
-          {statusOpen && (
-            <div className="absolute bottom-12 left-1/2 -translate-x-1/2 bg-white rounded-xl shadow-pop border py-1 w-28 z-50">
-              {(['active', 'resting'] as const).map((s) => (
-                <button
-                  key={s}
-                  onClick={async () => {
-                    await setStatus(s)
-                    setStatusOpen(false)
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-600 hover:bg-gray-50"
-                >
-                  <span className={clsx('w-2 h-2 rounded-full', STATUS_MAP[s].color)} />
-                  {STATUS_MAP[s].label}
-                  {agent?.status === s && <span className="ml-auto text-primary-600">✓</span>}
-                </button>
-              ))}
+    <AntLayout style={{ height: '100%' }}>
+      <Sider width={200} style={{ background: token.colorBgContainer, borderRight: `1px solid ${token.colorBorderSecondary}` }}>
+        <div className="h-full flex flex-col">
+          <div className="flex items-center gap-2 px-4 h-14 shrink-0">
+            <div
+              className="w-8 h-8 rounded-lg flex items-center justify-center text-white"
+              style={{ background: token.colorPrimary }}
+            >
+              <Sparkles size={16} />
             </div>
-          )}
-          <button
-            onClick={() => setStatusOpen(!statusOpen)}
-            title={`${agent?.display_name}（${curStatus.label}，点击切换）`}
-            className="relative w-10 h-10 rounded-full bg-primary-500 text-white flex items-center justify-center text-sm font-medium"
-          >
-            {agent?.display_name?.slice(0, 1) || '客'}
-            <span
-              className={clsx(
-                'absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-gray-900',
-                curStatus.color,
-              )}
+            <span className="font-medium" style={{ color: token.colorText }}>智能客服</span>
+          </div>
+          <div className="flex-1 overflow-auto">
+            <Menu
+              mode="inline"
+              selectedKeys={[selected]}
+              items={groups}
+              style={{ borderInlineEnd: 'none' }}
+              onClick={({ key }) => navigate(key)}
             />
-          </button>
+          </div>
+          <div className="p-3 flex items-center gap-2 border-t" style={{ borderColor: token.colorBorderSecondary }}>
+            <Dropdown
+              menu={{
+                items: (['active', 'resting'] as const).map((s) => ({
+                  key: s,
+                  label: (
+                    <span className="inline-flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full" style={{ background: STATUS_MAP[s].color }} />
+                      {STATUS_MAP[s].label}
+                      {agent?.status === s ? ' ✓' : ''}
+                    </span>
+                  ),
+                })),
+                onClick: ({ key }) => setStatus(key),
+              }}
+            >
+              <Button type="text" className="flex-1 !justify-start !px-1">
+                <span className="inline-flex items-center gap-2 min-w-0">
+                  <span
+                    className="w-7 h-7 rounded-full text-white text-xs flex items-center justify-center shrink-0"
+                    style={{ background: token.colorPrimary }}
+                  >
+                    {agent?.display_name?.slice(0, 1) || '客'}
+                  </span>
+                  <span className="truncate text-left">
+                    <span className="block text-xs leading-tight">{agent?.display_name || '客服'}</span>
+                    <span className="block text-[11px] opacity-60">{curStatus.label}</span>
+                  </span>
+                </span>
+              </Button>
+            </Dropdown>
+            <Button
+              type="text"
+              aria-label={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
+              icon={theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+              onClick={toggleTheme}
+            />
+            <Button
+              type="text"
+              aria-label="退出登录"
+              icon={<LogOut size={16} />}
+              onClick={() => {
+                logout()
+                navigate('/login')
+              }}
+            />
+          </div>
         </div>
-        <button
-          onClick={() => {
-            logout()
-            navigate('/login')
-          }}
-          title="退出登录"
-          className="text-gray-500 hover:text-white mt-1"
-        >
-          <LogOut size={16} />
-        </button>
-      </nav>
-
-      <div className="flex-1 min-w-0">
+      </Sider>
+      <Content style={{ minWidth: 0, background: token.colorBgLayout }}>
         {allowed ? (
           <Outlet />
         ) : fallback ? (
           <Navigate to={fallback} replace />
         ) : (
-          <div className="h-full flex items-center justify-center text-sm text-gray-500">
+          <div className="h-full flex items-center justify-center text-sm" style={{ color: token.colorTextSecondary }}>
             当前账号没有可访问的模块，请联系管理员
           </div>
         )}
-      </div>
-    </div>
+      </Content>
+    </AntLayout>
   )
 }

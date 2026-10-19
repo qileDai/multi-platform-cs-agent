@@ -1,4 +1,6 @@
 /** Promise 式对话框：confirmDialog / promptDialog，替代 window.confirm / window.prompt */
+import { Input, Modal } from 'antd'
+import type { InputRef } from 'antd'
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { create } from 'zustand'
 
@@ -46,7 +48,7 @@ export function DialogHost() {
   const current = useDialogStore((s) => s.current)
   const close = useDialogStore((s) => s.close)
   const [value, setValue] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<InputRef>(null)
 
   useEffect(() => {
     if (current?.kind === 'prompt') {
@@ -68,45 +70,26 @@ export function DialogHost() {
   }
 
   return (
-    <div className="fixed inset-0 z-[90] bg-black/40 flex items-center justify-center" onClick={() => done(current.kind === 'prompt' ? null : false)}>
-      <form
-        onSubmit={submit}
-        onClick={(e) => e.stopPropagation()}
-        className="bg-white dark:bg-gray-800 rounded-2xl shadow-pop w-[360px] p-5"
-      >
-        <div className="text-sm font-medium text-gray-800 dark:text-gray-100">{current.title}</div>
-        {current.kind === 'confirm' && current.message && (
-          <div className="text-sm text-gray-500 dark:text-gray-400 mt-2 leading-relaxed">{current.message}</div>
-        )}
-        {current.kind === 'prompt' && (
-          <input
-            ref={inputRef}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder={current.placeholder}
-            className="w-full border dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100 rounded-lg px-3 py-2 text-sm mt-3 outline-none focus:border-blue-500"
-          />
-        )}
-        <div className="flex justify-end gap-2 mt-5">
-          <button
-            type="button"
-            onClick={() => done(current.kind === 'prompt' ? null : false)}
-            className="text-xs px-4 py-2 rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
-          >
-            取消
-          </button>
-          <button
-            type="submit"
-            className={`text-xs px-4 py-2 rounded-lg text-white font-medium ${
-              current.kind === 'confirm' && current.danger
-                ? 'bg-red-500 hover:bg-red-600'
-                : 'bg-blue-600 hover:bg-blue-700'
-            }`}
-          >
-            {current.confirmText || '确认'}
-          </button>
-        </div>
-      </form>
-    </div>
+    <Modal
+      open
+      title={current.title}
+      okText={current.confirmText || '确认'}
+      cancelText="取消"
+      okButtonProps={{ danger: current.kind === 'confirm' && current.danger }}
+      onOk={() => submit()}
+      onCancel={() => done(current.kind === 'prompt' ? null : false)}
+      destroyOnClose
+    >
+      {current.kind === 'confirm' && current.message && <div>{current.message}</div>}
+      {current.kind === 'prompt' && (
+        <Input
+          ref={inputRef}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={current.placeholder}
+          onPressEnter={() => submit()}
+        />
+      )}
+    </Modal>
   )
 }

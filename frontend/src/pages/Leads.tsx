@@ -2,8 +2,8 @@ import clsx from 'clsx'
 import dayjs from 'dayjs'
 import { Contact } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { api, LeadCapture } from '../api/client'
+import LeadConversationModal from '../components/LeadConversationModal'
 import Empty from '../components/ui/Empty'
 import Skeleton from '../components/ui/Skeleton'
 
@@ -27,13 +27,13 @@ function Badge({ label, cls }: { label: string; cls: string }) {
 }
 
 export default function Leads() {
-  const navigate = useNavigate()
   const [q, setQ] = useState('')
   const [platform, setPlatform] = useState('')
   const [items, setItems] = useState<LeadCapture[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
+  const [viewing, setViewing] = useState<LeadCapture | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -129,7 +129,7 @@ export default function Leads() {
                         <button
                           type="button"
                           disabled={!row.conversation_id}
-                          onClick={() => navigate('/', { state: { conversationId: row.conversation_id } })}
+                          onClick={() => setViewing(row)}
                           className="text-xs text-blue-600 hover:underline px-2 py-1.5 disabled:opacity-30 disabled:no-underline disabled:cursor-not-allowed"
                         >
                           查看会话 →
@@ -164,6 +164,7 @@ export default function Leads() {
           </div>
         )}
       </div>
+      {viewing && <LeadConversationModal lead={viewing} onClose={() => setViewing(null)} />}
     </div>
   )
 }
